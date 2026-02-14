@@ -1,0 +1,22 @@
+{
+  "network": "aetheris-mainnet-alpha",
+  "genesis_time": "2026-02-14T00:00:00Z",
+  "consensus_params": {
+    "vdf_difficulty": 100000,
+    "block_reward": 5000000000
+  },
+  "allocations": [
+    {
+      "comment": "Genesis Foundation Account",
+      "viewing_key": "2f615319124ce9db1669040fbd2aa171e4a5f64e0ecba600aa6e186e915f9abc",
+      "amount": 1600000000000000,
+      "description": "Initial reserve for network growth"
+    },
+    {
+      "comment": "Developer Fund Account",
+      "viewing_key": "47cafe7b55906a973197db85130efdcca48b1a54d917c60282f6f290b434a2b5",
+      "amount": 500000000000000,
+      "description": "Allocated for core development"
+    }
+  ]
+}

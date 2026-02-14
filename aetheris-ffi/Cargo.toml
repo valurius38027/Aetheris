@@ -1,0 +1,36 @@
+[package]
+name = "aetheris-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aetheris-core = { path = "../aetheris-core" }
+aetheris-node = { path = "../aetheris-node" }
+aetheris-zkp = { path = "../aetheris-zkp" }
+aetheris-crypto = { path = "../aetheris-crypto" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+once_cell = "1.18"
+chrono = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+libc = "0.2"
+anyhow = { workspace = true }
+sled = "0.34"
+bip39 = { version = "2.0", features = ["rand"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+blake3 = "1.5"
+hex = "0.4"
+getrandom = { version = "0.2", features = ["js"] }
+aes-gcm = "0.10"
+bincode = "1.3"
+rand = "0.8"
+argon2 = "0.5"
+libp2p = "0.53"
+futures-util = "0.3"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+
+[dev-dependencies]
+tempfile = "3.8"

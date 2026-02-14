@@ -1,0 +1,13 @@
+[package]
+name = "aetheris-crypto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }
+num-bigint = { workspace = true, features = ["rand"] }
+num-traits = { workspace = true }
+rand = { workspace = true }
