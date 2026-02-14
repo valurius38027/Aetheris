@@ -1,0 +1,102 @@
+DIGEST cda53c7f46c8321e456a589deb0be761
+FAetheris_VDF
+R93:105 Aetheris_Core <> <> lib
+R123:137 Coq.Arith.Arith <> <> lib
+R155:171 Coq.ZArith.ZArith <> <> lib
+ax 298:307 <> GroupOrder
+R311:311 Coq.Numbers.BinNums <> Z ind
+ax 320:336 <> group_order_large
+R350:352 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R340:349 Aetheris_VDF <> GroupOrder defax
+R354:354 Coq.ZArith.BinInt <> ::Z_scope:x_'^'_x not
+ax 533:545 <> squaring_cost
+R549:549 Coq.Numbers.BinNums <> Z ind
+ax 558:574 <> squaring_cost_pos
+R591:593 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R578:590 Aetheris_VDF <> squaring_cost defax
+def 697:707 <> vdf_compute
+R714:714 Coq.Numbers.BinNums <> Z ind
+binder 710:710 <> x:9
+R722:724 Coq.Init.Datatypes <> nat ind
+binder 718:718 <> t:10
+R729:729 Coq.Numbers.BinNums <> Z ind
+R742:742 Aetheris_VDF <> t:10 var
+R753:753 Coq.Init.Datatypes <> O constr
+R758:758 Aetheris_VDF <> x:9 var
+R764:764 Coq.Init.Datatypes <> S constr
+R772:772 Coq.ZArith.BinInt <> ::Z_scope:x_'mod'_x not
+R808:813 Coq.ZArith.BinInt <> ::Z_scope:x_'mod'_x not
+R789:791 Coq.ZArith.BinInt <> ::Z_scope:x_'*'_x not
+R773:783 Aetheris_VDF <> vdf_compute:11 def
+R785:785 Aetheris_VDF <> x:9 var
+R792:802 Aetheris_VDF <> vdf_compute:11 def
+R804:804 Aetheris_VDF <> x:9 var
+R814:823 Aetheris_VDF <> GroupOrder defax
+def 1052:1065 <> vdf_total_cost
+R1072:1074 Coq.Init.Datatypes <> nat ind
+binder 1068:1068 <> t:13
+R1079:1079 Coq.Numbers.BinNums <> Z ind
+R1096:1098 Coq.ZArith.BinInt <> ::Z_scope:x_'*'_x not
+R1086:1093 Coq.ZArith.BinInt Z of_nat def
+R1095:1095 Aetheris_VDF <> t:13 var
+R1099:1111 Aetheris_VDF <> squaring_cost defax
+prf 1201:1217 <> vdf_is_sequential
+R1233:1235 Coq.Init.Datatypes <> nat ind
+binder 1229:1229 <> t:14
+R1257:1260 Coq.ZArith.BinInt <> ::Z_scope:x_'>='_x not
+R1241:1254 Aetheris_VDF <> vdf_total_cost def
+R1256:1256 Aetheris_VDF <> t:14 var
+R1271:1273 Coq.ZArith.BinInt <> ::Z_scope:x_'*'_x not
+R1261:1268 Coq.ZArith.BinInt Z of_nat def
+R1270:1270 Aetheris_VDF <> t:14 var
+R1274:1286 Aetheris_VDF <> squaring_cost defax
+R1317:1330 Aetheris_VDF <> vdf_total_cost def
+R1341:1347 Coq.ZArith.BinInt Z le_ge thm
+R1341:1347 Coq.ZArith.BinInt Z le_ge thm
+R1358:1366 Coq.ZArith.BinInt Z le_refl thm
+R1358:1366 Coq.ZArith.BinInt Z le_refl thm
+def 1510:1523 <> issuance_steps
+R1532:1537 Aetheris_Core <> Amount def
+binder 1526:1528 <> amt:15
+R1542:1544 Coq.Init.Datatypes <> nat ind
+R1555:1557 Coq.Init.Peano <> ::nat_scope:x_'*'_x not
+R1552:1554 Aetheris_VDF <> amt:15 var
+prf 1578:1604 <> issuance_requires_real_time
+R1622:1627 Aetheris_Core <> Amount def
+binder 1616:1618 <> amt:16
+R1646:1651 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1637:1639 Coq.Init.Peano <> ::nat_scope:x_'>'_x not
+R1634:1636 Aetheris_VDF <> amt:16 var
+R1687:1689 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R1652:1665 Aetheris_VDF <> vdf_total_cost def
+R1668:1681 Aetheris_VDF <> issuance_steps def
+R1683:1685 Aetheris_VDF <> amt:16 var
+R1728:1741 Aetheris_VDF <> vdf_total_cost def
+R1744:1757 Aetheris_VDF <> issuance_steps def
+R1793:1795 Coq.Init.Peano <> ::nat_scope:x_'>'_x not
+R1786:1788 Coq.Init.Peano <> ::nat_scope:x_'*'_x not
+R1793:1795 Coq.Init.Peano <> ::nat_scope:x_'>'_x not
+R1786:1788 Coq.Init.Peano <> ::nat_scope:x_'*'_x not
+R1817:1831 Coq.Arith.PeanoNat Nat mul_pos_pos thm
+R1817:1831 Coq.Arith.PeanoNat Nat mul_pos_pos thm
+R1872:1884 Coq.Arith.PeanoNat Nat lt_0_succ thm
+R1872:1884 Coq.Arith.PeanoNat Nat lt_0_succ thm
+R1932:1934 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R1911:1918 Coq.ZArith.BinInt Z of_nat def
+R1924:1926 Coq.Init.Peano <> ::nat_scope:x_'*'_x not
+R1932:1934 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R1911:1918 Coq.ZArith.BinInt Z of_nat def
+R1924:1926 Coq.Init.Peano <> ::nat_scope:x_'*'_x not
+R1953:1964 Coq.ZArith.Znat Nat2Z inj_gt thm
+R1953:1964 Coq.ZArith.Znat Nat2Z inj_gt thm
+R1991:1997 Coq.Init.Peano <> gt def
+R2070:2076 Coq.ZArith.BinInt Z lt_gt thm
+R2070:2076 Coq.ZArith.BinInt Z lt_gt thm
+R2087:2099 Coq.ZArith.BinInt Z mul_pos_pos thm
+R2087:2099 Coq.ZArith.BinInt Z mul_pos_pos thm
+R2112:2118 Coq.ZArith.BinInt Z gt_lt thm
+R2112:2118 Coq.ZArith.BinInt Z gt_lt thm
+R2143:2149 Coq.ZArith.BinInt Z gt_lt thm
+R2143:2149 Coq.ZArith.BinInt Z gt_lt thm
+R2158:2174 Aetheris_VDF <> squaring_cost_pos prfax
+R2158:2174 Aetheris_VDF <> squaring_cost_pos prfax

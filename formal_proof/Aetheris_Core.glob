@@ -1,0 +1,90 @@
+DIGEST b5822385bfb00da0c818adb98b425bed
+FAetheris_Core
+R65:78 Coq.Lists.List <> <> lib
+R96:110 Coq.Arith.Arith <> <> lib
+R120:132 Coq.Lists.List ListNotations <> mod
+def 174:179 <> Amount
+R184:186 Coq.Init.Datatypes <> nat ind
+def 200:207 <> RecordID
+R212:214 Coq.Init.Datatypes <> nat ind
+def 228:232 <> Owner
+R237:239 Coq.Init.Datatypes <> nat ind
+def 253:261 <> Nullifier
+R266:268 Coq.Init.Datatypes <> nat ind
+def 282:291 <> Commitment
+R296:298 Coq.Init.Datatypes <> nat ind
+rec 346:355 <> AET_Record
+proj 364:367 <> r_id
+proj 383:389 <> r_owner
+proj 402:409 <> r_amount
+proj 423:429 <> r_nonce
+R371:378 Aetheris_Core <> RecordID def
+R393:397 Aetheris_Core <> Owner def
+R413:418 Aetheris_Core <> Amount def
+R433:435 Coq.Init.Datatypes <> nat ind
+rec 484:494 <> Transaction
+proj 503:511 <> tx_inputs
+proj 533:542 <> tx_outputs
+proj 565:575 <> tx_total_in
+proj 589:600 <> tx_total_out
+proj 614:621 <> tx_proof
+R515:518 Coq.Init.Datatypes <> list ind
+R520:528 Aetheris_Core <> Nullifier def
+R546:549 Coq.Init.Datatypes <> list ind
+R551:560 Aetheris_Core <> Commitment def
+R579:584 Aetheris_Core <> Amount def
+R604:609 Aetheris_Core <> Amount def
+R625:627 Coq.Init.Datatypes <> nat ind
+def 775:792 <> is_value_conserved
+R800:810 Aetheris_Core <> Transaction rec
+binder 795:796 <> tx:12
+R839:841 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R825:835 Aetheris_Core <> tx_total_in proj
+R837:838 Aetheris_Core <> tx:12 var
+R842:853 Aetheris_Core <> tx_total_out proj
+R855:856 Aetheris_Core <> tx:12 var
+prf 952:969 <> conservation_holds
+binder 980:981 <> tx:13
+R1007:1010 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R986:1003 Aetheris_Core <> is_value_conserved def
+R1005:1006 Aetheris_Core <> tx:13 var
+R1025:1027 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1011:1021 Aetheris_Core <> tx_total_in proj
+R1023:1024 Aetheris_Core <> tx:13 var
+R1028:1039 Aetheris_Core <> tx_total_out proj
+R1041:1042 Aetheris_Core <> tx:13 var
+R1076:1093 Aetheris_Core <> is_value_conserved def
+rec 1155:1165 <> ClientState
+proj 1174:1189 <> known_nullifiers
+proj 1211:1227 <> known_commitments
+proj 1250:1261 <> user_balance
+R1193:1196 Coq.Init.Datatypes <> list ind
+R1198:1206 Aetheris_Core <> Nullifier def
+R1231:1234 Coq.Init.Datatypes <> list ind
+R1236:1245 Aetheris_Core <> Commitment def
+R1265:1270 Aetheris_Core <> Amount def
+def 1314:1332 <> is_not_double_spent
+R1339:1347 Aetheris_Core <> Nullifier def
+binder 1335:1335 <> n:18
+R1356:1366 Aetheris_Core <> ClientState rec
+binder 1351:1352 <> st:19
+R1381:1382 Coq.Init.Logic <> ::type_scope:'~'_x not
+R1383:1384 Coq.Lists.List <> In def
+R1389:1404 Aetheris_Core <> known_nullifiers proj
+R1406:1407 Aetheris_Core <> st:19 var
+R1386:1386 Aetheris_Core <> n:18 var
+prf 1593:1608 <> sovereign_safety
+R1624:1632 Aetheris_Core <> Nullifier def
+binder 1620:1620 <> n:20
+R1641:1651 Aetheris_Core <> ClientState rec
+binder 1636:1637 <> st:21
+R1681:1684 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1657:1675 Aetheris_Core <> is_not_double_spent def
+R1677:1677 Aetheris_Core <> n:20 var
+R1679:1680 Aetheris_Core <> st:21 var
+R1685:1686 Coq.Init.Logic <> ::type_scope:'~'_x not
+R1687:1688 Coq.Lists.List <> In def
+R1693:1708 Aetheris_Core <> known_nullifiers proj
+R1710:1711 Aetheris_Core <> st:21 var
+R1690:1690 Aetheris_Core <> n:20 var
+R1748:1766 Aetheris_Core <> is_not_double_spent def

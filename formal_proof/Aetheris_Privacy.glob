@@ -1,0 +1,126 @@
+DIGEST 3830108acab1e7d097e2e897b87145b6
+FAetheris_Privacy
+R98:110 Aetheris_Core <> <> lib
+R128:141 Coq.Lists.List <> <> lib
+R151:163 Coq.Lists.List ListNotations <> mod
+rec 286:294 <> RealTrace
+proj 303:311 <> t_records
+proj 334:345 <> t_nullifiers
+proj 367:379 <> t_commitments
+R315:318 Coq.Init.Datatypes <> list ind
+R320:329 Aetheris_Core <> AET_Record rec
+R349:352 Coq.Init.Datatypes <> list ind
+R354:362 Aetheris_Core <> Nullifier def
+R383:386 Coq.Init.Datatypes <> list ind
+R388:397 Aetheris_Core <> Commitment def
+rec 509:520 <> ObserverView
+proj 529:540 <> v_nullifiers
+proj 562:574 <> v_commitments
+R544:547 Coq.Init.Datatypes <> list ind
+R549:557 Aetheris_Core <> Nullifier def
+R578:581 Coq.Init.Datatypes <> list ind
+R583:592 Aetheris_Core <> Commitment def
+def 663:674 <> project_view
+R681:689 Aetheris_Privacy <> RealTrace rec
+binder 677:677 <> t:8
+R694:705 Aetheris_Privacy <> ObserverView rec
+R715:726 Aetheris_Privacy <> v_nullifiers proj
+R715:726 Aetheris_Privacy <> v_nullifiers proj
+R715:726 Aetheris_Privacy <> v_nullifiers proj
+R747:759 Aetheris_Privacy <> v_commitments proj
+R747:759 Aetheris_Privacy <> v_commitments proj
+R731:742 Aetheris_Privacy <> t_nullifiers proj
+R744:744 Aetheris_Privacy <> t:8 var
+R764:776 Aetheris_Privacy <> t_commitments proj
+R778:778 Aetheris_Privacy <> t:8 var
+ax 935:943 <> Simulator
+R951:954 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R947:950 Coq.Init.Datatypes <> unit ind
+R955:966 Aetheris_Privacy <> ObserverView rec
+def 1266:1275 <> is_private
+R1282:1290 Aetheris_Privacy <> RealTrace rec
+binder 1278:1278 <> t:11
+R1305:1312 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1329:1331 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1317:1328 Aetheris_Privacy <> ObserverView rec
+binder 1313:1313 <> s:12
+R1350:1357 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R1475:1475 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R1333:1335 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1332:1332 Aetheris_Privacy <> s:12 var
+R1336:1347 Aetheris_Privacy <> project_view def
+R1349:1349 Aetheris_Privacy <> t:11 var
+R1370:1379 Aetheris_Core <> AET_Record rec
+binder 1366:1366 <> r:13
+R1401:1409 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1383:1384 Coq.Lists.List <> In def
+R1389:1397 Aetheris_Privacy <> t_records proj
+R1399:1399 Aetheris_Privacy <> t:11 var
+R1386:1386 Aetheris_Privacy <> r:13 var
+R1410:1411 Coq.Init.Logic <> ::type_scope:'~'_x not
+R1412:1419 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1450:1452 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1436:1439 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1424:1435 Aetheris_Privacy <> ObserverView rec
+R1440:1449 Aetheris_Core <> AET_Record rec
+binder 1420:1420 <> f:14
+R1471:1473 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1453:1453 Aetheris_Privacy <> f:14 var
+R1456:1467 Aetheris_Privacy <> project_view def
+R1469:1469 Aetheris_Privacy <> t:11 var
+R1474:1474 Aetheris_Privacy <> r:13 var
+prf 1588:1620 <> privacy_implies_owner_obfuscation
+R1636:1644 Aetheris_Privacy <> RealTrace rec
+binder 1632:1632 <> t:15
+R1662:1667 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1650:1659 Aetheris_Privacy <> is_private def
+R1661:1661 Aetheris_Privacy <> t:15 var
+R1680:1689 Aetheris_Core <> AET_Record rec
+binder 1676:1676 <> r:16
+R1711:1716 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1693:1694 Coq.Lists.List <> In def
+R1699:1707 Aetheris_Privacy <> t_records proj
+R1709:1709 Aetheris_Privacy <> t:15 var
+R1696:1696 Aetheris_Privacy <> r:16 var
+R1717:1718 Coq.Init.Logic <> ::type_scope:'~'_x not
+R1719:1726 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1752:1754 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R1743:1746 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1731:1742 Aetheris_Privacy <> ObserverView rec
+R1747:1751 Aetheris_Core <> Owner def
+binder 1727:1727 <> f:17
+R1773:1775 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1755:1755 Aetheris_Privacy <> f:17 var
+R1758:1769 Aetheris_Privacy <> project_view def
+R1771:1771 Aetheris_Privacy <> t:15 var
+R1776:1782 Aetheris_Core <> r_owner proj
+R1784:1784 Aetheris_Privacy <> r:16 var
+R1841:1850 Aetheris_Privacy <> is_private def
+binder 2020:2020 <> v:18
+R2028:2031 Aetheris_Core <> r_id proj
+R2028:2031 Aetheris_Core <> r_id proj
+R2028:2031 Aetheris_Core <> r_id proj
+R2044:2050 Aetheris_Core <> r_owner proj
+R2044:2050 Aetheris_Core <> r_owner proj
+R2060:2067 Aetheris_Core <> r_amount proj
+R2060:2067 Aetheris_Core <> r_amount proj
+R2084:2090 Aetheris_Core <> r_nonce proj
+R2084:2090 Aetheris_Core <> r_nonce proj
+R2036:2039 Aetheris_Core <> r_id proj
+R2057:2057 Aetheris_Privacy <> v:18 var
+R2072:2079 Aetheris_Core <> r_amount proj
+R2095:2101 Aetheris_Core <> r_nonce proj
+binder 2020:2020 <> v:19
+R2028:2031 Aetheris_Core <> r_id proj
+R2028:2031 Aetheris_Core <> r_id proj
+R2028:2031 Aetheris_Core <> r_id proj
+R2044:2050 Aetheris_Core <> r_owner proj
+R2044:2050 Aetheris_Core <> r_owner proj
+R2060:2067 Aetheris_Core <> r_amount proj
+R2060:2067 Aetheris_Core <> r_amount proj
+R2084:2090 Aetheris_Core <> r_nonce proj
+R2084:2090 Aetheris_Core <> r_nonce proj
+R2036:2039 Aetheris_Core <> r_id proj
+R2057:2057 Aetheris_Privacy <> v:19 var
+R2072:2079 Aetheris_Core <> r_amount proj
+R2095:2101 Aetheris_Core <> r_nonce proj

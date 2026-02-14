@@ -1,0 +1,21 @@
+[package]
+name = "aetheris-zkp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+ark-relations = { workspace = true }
+ark-r1cs-std = { workspace = true }
+ark-groth16 = { workspace = true }
+ark-snark = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+halo2_proofs = { workspace = true }
+halo2curves = { version = "0.7.0" }
+rand_chacha = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+aes-gcm = { workspace = true }

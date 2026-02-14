@@ -1,0 +1,15 @@
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\aetheris_ffi.dll
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\Aetheris.CLI.exe
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\Aetheris.CLI.deps.json
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\Aetheris.CLI.runtimeconfig.json
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\Aetheris.CLI.dll
+e:\Crazy\Aetheris\Aetheris.CLI\bin\Release\net10.0\Aetheris.CLI.pdb
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.GeneratedMSBuildEditorConfig.editorconfig
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.AssemblyInfoInputs.cache
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.AssemblyInfo.cs
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.csproj.CoreCompileInputs.cache
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.dll
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\refint\Aetheris.CLI.dll
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.pdb
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\Aetheris.CLI.genruntimeconfig.cache
+e:\Crazy\Aetheris\Aetheris.CLI\obj\Release\net10.0\ref\Aetheris.CLI.dll

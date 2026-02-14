@@ -1,0 +1,159 @@
+DIGEST 43910029f5a0c466490ce0a4efddb446
+FAetheris_Integrity
+R77:89 Aetheris_Core <> <> lib
+R107:120 Aetheris_State <> <> lib
+R138:150 Aetheris_Tree <> <> lib
+R168:181 Coq.Lists.List <> <> lib
+R199:213 Coq.Arith.Arith <> <> lib
+R223:235 Coq.Lists.List ListNotations <> mod
+ax 249:258 <> empty_tree
+R262:270 Aetheris_Tree <> StateTree defax
+ind 326:330 <> Chain
+constr 361:373 <> genesis_chain
+constr 463:474 <> extend_chain
+R345:348 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R334:344 Aetheris_State <> GlobalState rec
+R377:381 Aetheris_Integrity <> Chain:3 ind
+R386:399 Aetheris_State <> all_nullifiers proj
+R386:399 Aetheris_State <> all_nullifiers proj
+R386:399 Aetheris_State <> all_nullifiers proj
+R408:422 Aetheris_State <> all_commitments proj
+R408:422 Aetheris_State <> all_commitments proj
+R431:440 Aetheris_State <> state_tree proj
+R431:440 Aetheris_State <> state_tree proj
+R404:405 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R427:428 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R445:454 Aetheris_Integrity <> empty_tree defax
+R490:500 Aetheris_State <> GlobalState rec
+binder 486:486 <> s:5
+R509:519 Aetheris_Core <> Transaction rec
+binder 504:505 <> tx:6
+R536:539 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R529:533 Aetheris_Integrity <> Chain:3 ind
+R535:535 Aetheris_Integrity <> s:5 var
+R564:567 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R540:558 Aetheris_State <> is_valid_transition def
+R560:560 Aetheris_Integrity <> s:5 var
+R562:563 Aetheris_Integrity <> tx:6 var
+R568:572 Aetheris_Integrity <> Chain:3 ind
+R575:584 Aetheris_State <> transition def
+R586:586 Aetheris_Integrity <> s:5 var
+R588:589 Aetheris_Integrity <> tx:6 var
+scheme 326:330 <> Chain_ind
+scheme 326:330 <> Chain_sind
+def 726:736 <> sum_amounts
+R743:746 Coq.Init.Datatypes <> list ind
+R748:753 Aetheris_Core <> Amount def
+binder 739:739 <> l:7
+R758:763 Aetheris_Core <> Amount def
+R776:776 Aetheris_Integrity <> l:7 var
+R787:788 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R800:803 Coq.Init.Datatypes <> ::list_scope:x_'::'_x not
+R813:815 Coq.Init.Peano <> ::nat_scope:x_'+'_x not
+R816:826 Aetheris_Integrity <> sum_amounts:8 def
+prf 1015:1036 <> global_value_integrity
+R1052:1062 Aetheris_State <> GlobalState rec
+binder 1048:1048 <> s:10
+R1071:1081 Aetheris_Core <> Transaction rec
+binder 1066:1067 <> tx:11
+R1094:1100 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1087:1091 Aetheris_Integrity <> Chain ind
+R1093:1093 Aetheris_Integrity <> s:10 var
+R1125:1131 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1101:1119 Aetheris_State <> is_valid_transition def
+R1121:1121 Aetheris_Integrity <> s:10 var
+R1123:1124 Aetheris_Integrity <> tx:11 var
+R1132:1149 Aetheris_Core <> is_value_conserved def
+R1151:1152 Aetheris_Integrity <> tx:11 var
+prf 1344:1363 <> nullifiers_monotonic
+R1379:1389 Aetheris_State <> GlobalState rec
+binder 1375:1375 <> s:12
+R1398:1408 Aetheris_Core <> Transaction rec
+binder 1393:1394 <> tx:13
+R1416:1424 Aetheris_Core <> Nullifier def
+binder 1412:1412 <> n:14
+R1437:1442 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1430:1434 Aetheris_Integrity <> Chain ind
+R1436:1436 Aetheris_Integrity <> s:12 var
+R1466:1471 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1443:1444 Coq.Lists.List <> In def
+R1449:1462 Aetheris_State <> all_nullifiers proj
+R1464:1464 Aetheris_Integrity <> s:12 var
+R1446:1446 Aetheris_Integrity <> n:14 var
+R1472:1473 Coq.Lists.List <> In def
+R1478:1491 Aetheris_State <> all_nullifiers proj
+R1494:1503 Aetheris_State <> transition def
+R1505:1505 Aetheris_Integrity <> s:12 var
+R1507:1508 Aetheris_Integrity <> tx:13 var
+R1475:1475 Aetheris_Integrity <> n:14 var
+R1565:1573 Coq.Lists.List <> in_or_app thm
+R1565:1573 Coq.Lists.List <> in_or_app thm
+prf 1660:1681 <> double_spend_forbidden
+R1697:1707 Aetheris_State <> GlobalState rec
+binder 1693:1693 <> s:15
+R1716:1726 Aetheris_Core <> Transaction rec
+binder 1711:1712 <> tx:16
+R1734:1742 Aetheris_Core <> Nullifier def
+binder 1730:1730 <> n:17
+R1755:1760 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1748:1752 Aetheris_Integrity <> Chain ind
+R1754:1754 Aetheris_Integrity <> s:15 var
+R1784:1789 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1761:1762 Coq.Lists.List <> In def
+R1767:1780 Aetheris_State <> all_nullifiers proj
+R1782:1782 Aetheris_Integrity <> s:15 var
+R1764:1764 Aetheris_Integrity <> n:17 var
+R1809:1814 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1790:1791 Coq.Lists.List <> In def
+R1796:1804 Aetheris_Core <> tx_inputs proj
+R1806:1807 Aetheris_Integrity <> tx:16 var
+R1793:1793 Aetheris_Integrity <> n:17 var
+R1815:1816 Coq.Init.Logic <> ::type_scope:'~'_x not
+R1817:1835 Aetheris_State <> is_valid_transition def
+R1837:1837 Aetheris_Integrity <> s:15 var
+R1839:1840 Aetheris_Integrity <> tx:16 var
+R1899:1917 Aetheris_State <> is_valid_transition def
+ind 2161:2183 <> AllTransactionsBalanced
+constr 2214:2229 <> genesis_balanced
+constr 2337:2351 <> extend_balanced
+R2198:2201 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2187:2197 Aetheris_State <> GlobalState rec
+R2233:2255 Aetheris_Integrity <> AllTransactionsBalanced:18 ind
+R2260:2273 Aetheris_State <> all_nullifiers proj
+R2260:2273 Aetheris_State <> all_nullifiers proj
+R2260:2273 Aetheris_State <> all_nullifiers proj
+R2282:2296 Aetheris_State <> all_commitments proj
+R2282:2296 Aetheris_State <> all_commitments proj
+R2305:2314 Aetheris_State <> state_tree proj
+R2305:2314 Aetheris_State <> state_tree proj
+R2278:2279 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R2301:2302 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R2319:2328 Aetheris_Integrity <> empty_tree defax
+R2367:2377 Aetheris_State <> GlobalState rec
+binder 2363:2363 <> s:20
+R2386:2396 Aetheris_Core <> Transaction rec
+binder 2381:2382 <> tx:21
+R2431:2441 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2406:2428 Aetheris_Integrity <> AllTransactionsBalanced:18 ind
+R2430:2430 Aetheris_Integrity <> s:20 var
+R2463:2473 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2442:2459 Aetheris_Core <> is_value_conserved def
+R2461:2462 Aetheris_Integrity <> tx:21 var
+R2474:2496 Aetheris_Integrity <> AllTransactionsBalanced:18 ind
+R2499:2508 Aetheris_State <> transition def
+R2510:2510 Aetheris_Integrity <> s:20 var
+R2512:2513 Aetheris_Integrity <> tx:21 var
+scheme 2161:2183 <> AllTransactionsBalanced_ind
+scheme 2161:2183 <> AllTransactionsBalanced_sind
+prf 2526:2547 <> chain_implies_balanced
+R2563:2573 Aetheris_State <> GlobalState rec
+binder 2559:2559 <> s:22
+R2586:2589 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2579:2583 Aetheris_Integrity <> Chain ind
+R2585:2585 Aetheris_Integrity <> s:22 var
+R2590:2612 Aetheris_Integrity <> AllTransactionsBalanced ind
+R2614:2614 Aetheris_Integrity <> s:22 var
+R2708:2723 Aetheris_Integrity <> genesis_balanced constr
+R2708:2723 Aetheris_Integrity <> genesis_balanced constr
+R2736:2750 Aetheris_Integrity <> extend_balanced constr
+R2736:2750 Aetheris_Integrity <> extend_balanced constr

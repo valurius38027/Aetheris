@@ -1,0 +1,87 @@
+DIGEST cf3952b0d8e01a24a4bdddf1f2999fdd
+FAetheris_ZK_Circuit
+R92:104 Aetheris_Core <> <> lib
+R122:138 Coq.ZArith.ZArith <> <> lib
+R156:169 Coq.Lists.List <> <> lib
+R179:191 Coq.Lists.List ListNotations <> mod
+ax 274:283 <> FieldOrder
+R287:287 Coq.Numbers.BinNums <> Z ind
+ax 296:312 <> field_order_prime
+R326:328 Coq.ZArith.BinInt <> ::Z_scope:x_'>'_x not
+R316:325 Aetheris_ZK_Circuit <> FieldOrder defax
+R330:330 Coq.ZArith.BinInt <> ::Z_scope:x_'^'_x not
+rec 528:542 <> R1CS_Constraint
+proj 551:558 <> c_inputs
+proj 572:580 <> c_outputs
+proj 594:606 <> c_is_balanced
+R562:565 Coq.Init.Datatypes <> list ind
+R567:567 Coq.Numbers.BinNums <> Z ind
+R584:587 Coq.Init.Datatypes <> list ind
+R589:589 Coq.Numbers.BinNums <> Z ind
+R650:652 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R623:632 Coq.Lists.List <> fold_right def
+R642:649 Aetheris_ZK_Circuit <> c_inputs:6 meth
+R634:638 Coq.ZArith.BinInt Z add def
+R653:662 Coq.Lists.List <> fold_right def
+R672:680 Aetheris_ZK_Circuit <> c_outputs:7 meth
+R664:668 Coq.ZArith.BinInt Z add def
+rec 913:920 <> ZK_Proof
+proj 929:940 <> p_circuit_id
+proj 951:965 <> p_public_inputs
+proj 979:988 <> p_is_valid
+proj 1000:1019 <> p_balance_constraint
+R944:946 Coq.Init.Datatypes <> nat ind
+R969:972 Coq.Init.Datatypes <> list ind
+R974:974 Coq.Numbers.BinNums <> Z ind
+R1033:1041 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1023:1032 Aetheris_ZK_Circuit <> p_is_valid:12 meth
+R1048:1062 Aetheris_ZK_Circuit <> p_public_inputs:11 meth
+R1075:1075 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1082:1083 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1091:1091 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1102:1104 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1124:1128 Coq.Init.Logic <> False ind
+prf 1306:1325 <> zk_soundness_refined
+R1342:1352 Aetheris_Core <> Transaction rec
+binder 1337:1338 <> tx:15
+R1364:1371 Aetheris_ZK_Circuit <> ZK_Proof rec
+binder 1356:1360 <> proof:16
+R1393:1398 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1377:1386 Aetheris_ZK_Circuit <> p_is_valid proj
+R1388:1392 Aetheris_ZK_Circuit <> proof:16 var
+R1478:1483 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1420:1422 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1399:1413 Aetheris_ZK_Circuit <> p_public_inputs proj
+R1415:1419 Aetheris_ZK_Circuit <> proof:16 var
+R1423:1423 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1449:1450 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1477:1477 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R1424:1431 Coq.ZArith.BinInt Z of_nat def
+R1434:1444 Aetheris_Core <> tx_total_in proj
+R1446:1447 Aetheris_ZK_Circuit <> tx:15 var
+R1451:1458 Coq.ZArith.BinInt Z of_nat def
+R1461:1472 Aetheris_Core <> tx_total_out proj
+R1474:1475 Aetheris_ZK_Circuit <> tx:15 var
+R1509:1511 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1484:1491 Coq.ZArith.BinInt Z of_nat def
+R1494:1504 Aetheris_Core <> tx_total_in proj
+R1506:1507 Aetheris_ZK_Circuit <> tx:15 var
+R1512:1519 Coq.ZArith.BinInt Z of_nat def
+R1522:1533 Aetheris_Core <> tx_total_out proj
+R1535:1536 Aetheris_ZK_Circuit <> tx:15 var
+ax 1878:1897 <> collision_resistance
+R1917:1926 Aetheris_Core <> Commitment def
+binder 1909:1910 <> c1:17
+binder 1912:1913 <> c2:18
+R1939:1942 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1934:1936 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1932:1933 Aetheris_ZK_Circuit <> c1:17 var
+R1937:1938 Aetheris_ZK_Circuit <> c2:18 var
+R1943:1951 Coq.Init.Logic <> ::type_scope:'exists'_'!'_x_'..'_x_','_x not
+R1966:1968 Coq.Init.Logic <> ::type_scope:'exists'_'!'_x_'..'_x_','_x not
+R1956:1965 Aetheris_Core <> AET_Record rec
+binder 1952:1952 <> r:19
+R1975:1977 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1969:1972 Aetheris_Core <> r_id proj
+R1974:1974 Aetheris_ZK_Circuit <> r:19 var
+R1978:1979 Aetheris_ZK_Circuit <> c1:17 var

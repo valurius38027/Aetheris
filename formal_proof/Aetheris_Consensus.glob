@@ -1,0 +1,95 @@
+DIGEST 97ad46a38eec3fe0b5a114b39dac81f3
+FAetheris_Consensus
+R93:105 Aetheris_Core <> <> lib
+R123:134 Aetheris_VDF <> <> lib
+R152:165 Coq.Lists.List <> <> lib
+R183:199 Coq.ZArith.ZArith <> <> lib
+R209:221 Coq.Lists.List ListNotations <> mod
+rec 300:312 <> BlockProposal
+proj 321:331 <> prop_height
+proj 340:354 <> prop_vdf_result
+proj 363:376 <> prop_vdf_proof
+proj 385:395 <> prop_sender
+proj 408:423 <> prop_hash_of_vdf
+R335:335 Coq.Numbers.BinNums <> Z ind
+R358:358 Coq.Numbers.BinNums <> Z ind
+R380:380 Coq.Numbers.BinNums <> Z ind
+R399:403 Aetheris_Core <> Owner def
+R427:427 Coq.Numbers.BinNums <> Z ind
+def 560:581 <> is_mathematical_winner
+R588:600 Aetheris_Consensus <> BlockProposal rec
+binder 584:584 <> p:7
+R616:619 Coq.Init.Datatypes <> list ind
+R621:633 Aetheris_Consensus <> BlockProposal rec
+binder 604:612 <> all_props:8
+R662:668 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R740:740 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R648:649 Coq.Lists.List <> In def
+R653:661 Aetheris_Consensus <> all_props:8 var
+R651:651 Aetheris_Consensus <> p:7 var
+binder 676:677 <> p':9
+R695:698 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R680:681 Coq.Lists.List <> In def
+R686:694 Aetheris_Consensus <> all_props:8 var
+R683:684 Aetheris_Consensus <> p':9 var
+R717:720 Coq.ZArith.BinInt <> ::Z_scope:x_'<='_x not
+R699:714 Aetheris_Consensus <> prop_hash_of_vdf proj
+R716:716 Aetheris_Consensus <> p:7 var
+R721:736 Aetheris_Consensus <> prop_hash_of_vdf proj
+R738:739 Aetheris_Consensus <> p':9 var
+prf 836:848 <> winner_exists
+R864:867 Coq.Init.Datatypes <> list ind
+R869:881 Aetheris_Consensus <> BlockProposal rec
+binder 860:860 <> l:10
+R894:897 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R888:891 Coq.Init.Logic <> ::type_scope:x_'<>'_x not
+R887:887 Aetheris_Consensus <> l:10 var
+R892:893 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R898:904 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R906:907 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+binder 905:905 <> p:11
+R908:929 Aetheris_Consensus <> is_mathematical_winner def
+R931:931 Aetheris_Consensus <> p:11 var
+R933:933 Aetheris_Consensus <> l:10 var
+R1140:1148 Coq.ZArith.BinInt Z le_refl thm
+R1140:1148 Coq.ZArith.BinInt Z le_refl thm
+R1258:1261 Coq.Init.Logic <> ::type_scope:x_'<>'_x not
+R1253:1256 Coq.Init.Datatypes <> ::list_scope:x_'::'_x not
+R1262:1263 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R1258:1261 Coq.Init.Logic <> ::type_scope:x_'<>'_x not
+R1253:1256 Coq.Init.Datatypes <> ::list_scope:x_'::'_x not
+R1262:1263 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R1361:1373 Coq.ZArith.BinInt Z le_gt_cases thm
+R1376:1391 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1397:1412 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1361:1373 Coq.ZArith.BinInt Z le_gt_cases thm
+R1376:1391 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1397:1412 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1570:1578 Coq.ZArith.BinInt Z le_refl thm
+R1570:1578 Coq.ZArith.BinInt Z le_refl thm
+R1610:1625 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1610:1625 Aetheris_Consensus <> prop_hash_of_vdf proj
+R1844:1855 Coq.ZArith.BinInt Z lt_le_incl thm
+R1844:1855 Coq.ZArith.BinInt Z lt_le_incl thm
+prf 2092:2116 <> deterministic_convergence
+R2132:2135 Coq.Init.Datatypes <> list ind
+R2137:2149 Aetheris_Consensus <> BlockProposal rec
+binder 2128:2128 <> l:12
+R2161:2173 Aetheris_Consensus <> BlockProposal rec
+binder 2153:2154 <> p1:13
+binder 2156:2157 <> p2:14
+R2206:2211 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2179:2200 Aetheris_Consensus <> is_mathematical_winner def
+R2202:2203 Aetheris_Consensus <> p1:13 var
+R2205:2205 Aetheris_Consensus <> l:12 var
+R2239:2244 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2212:2233 Aetheris_Consensus <> is_mathematical_winner def
+R2235:2236 Aetheris_Consensus <> p2:14 var
+R2238:2238 Aetheris_Consensus <> l:12 var
+R2264:2266 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R2245:2260 Aetheris_Consensus <> prop_hash_of_vdf proj
+R2262:2263 Aetheris_Consensus <> p1:13 var
+R2267:2282 Aetheris_Consensus <> prop_hash_of_vdf proj
+R2284:2285 Aetheris_Consensus <> p2:14 var
+R2351:2363 Coq.ZArith.BinInt Z le_antisymm thm
+R2351:2363 Coq.ZArith.BinInt Z le_antisymm thm

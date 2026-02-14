@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "aetheris-core",
+    "aetheris-crypto",
+    "aetheris-zkp",
+    "aetheris-node",
+    "aetheris-wallet", "aetheris-ffi",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+ark-ff = "0.4"
+ark-std = "0.4"
+ark-serialize = "0.4"
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-groth16 = "0.4"
+ark-snark = "0.4"
+ark-bls12-381 = "0.4"
+blake3 = "1.3"
+hex = "0.4"
+libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "mdns", "kad", "identify", "macros", "tokio", "autonat", "relay", "dcutr", "websocket"] }
+futures = "0.3"
+rand = "0.8"
+rand_chacha = "0.3"
+clap = { version = "4.0", features = ["derive"] }
+zeroize = { version = "1.5", features = ["derive"] }
+subtle = "2.4"
+bip39 = "2.0"
+tiny-bip39 = "1.0"
+ed25519-dalek = "2.0"
+num-bigint = "0.4"
+num-traits = "0.2"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+aes-gcm = "0.10"
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2" }
+halo2curves = { version = "0.7.0", features = ["bn256"] }
+sled = "0.34"
+bincode = "1.3"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+poseidon = "0.3"
+poseidon-circuit = { git = "https://github.com/privacy-scaling-explorations/poseidon-circuit", branch = "main" }

@@ -1,0 +1,115 @@
+DIGEST 96269bc139c01116bcf57ee2f6248475
+FAetheris_Tree
+R74:86 Aetheris_Core <> <> lib
+R104:117 Coq.Lists.List <> <> lib
+R127:139 Coq.Lists.List ListNotations <> mod
+ax 248:251 <> hash
+R265:268 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R255:264 Aetheris_Core <> Commitment def
+R279:282 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R269:278 Aetheris_Core <> Commitment def
+R283:292 Aetheris_Core <> Commitment def
+ax 301:319 <> collision_resistant
+R345:354 Aetheris_Core <> Commitment def
+binder 331:332 <> x1:3
+binder 334:335 <> x2:4
+binder 337:338 <> y1:5
+binder 340:341 <> y2:6
+R383:386 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R370:372 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R360:363 Aetheris_Tree <> hash defax
+R365:366 Aetheris_Tree <> x1:3 var
+R368:369 Aetheris_Tree <> x2:4 var
+R373:376 Aetheris_Tree <> hash defax
+R378:379 Aetheris_Tree <> y1:5 var
+R381:382 Aetheris_Tree <> y2:6 var
+R394:397 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R389:391 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R387:388 Aetheris_Tree <> x1:3 var
+R392:393 Aetheris_Tree <> y1:5 var
+R400:402 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R398:399 Aetheris_Tree <> x2:4 var
+R403:404 Aetheris_Tree <> y2:6 var
+ind 530:542 <> PathDirection
+constr 547:550 <> Left
+constr 554:558 <> Right
+scheme 530:542 <> PathDirection_rect
+scheme 530:542 <> PathDirection_ind
+scheme 530:542 <> PathDirection_rec
+scheme 530:542 <> PathDirection_sind
+def 572:581 <> MerkleStep
+R600:602 Coq.Init.Datatypes <> ::type_scope:x_'*'_x not
+R587:599 Aetheris_Tree <> PathDirection ind
+R603:612 Aetheris_Core <> Commitment def
+def 632:641 <> MerklePath
+R646:649 Coq.Init.Datatypes <> list ind
+R651:660 Aetheris_Tree <> MerkleStep def
+def 673:684 <> compute_root
+R694:703 Aetheris_Core <> Commitment def
+binder 687:690 <> leaf:11
+R714:723 Aetheris_Tree <> MerklePath def
+binder 707:710 <> path:12
+R728:737 Aetheris_Core <> Commitment def
+R750:753 Aetheris_Tree <> path:12 var
+R764:765 Coq.Lists.List ListNotations ::list_scope:'['_']' not
+R770:773 Aetheris_Tree <> leaf:11 var
+R794:797 Coq.Init.Datatypes <> ::list_scope:x_'::'_x not
+R779:779 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R784:785 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R793:793 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R780:783 Aetheris_Tree <> Left constr
+R806:817 Aetheris_Tree <> compute_root:13 def
+R820:823 Aetheris_Tree <> hash defax
+R825:828 Aetheris_Tree <> leaf:11 var
+R864:867 Coq.Init.Datatypes <> ::list_scope:x_'::'_x not
+R848:848 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R854:855 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R863:863 Coq.Init.Datatypes <> ::core_scope:'('_x_','_x_','_'..'_','_x_')' not
+R849:853 Aetheris_Tree <> Right constr
+R876:887 Aetheris_Tree <> compute_root:13 def
+R890:893 Aetheris_Tree <> hash defax
+R903:906 Aetheris_Tree <> leaf:11 var
+ax 971:979 <> StateTree
+ax 999:1007 <> tree_root
+R1020:1023 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1011:1019 Aetheris_Tree <> StateTree defax
+R1024:1033 Aetheris_Core <> Commitment def
+def 1048:1072 <> has_valid_inclusion_proof
+R1082:1091 Aetheris_Core <> Commitment def
+binder 1075:1078 <> leaf:19
+R1102:1111 Aetheris_Tree <> MerklePath def
+binder 1095:1098 <> path:20
+R1122:1130 Aetheris_Tree <> StateTree defax
+binder 1115:1118 <> tree:21
+R1167:1169 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1145:1156 Aetheris_Tree <> compute_root def
+R1158:1161 Aetheris_Tree <> leaf:19 var
+R1163:1166 Aetheris_Tree <> path:20 var
+R1170:1178 Aetheris_Tree <> tree_root defax
+R1180:1183 Aetheris_Tree <> tree:21 var
+prf 1370:1384 <> path_uniqueness
+R1404:1413 Aetheris_Core <> Commitment def
+binder 1396:1397 <> l1:22
+binder 1399:1400 <> l2:23
+R1425:1434 Aetheris_Tree <> MerklePath def
+binder 1417:1418 <> p1:24
+binder 1420:1421 <> p2:25
+R1479:1484 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1458:1460 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1440:1451 Aetheris_Tree <> compute_root def
+R1453:1454 Aetheris_Tree <> l1:22 var
+R1456:1457 Aetheris_Tree <> p1:24 var
+R1461:1472 Aetheris_Tree <> compute_root def
+R1474:1475 Aetheris_Tree <> l2:23 var
+R1477:1478 Aetheris_Tree <> p2:25 var
+R1492:1546 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1487:1489 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1485:1486 Aetheris_Tree <> p1:24 var
+R1490:1491 Aetheris_Tree <> p2:25 var
+R1549:1551 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1547:1548 Aetheris_Tree <> l1:22 var
+R1552:1553 Aetheris_Tree <> l2:23 var
+R1790:1808 Aetheris_Tree <> collision_resistant prfax
+R1790:1808 Aetheris_Tree <> collision_resistant prfax
+R1879:1897 Aetheris_Tree <> collision_resistant prfax
+R1879:1897 Aetheris_Tree <> collision_resistant prfax

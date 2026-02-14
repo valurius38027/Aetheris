@@ -1,0 +1,134 @@
+DIGEST 35b7d131cd07402d3676a9a7b82b2cf1
+FAetheris_State
+R62:74 Aetheris_Core <> <> lib
+R92:104 Aetheris_Tree <> <> lib
+R123:136 Coq.Lists.List <> <> lib
+R146:158 Coq.Lists.List ListNotations <> mod
+rec 196:206 <> GlobalState
+proj 215:228 <> all_nullifiers
+proj 250:264 <> all_commitments
+proj 287:296 <> state_tree
+R232:235 Coq.Init.Datatypes <> list ind
+R237:245 Aetheris_Core <> Nullifier def
+R268:271 Coq.Init.Datatypes <> list ind
+R273:282 Aetheris_Core <> Commitment def
+R300:308 Aetheris_Tree <> StateTree defax
+def 591:609 <> is_valid_transition
+R616:626 Aetheris_State <> GlobalState rec
+binder 612:612 <> s:5
+R635:645 Aetheris_Core <> Transaction rec
+binder 630:631 <> tx:6
+R660:660 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R719:725 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 668:668 <> n:7
+R690:693 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R671:672 Coq.Lists.List <> In def
+R677:685 Aetheris_Core <> tx_inputs proj
+R687:688 Aetheris_State <> tx:6 var
+R674:674 Aetheris_State <> n:7 var
+R694:695 Coq.Init.Logic <> ::type_scope:'~'_x not
+R696:697 Coq.Lists.List <> In def
+R702:715 Aetheris_State <> all_nullifiers proj
+R717:717 Aetheris_State <> s:5 var
+R699:699 Aetheris_State <> n:7 var
+R726:726 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R820:826 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+binder 734:734 <> c:8
+R756:759 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R737:738 Coq.Lists.List <> In def
+R743:751 Aetheris_Core <> tx_inputs proj
+R753:754 Aetheris_State <> tx:6 var
+R740:740 Aetheris_State <> c:8 var
+R760:766 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+R771:772 Coq.Init.Logic <> ::type_scope:'exists'_x_'..'_x_','_x not
+binder 767:770 <> path:9
+R773:797 Aetheris_Tree <> has_valid_inclusion_proof def
+R799:799 Aetheris_State <> c:8 var
+R801:804 Aetheris_State <> path:9 var
+R807:816 Aetheris_State <> state_tree proj
+R818:818 Aetheris_State <> s:5 var
+R848:853 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R827:844 Aetheris_Core <> is_value_conserved def
+R846:847 Aetheris_State <> tx:6 var
+R865:867 Coq.Init.Peano <> ::nat_scope:x_'>'_x not
+R854:861 Aetheris_Core <> tx_proof proj
+R863:864 Aetheris_State <> tx:6 var
+ax 882:892 <> update_tree
+R905:908 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R896:904 Aetheris_Tree <> StateTree defax
+R924:927 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R909:912 Coq.Init.Datatypes <> list ind
+R914:923 Aetheris_Core <> Commitment def
+R928:936 Aetheris_Tree <> StateTree defax
+def 1020:1029 <> transition
+R1036:1046 Aetheris_State <> GlobalState rec
+binder 1032:1032 <> s:12
+R1055:1065 Aetheris_Core <> Transaction rec
+binder 1050:1051 <> tx:13
+R1070:1080 Aetheris_State <> GlobalState rec
+R1094:1107 Aetheris_State <> all_nullifiers proj
+R1094:1107 Aetheris_State <> all_nullifiers proj
+R1094:1107 Aetheris_State <> all_nullifiers proj
+R1154:1168 Aetheris_State <> all_commitments proj
+R1154:1168 Aetheris_State <> all_commitments proj
+R1217:1226 Aetheris_State <> state_tree proj
+R1217:1226 Aetheris_State <> state_tree proj
+R1112:1112 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1125:1130 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1147:1147 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1113:1121 Aetheris_Core <> tx_inputs proj
+R1123:1124 Aetheris_State <> tx:13 var
+R1131:1144 Aetheris_State <> all_nullifiers proj
+R1146:1146 Aetheris_State <> s:12 var
+R1173:1173 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1187:1192 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1210:1210 Coq.Init.Datatypes <> ::list_scope:x_'++'_x not
+R1174:1183 Aetheris_Core <> tx_outputs proj
+R1185:1186 Aetheris_State <> tx:13 var
+R1193:1207 Aetheris_State <> all_commitments proj
+R1209:1209 Aetheris_State <> s:12 var
+R1231:1241 Aetheris_State <> update_tree defax
+R1244:1253 Aetheris_State <> state_tree proj
+R1255:1255 Aetheris_State <> s:12 var
+R1259:1268 Aetheris_Core <> tx_outputs proj
+R1270:1271 Aetheris_State <> tx:13 var
+prf 1389:1420 <> nullifier_added_after_transition
+R1436:1446 Aetheris_State <> GlobalState rec
+binder 1432:1432 <> s:14
+R1455:1465 Aetheris_Core <> Transaction rec
+binder 1450:1451 <> tx:15
+R1473:1481 Aetheris_Core <> Nullifier def
+binder 1469:1469 <> n:16
+R1506:1509 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1487:1488 Coq.Lists.List <> In def
+R1493:1501 Aetheris_Core <> tx_inputs proj
+R1503:1504 Aetheris_State <> tx:15 var
+R1490:1490 Aetheris_State <> n:16 var
+R1510:1511 Coq.Lists.List <> In def
+R1516:1529 Aetheris_State <> all_nullifiers proj
+R1532:1541 Aetheris_State <> transition def
+R1543:1543 Aetheris_State <> s:14 var
+R1545:1546 Aetheris_State <> tx:15 var
+R1513:1513 Aetheris_State <> n:16 var
+R1594:1602 Coq.Lists.List <> in_or_app thm
+R1594:1602 Coq.Lists.List <> in_or_app thm
+prf 1713:1748 <> transition_preserves_past_nullifiers
+R1764:1774 Aetheris_State <> GlobalState rec
+binder 1760:1760 <> s:17
+R1783:1793 Aetheris_Core <> Transaction rec
+binder 1778:1779 <> tx:18
+R1801:1809 Aetheris_Core <> Nullifier def
+binder 1797:1797 <> n:19
+R1838:1841 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1815:1816 Coq.Lists.List <> In def
+R1821:1834 Aetheris_State <> all_nullifiers proj
+R1836:1836 Aetheris_State <> s:17 var
+R1818:1818 Aetheris_State <> n:19 var
+R1842:1843 Coq.Lists.List <> In def
+R1848:1861 Aetheris_State <> all_nullifiers proj
+R1864:1873 Aetheris_State <> transition def
+R1875:1875 Aetheris_State <> s:17 var
+R1877:1878 Aetheris_State <> tx:18 var
+R1845:1845 Aetheris_State <> n:19 var
+R1926:1934 Coq.Lists.List <> in_or_app thm
+R1926:1934 Coq.Lists.List <> in_or_app thm
