@@ -1,3 +1,4 @@
+use aetheris_core::{MAX_INPUTS, MAX_OUTPUTS};
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{Layouter, SimpleFloorPlanner, Value},
@@ -28,8 +29,6 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore, aead::Aead};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 
-const MAX_INPUTS: usize = 5;
-const MAX_OUTPUTS: usize = 5;
 const PROVING_K: u32 = 10;
 
 // Cached CRS and proving key — generated once, shared across prover & verifier.

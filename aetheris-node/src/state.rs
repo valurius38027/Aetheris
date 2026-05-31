@@ -327,6 +327,12 @@ impl LedgerState {
             );
         }
 
+        // N-1: Trim timestamps to prevent unbounded growth
+        if self.timestamps.len() > DIFFICULTY_ADJUSTMENT_INTERVAL as usize * 2 {
+            let trim_at = self.timestamps.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize;
+            self.timestamps.drain(0..trim_at);
+        }
+
         // 6. Persist Metadata
         self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
         self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
