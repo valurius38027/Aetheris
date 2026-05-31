@@ -1,0 +1,206 @@
+DIGEST fe4bc4df0315c6d2d1a74696eb2d5dc9
+FAetheris_Recursive_Aggregation
+R86:98 Aetheris_Core <> <> lib
+R116:134 Aetheris_ZK_Circuit <> <> lib
+R152:168 Coq.ZArith.ZArith <> <> lib
+R186:199 Coq.Lists.List <> <> lib
+R209:221 Coq.Lists.List ListNotations <> mod
+rec 297:307 <> AtomicProof
+proj 316:320 <> ap_tx
+proj 339:343 <> ap_zk
+proj 359:366 <> ap_valid
+R324:334 Aetheris_Core <> Transaction rec
+R347:354 Aetheris_ZK_Circuit <> ZK_Proof rec
+R386:403 Coq.Init.Logic <> ::type_scope:x_'/\'_x not
+R370:379 Aetheris_ZK_Circuit <> p_is_valid proj
+R381:385 Aetheris_Recursive_Aggregation <> ap_zk:3 meth
+R425:427 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R404:418 Aetheris_ZK_Circuit <> p_public_inputs proj
+R420:424 Aetheris_Recursive_Aggregation <> ap_zk:3 meth
+R428:428 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R457:458 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R488:488 Coq.Lists.List ListNotations ::list_scope:'['_x_';'_x_';'_'..'_';'_x_']' not
+R429:436 Coq.ZArith.BinInt Z of_nat def
+R439:449 Aetheris_Core <> tx_total_in proj
+R451:455 Aetheris_Recursive_Aggregation <> ap_tx:2 meth
+R459:466 Coq.ZArith.BinInt Z of_nat def
+R469:480 Aetheris_Core <> tx_total_out proj
+R482:486 Aetheris_Recursive_Aggregation <> ap_tx:2 meth
+rec 555:568 <> AggregateProof
+proj 577:583 <> agg_txs
+proj 607:620 <> agg_proof_data
+proj 668:679 <> agg_is_valid
+R587:590 Coq.Init.Datatypes <> list ind
+R592:602 Aetheris_Core <> Transaction rec
+R624:627 Coq.Init.Datatypes <> list ind
+R629:629 Coq.Numbers.BinNums <> Z ind
+ax 741:749 <> aggregate
+R767:770 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R753:766 Aetheris_Recursive_Aggregation <> AggregateProof rec
+R785:788 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R771:784 Aetheris_Recursive_Aggregation <> AggregateProof rec
+R789:802 Aetheris_Recursive_Aggregation <> AggregateProof rec
+ax 812:834 <> aggregation_associative
+binder 845:846 <> p1:11
+binder 848:849 <> p2:12
+binder 851:852 <> p3:13
+R887:889 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R857:865 Aetheris_Recursive_Aggregation <> aggregate defax
+R867:868 Aetheris_Recursive_Aggregation <> p1:11 var
+R871:879 Aetheris_Recursive_Aggregation <> aggregate defax
+R881:882 Aetheris_Recursive_Aggregation <> p2:12 var
+R884:885 Aetheris_Recursive_Aggregation <> p3:13 var
+R890:898 Aetheris_Recursive_Aggregation <> aggregate defax
+R901:909 Aetheris_Recursive_Aggregation <> aggregate defax
+R911:912 Aetheris_Recursive_Aggregation <> p1:11 var
+R914:915 Aetheris_Recursive_Aggregation <> p2:12 var
+R918:919 Aetheris_Recursive_Aggregation <> p3:13 var
+ax 963:983 <> verify_aggregate_data
+R1001:1004 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R987:1000 Aetheris_Recursive_Aggregation <> AggregateProof rec
+rec 1019:1023 <> Block
+proj 1032:1039 <> b_height
+proj 1050:1054 <> b_txs
+proj 1078:1088 <> b_agg_proof
+proj 1110:1122 <> b_proof_valid
+proj 1154:1168 <> b_data_verified
+R1043:1045 Coq.Init.Datatypes <> nat ind
+R1058:1061 Coq.Init.Datatypes <> list ind
+R1063:1073 Aetheris_Core <> Transaction rec
+R1092:1105 Aetheris_Recursive_Aggregation <> AggregateProof rec
+R1126:1137 Aetheris_Recursive_Aggregation <> agg_is_valid proj
+R1139:1149 Aetheris_Recursive_Aggregation <> b_agg_proof:21 meth
+R1172:1192 Aetheris_Recursive_Aggregation <> verify_aggregate_data defax
+R1194:1204 Aetheris_Recursive_Aggregation <> b_agg_proof:21 meth
+ax 1216:1241 <> aggregation_tx_consistency
+R1257:1261 Aetheris_Recursive_Aggregation <> Block rec
+binder 1253:1253 <> b:24
+R1280:1290 Aetheris_Core <> Transaction rec
+binder 1275:1276 <> tx:25
+R1309:1313 Coq.Init.Logic <> ::type_scope:x_'<->'_x not
+R1294:1295 Coq.Lists.List <> In def
+R1301:1305 Aetheris_Recursive_Aggregation <> b_txs proj
+R1307:1307 Aetheris_Recursive_Aggregation <> b:24 var
+R1297:1298 Aetheris_Recursive_Aggregation <> tx:25 var
+R1314:1315 Coq.Lists.List <> In def
+R1321:1327 Aetheris_Recursive_Aggregation <> agg_txs proj
+R1330:1340 Aetheris_Recursive_Aggregation <> b_agg_proof proj
+R1342:1342 Aetheris_Recursive_Aggregation <> b:24 var
+R1317:1318 Aetheris_Recursive_Aggregation <> tx:25 var
+ax 1354:1380 <> aggregation_soundness_axiom
+R1396:1409 Aetheris_Recursive_Aggregation <> AggregateProof rec
+binder 1392:1392 <> p:28
+R1429:1434 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1415:1426 Aetheris_Recursive_Aggregation <> agg_is_valid proj
+R1428:1428 Aetheris_Recursive_Aggregation <> p:28 var
+R1458:1463 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1435:1455 Aetheris_Recursive_Aggregation <> verify_aggregate_data defax
+R1457:1457 Aetheris_Recursive_Aggregation <> p:28 var
+R1477:1487 Aetheris_Core <> Transaction rec
+binder 1472:1473 <> tx:29
+R1508:1513 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1491:1492 Coq.Lists.List <> In def
+R1498:1504 Aetheris_Recursive_Aggregation <> agg_txs proj
+R1506:1506 Aetheris_Recursive_Aggregation <> p:28 var
+R1494:1495 Aetheris_Recursive_Aggregation <> tx:29 var
+R1528:1530 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1514:1524 Aetheris_Core <> tx_total_in proj
+R1526:1527 Aetheris_Recursive_Aggregation <> tx:29 var
+R1531:1542 Aetheris_Core <> tx_total_out proj
+R1544:1545 Aetheris_Recursive_Aggregation <> tx:29 var
+prf 1579:1597 <> aggregate_soundness
+R1613:1626 Aetheris_Recursive_Aggregation <> AggregateProof rec
+binder 1609:1609 <> p:32
+R1646:1651 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1632:1643 Aetheris_Recursive_Aggregation <> agg_is_valid proj
+R1645:1645 Aetheris_Recursive_Aggregation <> p:32 var
+R1675:1680 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1652:1672 Aetheris_Recursive_Aggregation <> verify_aggregate_data defax
+R1674:1674 Aetheris_Recursive_Aggregation <> p:32 var
+R1694:1704 Aetheris_Core <> Transaction rec
+binder 1689:1690 <> tx:33
+R1725:1730 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1708:1709 Coq.Lists.List <> In def
+R1715:1721 Aetheris_Recursive_Aggregation <> agg_txs proj
+R1723:1723 Aetheris_Recursive_Aggregation <> p:32 var
+R1711:1712 Aetheris_Recursive_Aggregation <> tx:33 var
+R1745:1747 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R1731:1741 Aetheris_Core <> tx_total_in proj
+R1743:1744 Aetheris_Recursive_Aggregation <> tx:33 var
+R1748:1759 Aetheris_Core <> tx_total_out proj
+R1761:1762 Aetheris_Recursive_Aggregation <> tx:33 var
+R1818:1844 Aetheris_Recursive_Aggregation <> aggregation_soundness_axiom prfax
+R1818:1844 Aetheris_Recursive_Aggregation <> aggregation_soundness_axiom prfax
+ind 1942:1951 <> BlockProof
+constr 1976:1985 <> BP_Genesis
+constr 2048:2059 <> BP_Recursive
+R1960:1963 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R1955:1959 Aetheris_Recursive_Aggregation <> Block rec
+R2001:2005 Aetheris_Recursive_Aggregation <> Block rec
+binder 1997:1997 <> b:36
+R2027:2030 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2019:2021 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R2009:2016 Aetheris_Recursive_Aggregation <> b_height proj
+R2018:2018 Aetheris_Recursive_Aggregation <> b:36 var
+R2031:2040 Aetheris_Recursive_Aggregation <> BlockProof:34 ind
+R2042:2042 Aetheris_Recursive_Aggregation <> b:36 var
+R2075:2079 Aetheris_Recursive_Aggregation <> Block rec
+binder 2071:2071 <> b:37
+R2092:2096 Aetheris_Recursive_Aggregation <> Block rec
+binder 2083:2088 <> b_prev:38
+R2138:2147 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2116:2118 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R2106:2113 Aetheris_Recursive_Aggregation <> b_height proj
+R2115:2115 Aetheris_Recursive_Aggregation <> b:37 var
+R2119:2119 Coq.Init.Datatypes <> S constr
+R2122:2129 Aetheris_Recursive_Aggregation <> b_height proj
+R2131:2136 Aetheris_Recursive_Aggregation <> b_prev:38 var
+R2165:2174 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2148:2157 Aetheris_Recursive_Aggregation <> BlockProof:34 ind
+R2159:2164 Aetheris_Recursive_Aggregation <> b_prev:38 var
+R2175:2184 Aetheris_Recursive_Aggregation <> BlockProof:34 ind
+R2186:2186 Aetheris_Recursive_Aggregation <> b:37 var
+scheme 1942:1951 <> BlockProof_ind
+scheme 1942:1951 <> BlockProof_sind
+def 2271:2284 <> block_balanced
+R2291:2295 Aetheris_Recursive_Aggregation <> Block rec
+binder 2287:2287 <> b:39
+binder 2317:2318 <> tx:40
+R2336:2339 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2321:2322 Coq.Lists.List <> In def
+R2328:2332 Aetheris_Recursive_Aggregation <> b_txs proj
+R2334:2334 Aetheris_Recursive_Aggregation <> b:39 var
+R2324:2325 Aetheris_Recursive_Aggregation <> tx:40 var
+R2354:2356 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R2340:2350 Aetheris_Core <> tx_total_in proj
+R2352:2353 Aetheris_Recursive_Aggregation <> tx:40 var
+R2357:2368 Aetheris_Core <> tx_total_out proj
+R2370:2371 Aetheris_Recursive_Aggregation <> tx:40 var
+ax 2412:2430 <> genesis_consistency
+R2446:2450 Aetheris_Recursive_Aggregation <> Block rec
+binder 2442:2442 <> b:41
+R2474:2477 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2466:2468 Coq.Init.Logic <> ::type_scope:x_'='_x not
+R2456:2463 Aetheris_Recursive_Aggregation <> b_height proj
+R2465:2465 Aetheris_Recursive_Aggregation <> b:41 var
+R2478:2491 Aetheris_Recursive_Aggregation <> block_balanced def
+R2493:2493 Aetheris_Recursive_Aggregation <> b:41 var
+prf 2505:2529 <> aetheris_ledger_integrity
+R2545:2549 Aetheris_Recursive_Aggregation <> Block rec
+binder 2541:2541 <> b:44
+R2567:2573 Coq.Init.Logic <> ::type_scope:x_'->'_x not
+R2555:2564 Aetheris_Recursive_Aggregation <> BlockProof ind
+R2566:2566 Aetheris_Recursive_Aggregation <> b:44 var
+R2574:2587 Aetheris_Recursive_Aggregation <> block_balanced def
+R2589:2589 Aetheris_Recursive_Aggregation <> b:44 var
+R2625:2638 Aetheris_Recursive_Aggregation <> block_balanced def
+R2693:2711 Aetheris_Recursive_Aggregation <> genesis_consistency prfax
+R2693:2711 Aetheris_Recursive_Aggregation <> genesis_consistency prfax
+R2787:2812 Aetheris_Recursive_Aggregation <> aggregation_tx_consistency prfax
+R2787:2812 Aetheris_Recursive_Aggregation <> aggregation_tx_consistency prfax
+R2837:2855 Aetheris_Recursive_Aggregation <> aggregate_soundness thm
+R2837:2855 Aetheris_Recursive_Aggregation <> aggregate_soundness thm
+R2871:2883 Aetheris_Recursive_Aggregation <> b_proof_valid proj
+R2871:2883 Aetheris_Recursive_Aggregation <> b_proof_valid proj
+R2902:2916 Aetheris_Recursive_Aggregation <> b_data_verified proj
+R2902:2916 Aetheris_Recursive_Aggregation <> b_data_verified proj

@@ -19,7 +19,11 @@
 
 ---
 
-## 2. 重构执行日志 (Refactoring Log)
+### 第四阶段：集体递归与聚合验证 (Recursive Aggregation)
+- [ ] **任务 4.1**: 创建 `Aetheris_Recursive_Aggregation.v`。建模 Halo2 Accumulation Scheme 的代数结构，证明聚合操作的结合律与正确性。
+- [ ] **任务 4.2**: 定义**归纳完备性 (Inductive Soundness)** 定理。证明只要初始状态合法且递归步有效，则任意深度的区块状态均满足守恒律。
+- [ ] **任务 4.3**: 建模**原子平等性 (Atomic Equality)**。证明生成原子证明的计算开销 $E_{at}$ 存在上界，确保低功耗设备的准入主权。
+
 
 ### 2026-02-12 21:00 (Consensus Alignment)
 - **状态**: 移除人为引入的 aBFT 投票构造，回归白皮书的纯数学仲裁。

@@ -5,6 +5,7 @@ members = [
     "aetheris-zkp",
     "aetheris-node",
     "aetheris-wallet", "aetheris-ffi",
+    "aetheris-recursive",
 ]
 resolver = "2"
 
@@ -38,10 +39,13 @@ num-bigint = "0.4"
 num-traits = "0.2"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aes-gcm = "0.10"
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2" }
-halo2curves = { version = "0.7.0", features = ["bn256"] }
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+halo2curves = { version = "0.7.0" }
 sled = "0.34"
 bincode = "1.3"
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 poseidon = "0.3"
 poseidon-circuit = { git = "https://github.com/privacy-scaling-explorations/poseidon-circuit", branch = "main" }
+
+[patch.crates-io]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }

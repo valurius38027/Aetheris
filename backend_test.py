@@ -10,8 +10,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 FFI_PATH = r"E:\Crazy\Aetheris\target\release\aetheris_ffi.dll"
 # The DB folder name as defined in Rust (it will be created in CWD)
 DB_NAME = "aetheris_vault_v2"
-# Shared Bridge Key for encrypted FFI communication
-BRIDGE_KEY = b"AETHERIS_SECURE_BRIDGE_2026_KEY!"
+# Dynamically obtained via aetheris_handshake() after aetheris_init()
+BRIDGE_KEY = None
 
 class BinaryBuffer(ctypes.Structure):
     _fields_ = [("ptr", ctypes.POINTER(ctypes.c_ubyte)),
@@ -49,7 +49,6 @@ def setup_ffi(lib):
     lib.aetheris_is_initialized.restype = ctypes.c_bool
     lib.aetheris_import_wallet.argtypes = [ctypes.c_char_p]
     lib.aetheris_import_wallet.restype = ctypes.c_bool
-    lib.aetheris_get_genesis_phrase.restype = ctypes.c_char_p
     lib.aetheris_get_node_status_bin.restype = BinaryBuffer
     lib.aetheris_execute_command_bin.argtypes = [BinaryBuffer]
     lib.aetheris_execute_command_bin.restype = BinaryBuffer
@@ -59,7 +58,6 @@ def setup_ffi(lib):
     lib.aetheris_get_last_error.restype = ctypes.c_char_p
     lib.aetheris_free_string.argtypes = [ctypes.c_void_p]
     lib.aetheris_solve_vdf_local.restype = ctypes.c_void_p
-    lib.aetheris_get_genesis_phrase.restype = ctypes.c_void_p
     
     # VDF Functions
     lib.aetheris_get_vdf_challenge.restype = ctypes.c_void_p
@@ -72,12 +70,32 @@ def setup_ffi(lib):
     lib.aetheris_set_wallet_password.argtypes = [ctypes.c_char_p]
     lib.aetheris_set_wallet_password.restype = ctypes.c_bool
 
+    # Recursive Proof Features
+    lib.aetheris_recursive_init.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+    lib.aetheris_recursive_init.restype = ctypes.c_int32
+    lib.aetheris_recursive_handle_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.aetheris_recursive_handle_event.restype = ctypes.c_int32
+    lib.aetheris_recursive_get_reward.argtypes = [ctypes.c_char_p]
+    lib.aetheris_recursive_get_reward.restype = ctypes.c_uint64
+    lib.aetheris_recursive_generate_atomic_proof.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    lib.aetheris_recursive_generate_atomic_proof.restype = ctypes.c_char_p
+
 def print_last_error(lib):
     err_ptr = lib.aetheris_get_last_error()
     if err_ptr:
         err_msg = ctypes.string_at(err_ptr).decode()
         if err_msg:
             print(f"   [Backend Error]: {err_msg}")
+
+def init_bridge_key(lib):
+    """Initialize bridge and set global BRIDGE_KEY via handshake."""
+    global BRIDGE_KEY
+    lib.aetheris_init()
+    key_buf = ctypes.create_string_buffer(32)
+    ret = lib.aetheris_handshake(key_buf, 32)
+    if ret != 0:
+        raise RuntimeError(f"Handshake failed: {ret}")
+    BRIDGE_KEY = bytes(key_buf)
 
 def test_genesis_wallet():
     print("\n--- Phase 1: Genesis Wallet (Aetheris Foundation) ---")
@@ -86,14 +104,12 @@ def test_genesis_wallet():
     
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
     
-    genesis_phrase_ptr = lib.aetheris_get_genesis_phrase()
-    genesis_phrase = ctypes.string_at(genesis_phrase_ptr)
+    genesis_phrase = b"legal winner thank year wave sausage worth useful legal winner thank yellow"
     print(f"Importing Genesis Phrase: {genesis_phrase.decode()}")
     
     lib.aetheris_import_wallet(genesis_phrase)
-    lib.aetheris_free_string(genesis_phrase_ptr)
     
     buf = lib.aetheris_get_node_status_bin()
     payload = bytes(ctypes.string_at(buf.ptr, buf.len))
@@ -118,7 +134,7 @@ def test_developer_wallet():
     
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
     
     dev_mnemonic = b"crystal sudden zero dynamic unique secret manual adjust orbit current focus total"
     print(f"Importing Developer Mnemonic: {dev_mnemonic.decode()}")
@@ -154,7 +170,7 @@ def test_tamper_prevention():
     # 1. 正常导入一个钱包
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
     
     dev_mnemonic = b"crystal sudden zero dynamic unique secret manual adjust orbit current focus total"
     lib.aetheris_import_wallet(dev_mnemonic)
@@ -178,7 +194,7 @@ def test_vdf_issuance():
     
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
     
     dev_mnemonic = b"crystal sudden zero dynamic unique secret manual adjust orbit current focus total"
     lib.aetheris_import_wallet(dev_mnemonic)
@@ -232,7 +248,7 @@ def test_encrypted_commands():
     print("\n--- Phase 5: Encrypted Command Interface Test ---")
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
 
     commands = ["get_version", "get_network_info", "invalid_cmd"]
     for cmd in commands:
@@ -266,7 +282,7 @@ def test_wallet_enhancements():
     
     lib = ctypes.CDLL(FFI_PATH)
     setup_ffi(lib)
-    lib.aetheris_init()
+    init_bridge_key(lib)
     
     # 1. Set Password and Import Wallet
     print("[Password Test] Setting wallet password...")
@@ -315,6 +331,54 @@ def test_wallet_enhancements():
     # Since we can't easily restart the DLL state here, we just verify the logic works.
     print("   (Note: DLL state is global in this script session)")
 
+def test_recursive_aggregation():
+    print("\n--- Phase 7: Recursive Proof Aggregation & P2P Incentive Test ---")
+    lib = ctypes.CDLL(FFI_PATH)
+    setup_ffi(lib)
+    
+    # 1. Initialize Recursive Manager
+    # Use a valid PeerId format (libp2p uses base58 encoded PeerIds)
+    peer_id = b"12D3KooWJvDx1p..." # This is a mock, but needs to be long enough
+    # To be safe, we can use a string that PeerId::from_str might accept or use a known valid one
+    # For testing, let's use a standard format
+    valid_peer_id = b"12D3KooWEu572Y69N6y4zY9Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z" 
+    shard_id = 1
+    print(f"[Init] Initializing Recursive Manager for Shard {shard_id}...")
+    res = lib.aetheris_recursive_init(valid_peer_id, shard_id)
+    if res != 0:
+        print(f"FAILED: Recursive Init returned {res}")
+        # Let's try an even simpler valid PeerId if it fails
+        return
+
+    # 2. Generate Real Halo2 Atomic Proof
+    print("[ZK] Generating real Halo2 Atomic Proof...")
+    tx_id = bytes([0] * 32)
+    zero_field = "0"
+    proof_json_ptr = lib.aetheris_recursive_generate_atomic_proof(tx_id, zero_field.encode(), zero_field.encode())
+    
+    if not proof_json_ptr:
+        print("FAILED: Proof generation failed")
+        return
+        
+    event_json = ctypes.cast(proof_json_ptr, ctypes.c_char_p).value
+    print(f"SUCCESS: Generated real proof (JSON length: {len(event_json)})")
+
+    # 3. Simulate Incoming Atomic Proof Event
+    print("[P2P] Simulating incoming REAL Atomic Proof from network...")
+    # Use a valid PeerId for the sender to avoid -2 error
+    valid_sender_peer = b"12D3KooW9T629XN6y4zY9Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z"
+    
+    res = lib.aetheris_recursive_handle_event(valid_sender_peer, event_json)
+    if res == 0:
+        print("SUCCESS: Real atomic proof handled and peer scored.")
+    else:
+        print(f"FAILED: Handle event returned {res}")
+
+    # 3. Check Reward Tracking
+    print("[Incentive] Checking reward for aggregator...")
+    reward = lib.aetheris_recursive_get_reward(valid_peer_id)
+    print(f"   Current reward for aggregator: {reward} AET")
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "genesis":
@@ -329,6 +393,8 @@ if __name__ == "__main__":
             test_encrypted_commands()
         elif sys.argv[1] == "wallet":
             test_wallet_enhancements()
+        elif sys.argv[1] == "recursive":
+            test_recursive_aggregation()
     else:
         # Run all in separate processes
         print("=== Aetheris Genesis Flow & Security Verification ===")
@@ -338,4 +404,5 @@ if __name__ == "__main__":
         subprocess.run([sys.executable, __file__, "vdf"])
         subprocess.run([sys.executable, __file__, "commands"])
         subprocess.run([sys.executable, __file__, "wallet"])
+        subprocess.run([sys.executable, __file__, "recursive"])
         print("\n=== All Tests Completed ===")
