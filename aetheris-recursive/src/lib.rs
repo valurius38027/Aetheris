@@ -1559,25 +1559,28 @@ impl Circuit<Fp> for RecursiveAggregationCircuit {
         kzg.verify_opening(layouter.namespace(|| "verify proof a"), &proof_a)?;
         kzg.verify_opening(layouter.namespace(|| "verify proof b"), &proof_b)?;
 
-        // 3. Update Accumulator (Recursive Aggregation)
-        let old_acc = ecc.generator();
-        
-        let (challenge_a, challenge_b) = layouter.assign_region(
-            || "assign aggregation challenges",
-            |mut region| {
-                let c1 = region.assign_advice(|| "challenge_a", config.poseidon_config.state[0], 0, || Value::known(Fp::from(999)))?;
-                let c2 = region.assign_advice(|| "challenge_b", config.poseidon_config.state[0], 1, || Value::known(Fp::from(888)))?;
-                Ok((
-                    Limb { value: Value::known(Fp::from(999)), cell: Some(c1.cell()) },
-                    Limb { value: Value::known(Fp::from(888)), cell: Some(c2.cell()) }
-                ))
-            }
+        // 3. Derive challenges from proof commitments via Poseidon (Fiat-Shamir)
+        let challenge_a = poseidon.hash(
+            layouter.namespace(|| "challenge_a from proof_a"),
+            &[
+                Limb { value: proof_a.commitment.x, cell: proof_a.commitment.x_cell },
+                Limb { value: proof_a.commitment.y, cell: proof_a.commitment.y_cell },
+            ],
+        )?;
+        let challenge_b = poseidon.hash(
+            layouter.namespace(|| "challenge_b from proof_b"),
+            &[
+                Limb { value: proof_b.commitment.x, cell: proof_b.commitment.x_cell },
+                Limb { value: proof_b.commitment.y, cell: proof_b.commitment.y_cell },
+            ],
         )?;
 
+        // 4. Update Accumulator (Recursive Aggregation)
+        let old_acc = ecc.generator();
         let acc_a = accumulator.update(layouter.namespace(|| "update acc a"), &old_acc, &proof_a.commitment, &challenge_a)?;
         let final_acc = accumulator.update(layouter.namespace(|| "update acc b"), &acc_a, &proof_b.commitment, &challenge_b)?;
 
-        // 4. Hash Public Inputs (including final accumulator)
+        // 5. Hash Public Inputs (including final accumulator)
         let mut hash_input = Vec::new();
         
         // Add final accumulator to hash inputs
@@ -1609,10 +1612,10 @@ impl Circuit<Fp> for RecursiveAggregationCircuit {
         // Print hash for debugging in tests
         pi_hash.value.map(|v| println!("PI Hash: {:?}", v));
 
-        // 5. Expose to instance column
+        // 6. Expose to instance column
         layouter.constrain_instance(pi_hash.cell.unwrap(), config.instance, 0)?;
 
-        // 6. Atomic Equality Check (Optimized)
+        // 7. Atomic Equality Check (Optimized)
         // This ensures two values are equal within the circuit with minimum constraints.
         // Instead of complex branch logic, we use a single constraint that (a - b) * inv = 0
         // Or even simpler for production: use Halo2's built-in equality constraints for direct cell mapping.
