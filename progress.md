@@ -784,4 +784,23 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 ---
 
+### Stage 17 — Production Readiness Roadmap (2026-05-31)
+
+**Assessment**: Alpha-3 — compiles, tests pass, mathematically correct. Not production-ready.
+
+**6-Phase plan** to Mainnet, detailed in `implementation_roadmap.md`:
+
+| Phase | Focus | Duration | Key Deliverables |
+|-------|-------|----------|------------------|
+| **A** | Security Hardening | 1-2 mo | Third-party audit, FFI zeroize, key derivation unification, C# frontend cleanup |
+| **B** | Performance Engineering | 1-2 mo | VDF incremental proof, Halo2 proving benchmarks, sled batch writes |
+| **C** | Network Robustness | 1-2 mo | Peer scoring, gossip spec alignment, bootstrap infra, NAT traversal testing |
+| **D** | Protocol Completeness | 2-3 mo | Recursive proof end-to-end, incentive model, genesis ceremony |
+| **E** | Formal Verification | 2-3 mo | Recursive aggregation Coq proof, TLA+ modeling, CI proof gates |
+| **F** | Deployment & Ops | 1 mo | Binary distribution, upgrade mechanism, monitoring, docs |
+
+**MVP (Testnet in ~4 months)**: A-1~A-5 + B-1 + C-1~C-3 + D-4.
+
+---
+
 *Last updated: 2026-05-31*
