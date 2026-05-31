@@ -1,4 +1,5 @@
-use aetheris_core::{Block, ShieldedOutput};
+use aetheris_core::{Block, ShieldedOutput, EXPECTED_GENESIS_HASH, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME};
+use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,8 @@ struct StateSnapshot {
     nullifiers: Vec<[u8; 32]>,
     commitments: Vec<[u8; 32]>,
     all_outputs: Vec<ShieldedOutput>,
+    current_difficulty: u64,
+    timestamps: Vec<u64>,
 }
 
 const SNAPSHOT_KEY: &[u8] = b"state_snapshot_v1";
@@ -25,6 +28,8 @@ pub struct LedgerState {
     pub height: u64,
     pub last_block_hash: [u8; 32],
     pub last_aggregate_proof: Vec<u8>,
+    pub current_difficulty: u64,
+    pub timestamps: Vec<u64>,
 }
 
 impl LedgerState {
@@ -42,6 +47,8 @@ impl LedgerState {
             height: 0,
             last_block_hash: [0u8; 32],
             last_aggregate_proof: b"genesis_proof".to_vec(),
+            current_difficulty: VDF_DIFFICULTY,
+            timestamps: Vec::new(),
         };
         state.restore_from_db();
         state
@@ -55,6 +62,8 @@ impl LedgerState {
 
         // Fallback: full replay (O(n) — slow for large chains)
         println!("[STATE] No snapshot found, replaying {} blocks from DB...", self.height);
+        self.current_difficulty = VDF_DIFFICULTY;
+        self.timestamps.clear();
         for i in 0..self.height {
             if let Ok(Some(block_bytes)) = self.db.get(format!("block_{}", i).as_bytes()) {
                 if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
@@ -62,6 +71,16 @@ impl LedgerState {
                     hasher.update(&block_bytes);
                     self.last_block_hash = hasher.finalize().into();
                     self.last_aggregate_proof = block.header.aggregate_proof.clone();
+                    self.timestamps.push(block.header.timestamp);
+
+                    // Recompute difficulty at each adjustment interval
+                    if self.height > 0 && i > 0 && i % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
+                        let window_start = self.timestamps.len().saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL as usize);
+                        let window: Vec<u64> = self.timestamps[window_start..].to_vec();
+                        self.current_difficulty = VDF::retarget_difficulty(
+                            self.current_difficulty, &window, TARGET_BLOCK_TIME,
+                        );
+                    }
 
                     for tx in &block.transactions {
                         for nf in &tx.inputs { self.nullifiers.insert(*nf); }
@@ -72,6 +91,11 @@ impl LedgerState {
                     }
                 }
             }
+        }
+        // Also check DB for persisted difficulty
+        if let Ok(Some(diff_bytes)) = self.db.get(b"current_difficulty") {
+            let diff_str = String::from_utf8_lossy(&diff_bytes);
+            self.current_difficulty = diff_str.parse().unwrap_or(VDF_DIFFICULTY);
         }
     }
 
@@ -134,6 +158,8 @@ impl LedgerState {
             nullifiers: self.nullifiers.iter().copied().collect(),
             commitments: self.commitments.iter().copied().collect(),
             all_outputs: self.all_outputs.clone(),
+            current_difficulty: self.current_difficulty,
+            timestamps: self.timestamps.clone(),
         };
         if let Ok(data) = bincode::serialize(&snapshot) {
             let _ = self.db.insert(SNAPSHOT_KEY, data);
@@ -156,6 +182,8 @@ impl LedgerState {
         self.nullifiers = snapshot.nullifiers.into_iter().collect();
         self.commitments = snapshot.commitments.into_iter().collect();
         self.all_outputs = snapshot.all_outputs;
+        self.current_difficulty = snapshot.current_difficulty;
+        self.timestamps = snapshot.timestamps;
         true
     }
 
@@ -186,11 +214,17 @@ impl LedgerState {
             hasher.update(&data);
             let current_hash = hex::encode(hasher.finalize().as_bytes());
             
-            // This is the hardcoded "Network ID"
-            const EXPECTED_GENESIS_HASH: &str = "78096181f215049a421f660f5454641579a32c636e0d9a695e2637a77519199c";
-            
+            // Network identity check
             if current_hash != EXPECTED_GENESIS_HASH {
                 return Err(format!("CRITICAL: Genesis block hash mismatch! Found: {}", current_hash));
+            }
+        } else {
+            // V-2: Validate difficulty matches expected chain value
+            if block.header.difficulty != self.current_difficulty {
+                return Err(format!(
+                    "Difficulty mismatch: block claims {}, chain expects {} at height {}",
+                    block.header.difficulty, self.current_difficulty, block.header.height
+                ));
             }
         }
 
@@ -224,7 +258,7 @@ impl LedgerState {
                 // Rule C: Calculation Variance Check (Dynamic VDF Estimation)
                 // We calculate the minimum possible time required based on the block's difficulty
                 // and a maximum "theoretically possible" VDF speed.
-                let min_required_time = block.header.difficulty / aetheris_core::MAX_VDF_SPEED;
+                let min_required_time = block.header.difficulty.div_ceil(aetheris_core::MAX_VDF_SPEED);
                 let elapsed = block.header.timestamp.saturating_sub(prev_block.header.timestamp);
                 
                 if elapsed < min_required_time {
@@ -272,19 +306,30 @@ impl LedgerState {
 
         let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
 
-        // 6. Update Metadata
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&data);
-        self.last_block_hash = hasher.finalize().into();
+        // 5. Update Metadata & Difficulty Retargeting
+        self.timestamps.push(block.header.timestamp);
+        self.last_block_hash = blake3::hash(&data).into();
         self.last_aggregate_proof = block.header.aggregate_proof.clone();
         self.height += 1;
 
-        // 5. Persist Block
+        // V-1: Retarget difficulty every DIFFICULTY_ADJUSTMENT_INTERVAL blocks
+        if self.height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && self.timestamps.len() >= 2 {
+            let window_start = self.timestamps.len().saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL as usize);
+            let window_timestamps: Vec<u64> = self.timestamps[window_start..].to_vec();
+            self.current_difficulty = VDF::retarget_difficulty(
+                self.current_difficulty,
+                &window_timestamps,
+                TARGET_BLOCK_TIME,
+            );
+        }
+
+        // 6. Persist Block
         self.db.insert(format!("block_{}", self.height - 1).as_bytes(), data).map_err(|e| e.to_string())?;
 
         // 7. Persist Metadata
         self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
         self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
+        self.db.insert(b"current_difficulty", self.current_difficulty.to_string().as_bytes()).map_err(|e| e.to_string())?;
         self.db.flush().map_err(|e| e.to_string())?;
 
         // 8. Persist state snapshot for fast O(1) startup
@@ -330,6 +375,7 @@ mod tests {
         
         // Manually set up state to skip height 0 hash validation in apply_block
         state.height = 1;
+        state.current_difficulty = 10_000_000;
         state.last_block_hash = [1u8; 32];
         let prev_timestamp = 1000;
         
@@ -421,6 +467,7 @@ mod tests {
 
         // Override state to simulate "at height 1"
         state.height = 1;
+        state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
         state.last_aggregate_proof =
             b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
@@ -482,6 +529,7 @@ mod tests {
         db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
         db.insert(b"height", &1u64.to_le_bytes()).unwrap();
         state.height = 1;
+        state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
         state.last_aggregate_proof =
             b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
@@ -581,6 +629,7 @@ mod tests {
         db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
         db.insert(b"height", &1u64.to_le_bytes()).unwrap();
         state.height = 1;
+        state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
         state.last_aggregate_proof =
             b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();

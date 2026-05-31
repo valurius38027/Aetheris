@@ -748,8 +748,8 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 | V-1 | VDF | **Difficulty never retargeted** — `retarget_difficulty()` defines correct formula but is **never called** in any production code path | `vdf.rs:135`, `state.rs`, `ffi/lib.rs:1563-1914` |
 | V-2 | VDF | **No expected-difficulty validation** — Node accepts blocks at any difficulty without checking chain-expected value. Spec §1.3.2 violated. | `state.rs:240-246` |
 | V-3 | VDF | **Proof computation 2x slower** — `π = x^⌊2^T/l⌋` uses separate ~200KB-exponent modpow instead of incremental accumulator during squaring loop | `vdf.rs:66-80` |
-| Z-1 | ZKP | **`verify_conservation` missing `.is_ok()`** — `verify_proof_multi` returns `Result<(), PlonkError>`, but is used directly as `bool` return (always truthy). **All proofs pass verification.** | `aetheris-zkp/src/lib.rs:416` |
-| Z-2 | ZKP | **`KzgChip::verify_opening` is a no-op** — Never computes `C - v·G₁`, never binds opening point `z` or evaluation `v`, returns `()` instead of `EcPoint` for accumulator. | `aetheris-recursive/src/lib.rs:1183-1202` |
+| Z-1 | ZKP | ~~**verify_conservation missing .is_ok()** — FALSE POSITIVE. verify_proof_multi returns `bool` directly. Code is correct.~~ | ~~`aetheris-zkp/src/lib.rs:416`~~ |
+| Z-2 | ZKP | **`KzgChip::verify_opening` partially deficient** — on-curve check + transcript binding present. Should return `EcPoint` for accumulator folding (currently caller manually passes `proof.commitment`, which works but is not idiomatic). | `aetheris-recursive/src/lib.rs:1183-1202` |
 | Z-3 | ZKP | **Accumulator challenges hardcoded** — `Fr::from(999)` / `Fr::from(888)` instead of Fiat-Shamir transcript. Accumulation soundness = 0. | `aetheris-recursive/src/lib.rs:1568-1569` |
 | P-1 | P2P | **FFI path never subscribes to gossip topics** — `aetheris_start_node` omits `subscribe_topics()`. FFI node is functionally deaf. | `aetheris-ffi/src/lib.rs:386` |
 | P-2 | P2P | **Sync topic mismatch** — FFI sends on `block_topic`, main.rs sends on `sync_topic`. Cross-path sync impossible. | `ffi/lib.rs:437` vs `main.rs:283` |
