@@ -63,19 +63,11 @@ impl VDF {
         
         let l = self.generate_l(&x, &y);
         
-        let mut q = BigUint::zero();
-        let mut r = BigUint::from(1u32);
-        let two = BigUint::from(2u32);
-        for _ in 0..self.difficulty {
-            let next_r = &r * &two;
-            q *= &two;
-            if next_r >= l {
-                q += &next_r / &l;
-                r = &next_r % &l;
-            } else {
-                r = next_r;
-            }
-        }
+        // r = 2^T mod l  (modpow with exponent T ~21 bits, very fast)
+        let r = BigUint::from(2u32).modpow(&BigUint::from(self.difficulty), &l);
+        // q = (2^T - r) / l  (one shift + sub + div, avoids T-iteration loop)
+        let two_pow_t = BigUint::one() << self.difficulty;
+        let q = (&two_pow_t - &r) / &l;
         
         let proof = x.modpow(&q, &self.modulus);
 
