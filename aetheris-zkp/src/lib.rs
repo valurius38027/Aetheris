@@ -60,9 +60,14 @@ fn ensure_keys() -> (&'static halo2_proofs::plonk::VerifyingKey<G1Affine>,
 }
 
 /// Simple circuit-friendly commitment: amount + blinding (in Fr field)
+/// Hashes blinding bytes; if hash >= Fr MODULUS, reduces by masking top bit.
 pub fn create_commitment(amount: u64, blinding: &[u8; 32]) -> [u8; 32] {
     let amt_fr = Fr::from(amount);
-    let blind_fr = Fr::from_bytes(blinding).unwrap_or(Fr::zero());
+    let h = blake3::hash(blinding);
+    let mut bytes = *h.as_bytes();
+    // Fr MODULUS = 0x30644e... — clear top 2 bits to guarantee < modulus
+    bytes[31] &= 0x2F;
+    let blind_fr = Fr::from_bytes(&bytes).expect("masked bytes always valid Fr");
     let commitment_fr = amt_fr + blind_fr;
     commitment_fr.to_bytes()
 }

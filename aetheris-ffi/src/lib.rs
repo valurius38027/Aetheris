@@ -41,7 +41,12 @@ use aetheris_recursive::RecursiveManagerHandle;
 use rand::RngCore;
 
 struct SendPtr<T>(*mut T);
+
+/// SAFETY: SendPtr is only used behind `Mutex<InnerState>`, ensuring
+/// thread-safe access. The wrapped raw pointer is never accessed
+/// concurrently without the mutex lock held.
 unsafe impl<T> Send for SendPtr<T> {}
+/// SAFETY: Same as Send — guarded by the enclosing Mutex.
 unsafe impl<T> Sync for SendPtr<T> {}
 
 static RECURSIVE_MANAGER: Lazy<RwLock<Option<SendPtr<RecursiveManagerHandle>>>> = Lazy::new(|| RwLock::new(None));
