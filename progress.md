@@ -741,21 +741,24 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 ---
 
-#### 🔴 P0 — Blocking (must fix before any production use)
+### Stage 16 — P0 Fix Round (2026-05-31)
 
-| ID | Module | Issue | Location |
-|----|--------|-------|----------|
-| V-1 | VDF | **Difficulty never retargeted** — `retarget_difficulty()` defines correct formula but is **never called** in any production code path | `vdf.rs:135`, `state.rs`, `ffi/lib.rs:1563-1914` |
-| V-2 | VDF | **No expected-difficulty validation** — Node accepts blocks at any difficulty without checking chain-expected value. Spec §1.3.2 violated. | `state.rs:240-246` |
-| V-3 | VDF | **Proof computation 2x slower** — `π = x^⌊2^T/l⌋` uses separate ~200KB-exponent modpow instead of incremental accumulator during squaring loop | `vdf.rs:66-80` |
-| Z-1 | ZKP | ~~**verify_conservation missing .is_ok()** — FALSE POSITIVE. verify_proof_multi returns `bool` directly. Code is correct.~~ | ~~`aetheris-zkp/src/lib.rs:416`~~ |
-| Z-2 | ZKP | **`KzgChip::verify_opening` partially deficient** — on-curve check + transcript binding present. Should return `EcPoint` for accumulator folding (currently caller manually passes `proof.commitment`, which works but is not idiomatic). | `aetheris-recursive/src/lib.rs:1183-1202` |
-| Z-3 | ZKP | **Accumulator challenges hardcoded** — `Fr::from(999)` / `Fr::from(888)` instead of Fiat-Shamir transcript. Accumulation soundness = 0. | `aetheris-recursive/src/lib.rs:1568-1569` |
-| P-1 | P2P | **FFI path never subscribes to gossip topics** — `aetheris_start_node` omits `subscribe_topics()`. FFI node is functionally deaf. | `aetheris-ffi/src/lib.rs:386` |
-| P-2 | P2P | **Sync topic mismatch** — FFI sends on `block_topic`, main.rs sends on `sync_topic`. Cross-path sync impossible. | `ffi/lib.rs:437` vs `main.rs:283` |
-| P-3 | P2P | **Transaction gossip one-way lost** — raw `Transaction` broadcast on `tx_topic`, but receiver only deserializes `MixMessage`/`BlockProposal`/`P2PMessage`. Silently dropped. | `p2p.rs:185-191`, `main.rs:342-511` |
-| F-1 | FFI | **C# frontend uses hardcoded bridge key** — Rust side switched to per-session key, but `AetherisBackend.cs:13` still uses `"AETHERIS_SECURE_BRIDGE_2026_KEY!"`. All transport encryption is ineffective. | `Aetheris.App/Core/AetherisBackend.cs:13` |
-| F-2 | FFI | **C# still calls `aetheris_get_genesis_phrase()`** — Rust removed it; both C# backends still declare and call it. Genesis seed leaks programmatically. | `Aetheris.App/Core/AetherisBackend.cs:138` |
+**Scope**: All non-frontend P0 items from Stage 15 audit resolved. 6 commits, 5 real bugs fixed, 1 false positive identified.
+
+| ID | Status | Module | Fix |
+|----|--------|--------|-----|
+| V-1 | ✅ | VDF | `retarget_difficulty()` called every `DIFFICULTY_ADJUSTMENT_INTERVAL` blocks in `state.rs:308-323` |
+| V-2 | ✅ | VDF | `apply_block_with_validation` checks `difficulty == current_difficulty` (`state.rs:221-228`) |
+| V-3 | ✅ | VDF | q-loop replaced with `modpow` + `(2^T - r) / l` — O(T) → O(log T) (`vdf.rs:66-78`) |
+| Z-1 | ❌ | ZKP | **False positive**: `verify_proof_multi` returns `bool` directly, not `Result` |
+| Z-2 | ⚠️ | ZKP | Partial: deferred pairing pattern is correct; minor API preference only |
+| Z-3 | ✅ | ZKP | Challenges derived from Poseidon hash of proof commitment (`recursive/src/lib.rs:1562-1576`) |
+| P-1 | ✅ | P2P | `subscribe_topics()` added to FFI `aetheris_start_node` (`ffi/src/lib.rs:395-399`) |
+| P-2 | ✅ | P2P | Sync topic unified to `sync_topic`; both topics accepted on listener |
+| P-3 | ✅ | P2P | Raw `Transaction` deserialization handler added to `main.rs:443-449` |
+| V-4 | ✅ | VDF | `MAX_VDF_SPEED` changed to `div_ceil` (`state.rs:260`) |
+| F-1 | ⏸️ | FFI | Frontend suspended — C# hardcoded bridge key |
+| F-2 | ⏸️ | FFI | Frontend suspended — C# genesis phrase call |
 
 #### 🟠 High Priority
 
