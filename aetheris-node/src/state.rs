@@ -293,7 +293,13 @@ impl LedgerState {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }
 
-        // 4. Update State (Nullifiers & Commitments)
+        let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
+
+        // P-5: Persist block to disk BEFORE updating in-memory state (write-ahead)
+        self.db.insert(format!("block_{}", block.header.height).as_bytes(), data.as_slice()).map_err(|e| e.to_string())?;
+        self.db.flush().map_err(|e| e.to_string())?;
+
+        // 4. Update State (Nullifiers & Commitments) — now safe after persist
         for tx in &block.transactions {
             for nf in &tx.inputs {
                 self.nullifiers.insert(*nf);
@@ -304,13 +310,11 @@ impl LedgerState {
             }
         }
 
-        let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
-
         // 5. Update Metadata & Difficulty Retargeting
         self.timestamps.push(block.header.timestamp);
         self.last_block_hash = blake3::hash(&data).into();
         self.last_aggregate_proof = block.header.aggregate_proof.clone();
-        self.height += 1;
+        self.height = block.header.height + 1;
 
         // V-1: Retarget difficulty every DIFFICULTY_ADJUSTMENT_INTERVAL blocks
         if self.height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && self.timestamps.len() >= 2 {
@@ -323,16 +327,13 @@ impl LedgerState {
             );
         }
 
-        // 6. Persist Block
-        self.db.insert(format!("block_{}", self.height - 1).as_bytes(), data).map_err(|e| e.to_string())?;
-
-        // 7. Persist Metadata
+        // 6. Persist Metadata
         self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
         self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
         self.db.insert(b"current_difficulty", self.current_difficulty.to_string().as_bytes()).map_err(|e| e.to_string())?;
         self.db.flush().map_err(|e| e.to_string())?;
 
-        // 8. Persist state snapshot for fast O(1) startup
+        // 7. Persist state snapshot for fast O(1) startup
         self.save_snapshot();
 
         Ok(())

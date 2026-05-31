@@ -90,8 +90,8 @@ impl MathematicalArbitrator {
         let actual_time = last_block.header.timestamp.saturating_sub(prev_adjustment_block.header.timestamp);
         let target_time = aetheris_core::TARGET_BLOCK_TIME * aetheris_core::DIFFICULTY_ADJUSTMENT_INTERVAL;
 
-        // Dampen the adjustment to prevent extreme fluctuations (max 2x or min 0.5x)
-        let actual_time = actual_time.clamp(target_time / 2, target_time * 2);
+        // Dampen the adjustment to prevent extreme fluctuations (max 4x or min 0.25x)
+        let actual_time = actual_time.clamp(target_time / 4, target_time * 4);
         
         let new_difficulty = (last_block.header.difficulty as u128 * target_time as u128 / actual_time.max(1) as u128) as u64;
         

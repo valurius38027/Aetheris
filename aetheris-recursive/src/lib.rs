@@ -26,6 +26,7 @@ use halo2_proofs::{
 };
 
 use halo2curves::bn256::{Bn256, G1Affine as PallasAffine, G1Affine, Fr as Fp, Fq};
+// Uses BN254/Grumpkin cycle, NOT Pasta curves. Grumpkin curve equation: y^2 = x^3 + 3
 use halo2curves::grumpkin::G1Affine as VestaAffine;
 use halo2curves::CurveAffine;
 use halo2curves::group::Curve;
@@ -455,7 +456,7 @@ impl EccChip {
             ]
         });
 
-        // On-curve check: y^2 = x^3 + 5
+        // On-curve check: y^2 = x^3 + 3 (Grumpkin curve, not Pasta)
         meta.create_gate("on_curve_check", |meta| {
             let s_on_curve = meta.query_selector(s_on_curve);
             let x = meta.query_advice(x, Rotation::cur());

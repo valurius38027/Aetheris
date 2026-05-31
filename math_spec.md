@@ -4,12 +4,12 @@
 
 ## 1. 可验证延迟函数 (VDF)
 
-为了实现公平的时间发行，Aetheris 采用 **Wesolowski VDF**，运行在 **虚二次域类群 (Class Groups of Imaginary Quadratic Fields)** 上。
+为了实现公平的时间发行，Aetheris 采用 **Wesolowski VDF**，运行在 **RSA-2048 群**上。
 
-### 1.1 类群选择
-选择类群而非 RSA 群是为了消除 **可信设置 (Trusted Setup)**。
-- **判别式 (Discriminant)**: $\Delta = -D$，其中 $D$ 是一个由创世哈希派生的巨大质数。
-- **群元素**: 由形式为 $(a, b, c)$ 的二元二次型 $ax^2 + bxy + cy^2$ 表示。
+### 1.1 RSA-2048 选择
+使用 RSA-2048 而非类群是基于实现成熟度和性能考虑（现有类群实现缺乏生产级审计，且类群运算在软件中比 RSA 慢约 5-10 倍）。
+- **模数**: 使用 RSA Factoring Challenge 的 RSA-2048 半素数（`0x9c...47`），其因数未公开。选择已知半素数而非自行生成保证**(1) 无后门**：即使模数创建者也无法声称其因数；(2) **可验证性**：任何人都可验证该模数与 RSA Factoring Challenge 一致。
+- **群运算**: 模 $N$ 的平方运算 $\text{mod } N$，使用标准大整数快速幂算法。
 
 ### 1.2 计算逻辑
 - **输入**: $x \in G, T$ (时间参数/难度)。
