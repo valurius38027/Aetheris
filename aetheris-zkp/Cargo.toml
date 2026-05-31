@@ -13,9 +13,10 @@ ark-snark = { workspace = true }
 ark-bls12-381 = { workspace = true }
 ark-serialize = { workspace = true }
 halo2_proofs = { workspace = true }
-halo2curves = { version = "0.7.0" }
+halo2curves = { workspace = true }
 rand_chacha = { workspace = true }
 rand = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 aes-gcm = { workspace = true }
+x25519-dalek = { workspace = true }

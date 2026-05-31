@@ -1,7 +1,21 @@
 use aetheris_core::{Block, ShieldedOutput};
+use aetheris_zkp::build_merkle_root;
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct StateSnapshot {
+    height: u64,
+    last_block_hash: [u8; 32],
+    last_aggregate_proof: Vec<u8>,
+    nullifiers: Vec<[u8; 32]>,
+    commitments: Vec<[u8; 32]>,
+    all_outputs: Vec<ShieldedOutput>,
+}
+
+const SNAPSHOT_KEY: &[u8] = b"state_snapshot_v1";
 
 pub struct LedgerState {
     pub nullifiers: HashSet<[u8; 32]>,
@@ -34,24 +48,13 @@ impl LedgerState {
     }
 
     pub fn restore_from_db(&mut self) {
-        // Restore height
-        if let Ok(Some(h_bytes)) = self.db.get(b"height") {
-            if h_bytes.len() == 8 {
-                self.height = u64::from_le_bytes(h_bytes.as_ref().try_into().unwrap());
-            } else {
-                let h_str = String::from_utf8_lossy(&h_bytes);
-                self.height = h_str.parse().unwrap_or(0);
-            }
+        // Try snapshot first (O(1) startup)
+        if self.load_snapshot() {
+            return;
         }
 
-        // Restore last_block_hash from DB if it exists
-        if let Ok(Some(hash_bytes)) = self.db.get(b"last_block_hash") {
-            if hash_bytes.len() == 32 {
-                self.last_block_hash.copy_from_slice(&hash_bytes);
-            }
-        }
-        
-        // Restore nullifiers and commitments
+        // Fallback: full replay (O(n) — slow for large chains)
+        println!("[STATE] No snapshot found, replaying {} blocks from DB...", self.height);
         for i in 0..self.height {
             if let Ok(Some(block_bytes)) = self.db.get(format!("block_{}", i).as_bytes()) {
                 if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
@@ -101,14 +104,12 @@ impl LedgerState {
             self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
 
             // Update last_block_hash and last_aggregate_proof
-            if self.height > 0 {
+        if self.height > 0 {
                 let prev_height = self.height - 1;
                 if let Ok(Some(prev_block_bytes)) = self.db.get(format!("block_{}", prev_height).as_bytes()) {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update(&prev_block_bytes);
                     self.last_block_hash = hasher.finalize().into();
-                    let prev_block = bincode::deserialize::<Block>(&prev_block_bytes).map_err(|e| e.to_string())?;
-                    self.last_aggregate_proof = prev_block.header.aggregate_proof;
                 }
             } else {
                 self.last_block_hash = [0u8; 32];
@@ -124,6 +125,40 @@ impl LedgerState {
         }
     }
 
+    /// Save current state as a snapshot for fast O(1) startup.
+    fn save_snapshot(&self) {
+        let snapshot = StateSnapshot {
+            height: self.height,
+            last_block_hash: self.last_block_hash,
+            last_aggregate_proof: self.last_aggregate_proof.clone(),
+            nullifiers: self.nullifiers.iter().copied().collect(),
+            commitments: self.commitments.iter().copied().collect(),
+            all_outputs: self.all_outputs.clone(),
+        };
+        if let Ok(data) = bincode::serialize(&snapshot) {
+            let _ = self.db.insert(SNAPSHOT_KEY, data);
+            let _ = self.db.flush();
+        }
+    }
+
+    /// Load state from snapshot. Returns true if snapshot was loaded.
+    fn load_snapshot(&mut self) -> bool {
+        let data = match self.db.get(SNAPSHOT_KEY) {
+            Ok(Some(d)) => d,
+            _ => return false,
+        };
+        let Ok(snapshot): Result<StateSnapshot, _> = bincode::deserialize(&data) else {
+            return false;
+        };
+        self.height = snapshot.height;
+        self.last_block_hash = snapshot.last_block_hash;
+        self.last_aggregate_proof = snapshot.last_aggregate_proof;
+        self.nullifiers = snapshot.nullifiers.into_iter().collect();
+        self.commitments = snapshot.commitments.into_iter().collect();
+        self.all_outputs = snapshot.all_outputs;
+        true
+    }
+
     pub fn get_block(&self, height: u64) -> Option<Block> {
         if let Ok(Some(data)) = self.db.get(format!("block_{}", height).as_bytes()) {
             bincode::deserialize::<Block>(&data).ok()
@@ -133,9 +168,10 @@ impl LedgerState {
     }
 
     pub fn get_state_root(&self) -> [u8; 32] {
-        // In a real system, this would be a Merkle/JMT root.
-        // For the prototype, we use the last block hash as a state commitment proxy.
-        self.last_block_hash
+        let mut leaves: Vec<[u8; 32]> = self.nullifiers.iter().copied().collect();
+        leaves.extend(self.commitments.iter().copied());
+        leaves.sort();
+        build_merkle_root(&leaves)
     }
 
     pub fn apply_block(&mut self, block: Block) -> Result<(), String> {
@@ -251,6 +287,9 @@ impl LedgerState {
         self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
         self.db.flush().map_err(|e| e.to_string())?;
 
+        // 8. Persist state snapshot for fast O(1) startup
+        self.save_snapshot();
+
         Ok(())
     }
 
@@ -281,7 +320,7 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aetheris_core::{BlockHeader};
+    use aetheris_core::{BlockHeader, ShieldedOutput};
 
     #[test]
     fn test_vdf_dynamic_time_validation() {
@@ -341,5 +380,274 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(db_path);
+    }
+
+    #[test]
+    fn test_ledger_state_creation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let state = LedgerState::new(path);
+        println!("Created LedgerState with height: {}", state.height);
+        assert_eq!(state.height, 0);
+        assert_eq!(state.last_block_hash, [0u8; 32]);
+        assert_eq!(state.last_aggregate_proof, b"genesis_proof");
+        assert!(state.nullifiers.is_empty());
+        assert!(state.commitments.is_empty());
+        assert!(state.all_outputs.is_empty());
+    }
+
+    #[test]
+    fn test_block_application() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        // Insert mock block #0 in DB so parent validation can find it
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                aggregate_proof: vec![],
+                height: 0,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+
+        // Override state to simulate "at height 1"
+        state.height = 1;
+        state.last_block_hash = [42u8; 32];
+        state.last_aggregate_proof =
+            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        // Solve VDF and create aggregate proof for the new block
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+        let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
+            &state.last_aggregate_proof,
+            &[],
+            &[],
+            1,
+            &[0u8; 32],
+        ).unwrap();
+
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                aggregate_proof: agg_proof,
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+
+        let result = state.apply_block(block);
+        println!("Block application result: {:?}", result);
+        assert!(result.is_ok(), "Block application failed: {:?}", result);
+        assert_eq!(state.height, 2);
+        assert_ne!(state.last_block_hash, [0u8; 32]);
+        assert!(state.last_aggregate_proof.starts_with(b"aetheris_aggregate_v1_"));
+    }
+
+    #[test]
+    fn test_rollback_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        // Insert mock block #0
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                aggregate_proof: vec![],
+                height: 0,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+        state.height = 1;
+        state.last_block_hash = [42u8; 32];
+        state.last_aggregate_proof =
+            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        // Apply a block to get to height 2
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+        let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
+            &state.last_aggregate_proof, &[], &[], 1, &[0u8; 32],
+        ).unwrap();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                aggregate_proof: agg_proof,
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        state.apply_block(block).unwrap();
+        assert_eq!(state.height, 2);
+
+        // Rollback
+        let rollback_result = state.rollback_block();
+        println!("Rollback result: {:?}", rollback_result);
+        assert!(rollback_result.is_ok());
+        assert_eq!(state.height, 1);
+        // Height in DB should match
+        let h_bytes = db.get(b"height").unwrap().unwrap();
+        let h = u64::from_le_bytes(h_bytes.as_ref().try_into().unwrap());
+        assert_eq!(h, 1);
+    }
+
+    #[test]
+    fn test_snapshot_save_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        // Manually set state fields (simulating applied state)
+        state.height = 5;
+        state.last_block_hash = [0xAA; 32];
+        state.last_aggregate_proof = b"aetheris_aggregate_v1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec();
+        state.nullifiers.insert([1u8; 32]);
+        state.commitments.insert([2u8; 32]);
+        state.all_outputs.push(ShieldedOutput {
+            commitment: [3u8; 32],
+            ephemeral_key: [4u8; 32],
+            ciphertext: vec![5u8; 16],
+        });
+        // Persist metadata to DB so snapshot is consistent
+        db.insert(b"height", &state.height.to_le_bytes()).unwrap();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        // Save snapshot
+        state.save_snapshot();
+        println!("Saved snapshot at height {}", state.height);
+
+        // Create a fresh LedgerState on the same DB — it will restore via snapshot
+        let state2 = LedgerState::new_with_db(db.clone());
+        println!("Restored state height: {}", state2.height);
+        assert_eq!(state2.height, 5);
+        assert_eq!(state2.last_block_hash, [0xAA; 32]);
+        assert_eq!(state2.last_aggregate_proof,
+            b"aetheris_aggregate_v1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(state2.nullifiers.contains(&[1u8; 32]));
+        assert!(state2.commitments.contains(&[2u8; 32]));
+        assert_eq!(state2.all_outputs.len(), 1);
+        assert_eq!(state2.all_outputs[0].commitment, [3u8; 32]);
+    }
+
+    #[test]
+    fn test_reorganize_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        // Insert mock block #0
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                aggregate_proof: vec![],
+                height: 0,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+        state.height = 1;
+        state.last_block_hash = [42u8; 32];
+        state.last_aggregate_proof =
+            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        // Apply block A (height 1) — canonical chain goes to height 2
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_a, proof_a, _) = vdf.solve(&state.last_block_hash);
+        let agg_a = aetheris_zkp::ZKProofSystem::aggregate_proofs(
+            &state.last_aggregate_proof, &[], &[], 1, &[0u8; 32],
+        ).unwrap();
+        let block_a = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                vdf_result: vdf_a,
+                vdf_proof: proof_a,
+                aggregate_proof: agg_a.clone(),
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        state.apply_block(block_a.clone()).unwrap();
+        assert_eq!(state.height, 2);
+
+        // Reorganize to a different block B at height 1 (different hash via different state_root)
+        // After rollback, last_block_hash will be hash of block_0, and last_aggregate_proof
+        // will be the value that was set when block A was applied (agg_a).
+        let block_0_hash: [u8; 32] = {
+            let data = bincode::serialize(&prev_block).unwrap();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&data);
+            hasher.finalize().into()
+        };
+        let (vdf_b, proof_b, _) = vdf.solve(&block_0_hash);
+        let agg_b = aetheris_zkp::ZKProofSystem::aggregate_proofs(
+            &agg_a, &[], &[], 1, &[0xBBu8; 32],
+        ).unwrap();
+        let block_b = Block {
+            header: BlockHeader {
+                parent_hash: block_0_hash,
+                state_root: [0xBB; 32],
+                timestamp: 3000,
+                vdf_result: vdf_b,
+                vdf_proof: proof_b,
+                aggregate_proof: agg_b,
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+
+        let reorg_result = state.reorganize(vec![block_b.clone()]);
+        println!("Reorganize result: {:?}", reorg_result);
+        assert!(reorg_result.is_ok());
+        assert_eq!(state.height, 2);
+        // After reorganization the state_root in the block header should differ from block A's
+        // The last_block_hash for block B will be computed from serialized block_b
+        let expected_hash: [u8; 32] = {
+            let data = bincode::serialize(&block_b).unwrap();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&data);
+            hasher.finalize().into()
+        };
+        assert_eq!(state.last_block_hash, expected_hash,
+            "Reorganized chain should have block B's hash");
     }
 }

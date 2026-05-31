@@ -18,8 +18,30 @@
 
 ## 2. 安全性定理定义
 
-### 定理：主权一致性 (Sovereign Consistency)
+### 定理 2.1：主权一致性 (Sovereign Consistency)
 $\forall \text{ State } S, \forall \text{ Malicious Actors } M, \text{ if } Verify(\pi, S_{prev} \rightarrow S_{next}) = True \text{ and } \pi \text{ follows Formal\_Spec, then } S_{next} \text{ is valid.}$
+
+### 定理 2.2：主权完整性 (Sovereign Integrity)
+$\forall \text{ Node } V, \forall \text{ Adversary } A \text{ eclipsing } V, \forall \text{ Chain } C_{adv} \neq C_{honest}:$
+$V.\text{verify}(C_{adv}) \Rightarrow C_{adv} \text{ is valid}$
+
+即，即使 $V$ 被完全日蚀且仅接收攻击者提供的链 $C_{adv}$，$V$ 的本地验证保证：接受 $C_{adv}$ 当且仅当 $C_{adv}$ 是数学上合法的链。
+
+### 定理 2.3：日蚀可检测性 (Eclipse Detectability)
+$\forall \text{ Node } V, \text{ let } n = V.\text{vdf\_steps\_computed}, m = V.\text{blocks\_received}:$
+$n > m \Rightarrow V \text{ is eclipsed}$
+
+VDF 序列是确定性的，因此 $n \neq m$ 是日蚀的充分必要条件。
+
+### 定理 2.4：可恢复性 (Recoverability)
+$\forall \text{ Node } V, \forall \text{ Honest Network } H, \forall \text{ Eclipse Duration } \Delta t:$
+$V.\text{reconnect}(H) \Rightarrow V.\text{can\_determine\_canonical\_chain}()$
+
+### 定理 2.5：有限损害 (Bounded Harm)
+$\forall \text{ Adversary } A, \forall \text{ Node } V:$
+- $A$ cannot steal $V$'s funds (requires ZK key)
+- $A$ cannot double-spend against honest network (Nullifier uniqueness)
+- $A$ cannot create permanent fork (VDF chain determinism)
 
 ## 3. 验证路线图
 1. **阶段 1**: 使用 TLA+ 对 VDF 发行与主权同步逻辑进行建模。

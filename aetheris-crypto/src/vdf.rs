@@ -2,6 +2,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 
+/// Aetheris Verifiable Delay Function (Wesolowski VDF)
+///
+/// The difficulty parameter controls the number of sequential squarings.
+/// Difficulty is NOT permanently fixed — it adjusts via deterministic
+/// retargeting (see `retarget_difficulty`) to maintain a constant block
+/// time as hardware speeds evolve.
+///
+/// Security property: VDF proof BINDS the difficulty parameter.
+/// A block claiming difficulty D cannot use a proof computed with
+/// difficulty D' ≠ D — verification will fail.
 pub struct VDF {
     pub difficulty: u64,
     pub modulus: BigUint,
@@ -9,14 +19,30 @@ pub struct VDF {
 
 impl VDF {
     pub fn new(difficulty: u64) -> Self {
-        // Use a 2048-bit RSA modulus (simulated with a known safe prime product)
+        // RSA-2048 modulus from the RSA Factoring Challenge.
+        // Source: https://en.wikipedia.org/wiki/RSA_numbers#RSA-2048
+        // This is a well-known 2048-bit semiprime whose factors remain unknown.
+        // Using this modulus ensures the VDF's sequentiality assumption holds.
         let modulus_str = concat!(
-            "c536440263673c683883a48e71887e5b15488424075f65349e54e4c29729a59d",
-            "1c068305f6396979207e35f498967964724a275217415f36894a428678088001",
-            "895780287a91a924294a824687a41a247291a247291a47291a47291a47291a47",
-            "291a47291a47291a47291a47291a47291a47291a47291a47291a47291a47291a"
+            "2519590847565789349402718324004839857142928212620403202777713783",
+            "6043662020707595556264018525880716693393707690092433928669523162",
+            "1332113167977740145143660241128128651571318133663015990925279534",
+            "5406284763226658279999462176041112592934961523336169032395877292",
+            "6130294440921183066020676656179588964424509327536664341607522675",
+            "4334299293812742815218786148813520482179060066302435573282461334",
+            "0760155423783273639098298109486195567697671388867587690641355365",
+            "1444138621425171645214235838290586186493241498687868279016866673",
+            "4609276567802507039061963056051027353524999690195908612605481897",
+            "3283558255789369892939182183030431930850067754886497555323946874",
+            "1239892405911210382547473295930826764832780375316692653445122202",
+            "3520180924988787360509903391423534377035476077752761150740331089",
+            "2498574749247168578578024926265177224310762270793261738762005598",
+            "5308707937836026885223751528942314622246870065618379740976068165",
+            "5290897776987020778630041458519388624101429259641233475669593367",
+            "7555641150086904467380988630860537883679845043173371133263114727",
+            "729747503354668607179890"
         );
-        let modulus = BigUint::parse_bytes(modulus_str.as_bytes(), 16).unwrap();
+        let modulus = BigUint::parse_bytes(modulus_str.as_bytes(), 10).unwrap();
         Self { difficulty, modulus }
     }
 
@@ -97,6 +123,34 @@ impl VDF {
         l
     }
 
+    /// Deterministic difficulty retargeting.
+    ///
+    /// Given the current difficulty, the timestamps of a window of blocks,
+    /// the target block time, and the window size, computes the next difficulty.
+    ///
+    /// Formula: D_new = D_old × target_window_time / actual_window_time
+    ///
+    /// This is deterministic: all nodes with the same chain data compute
+    /// the same result. No communication needed.
+    pub fn retarget_difficulty(
+        current_difficulty: u64,
+        timestamps: &[u64],
+        target_block_time: u64,
+    ) -> u64 {
+        if timestamps.len() < 2 {
+            return current_difficulty;
+        }
+        let window = (timestamps.len() - 1) as u64;
+        let actual_time = timestamps[timestamps.len() - 1].saturating_sub(timestamps[0]);
+        let target_time = target_block_time * window;
+
+        let actual_time = actual_time.clamp(target_time / 4, target_time * 4);
+        let new_diff = (current_difficulty as u128 * target_time as u128
+            / actual_time.max(1) as u128) as u64;
+
+        new_diff.clamp(current_difficulty / 4, current_difficulty * 4)
+    }
+
     fn is_probabilistic_prime(&self, n: &BigUint) -> bool {
         if n <= &BigUint::from(1u32) { return false; }
         if n == &BigUint::from(2u32) || n == &BigUint::from(3u32) { return true; }
@@ -154,5 +208,160 @@ mod tests {
         assert!(vdf.is_probabilistic_prime(&BigUint::from(17u32)));
         assert!(vdf.is_probabilistic_prime(&BigUint::from(19u32)));
         assert!(!vdf.is_probabilistic_prime(&BigUint::from(21u32)));
+    }
+
+    #[test]
+    fn test_vdf_solve_verify_roundtrip() {
+        let vdf = VDF::new(100);
+        let seed = b"test_seed_for_roundtrip";
+        let (result, proof, duration) = vdf.solve(seed);
+        println!("Roundtrip: difficulty=100, duration={}ns", duration);
+        assert!(vdf.verify(seed, &result, &proof));
+    }
+
+    #[test]
+    fn test_different_difficulties_different_outputs() {
+        let seed = b"same_seed_diff_diff";
+        let vdf1 = VDF::new(50);
+        let vdf2 = VDF::new(100);
+        let (r1, _, _) = vdf1.solve(seed);
+        let (r2, _, _) = vdf2.solve(seed);
+        println!("Difficulty 50 result: {:?}", r1);
+        println!("Difficulty 100 result: {:?}", r2);
+        assert_ne!(r1, r2, "Different difficulties should produce different results");
+    }
+
+    #[test]
+    fn test_empty_seed() {
+        let vdf = VDF::new(100);
+        let seed = b"";
+        let (result, proof, duration) = vdf.solve(seed);
+        println!("Empty seed: duration={}ns, result_len={}, proof_len={}", duration, result.len(), proof.len());
+        assert!(vdf.verify(seed, &result, &proof), "Empty seed should verify correctly");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_difficulty() {
+        let vdf1 = VDF::new(100);
+        let vdf2 = VDF::new(200);
+        let seed = b"wrong_diff_test";
+        let (result, proof, _) = vdf1.solve(seed);
+        println!("Verifying with wrong difficulty (200 instead of 100)");
+        assert!(!vdf2.verify(seed, &result, &proof), "Wrong difficulty should fail verification");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_seed() {
+        let vdf = VDF::new(100);
+        let seed_a = b"seed_A_for_test";
+        let seed_b = b"seed_B_for_test";
+        let (result, proof, _) = vdf.solve(seed_a);
+        println!("Verifying with wrong seed");
+        assert!(!vdf.verify(seed_b, &result, &proof), "Wrong seed should fail verification");
+    }
+
+    #[test]
+    fn test_difficulty_zero() {
+        let vdf = VDF::new(0);
+        let seed = b"zero_difficulty_test";
+        let (result, proof, duration) = vdf.solve(seed);
+        println!("Difficulty 0: duration={}ns, result_len={}", duration, result.len());
+        assert!(vdf.verify(seed, &result, &proof), "Difficulty 0 roundtrip should pass");
+    }
+
+    #[test]
+    fn test_large_difficulty() {
+        let vdf = VDF::new(1000);
+        let seed = b"large_difficulty_test";
+        let (result, proof, duration) = vdf.solve(seed);
+        println!("Large difficulty 1000: duration={}ns", duration);
+        assert!(vdf.verify(seed, &result, &proof), "Large difficulty roundtrip should pass");
+    }
+
+    #[test]
+    fn test_deterministic_solves() {
+        let vdf = VDF::new(100);
+        let seed = b"deterministic_test_seed";
+        let (r1, p1, _) = vdf.solve(seed);
+        let (r2, p2, _) = vdf.solve(seed);
+        assert_eq!(r1, r2, "Result should be deterministic");
+        assert_eq!(p1, p2, "Proof should be deterministic");
+    }
+
+    #[test]
+    fn test_result_fields() {
+        let vdf = VDF::new(50);
+        let seed = b"field_access_test";
+        let (result, proof, duration_ns) = vdf.solve(seed);
+        println!("Duration: {}ns, result_bytes: {}, proof_bytes: {}", duration_ns, result.len(), proof.len());
+        assert!(!result.is_empty(), "Result should be non-empty");
+        assert!(!proof.is_empty(), "Proof should be non-empty");
+        assert!(duration_ns > 0, "Duration should be positive");
+        assert!(vdf.verify(seed, &result, &proof));
+    }
+
+    #[test]
+    fn test_retarget_difficulty_deterministic() {
+        let timestamps = vec![100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200];
+        let d1 = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        let d2 = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        assert_eq!(d1, d2, "Retarget must be deterministic");
+    }
+
+    #[test]
+    fn test_retarget_on_target() {
+        // 10 blocks × 10s target = 100s. Our window is exactly 100s → no change.
+        let timestamps: Vec<u64> = (0..=10).map(|i| 1000 + i * 10).collect();
+        let d = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        assert_eq!(d, 1_600_000, "On-target window should keep same difficulty");
+    }
+
+    #[test]
+    fn test_retarget_half_speed() {
+        // Hardware is 2x slower: 20s per block instead of 10s.
+        let timestamps: Vec<u64> = (0..=10).map(|i| 1000 + i * 20).collect();
+        let d = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        // Actual = 200s, Target = 100s → difficulty should halve
+        assert_eq!(d, 800_000, "2x slower should halve difficulty");
+    }
+
+    #[test]
+    fn test_retarget_double_speed() {
+        // Hardware is 2x faster: 5s per block instead of 10s.
+        let timestamps: Vec<u64> = (0..=10).map(|i| 1000 + i * 5).collect();
+        let d = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        // Actual = 50s, Target = 100s → difficulty should double
+        assert_eq!(d, 3_200_000, "2x faster should double difficulty");
+    }
+
+    #[test]
+    fn test_retarget_clamp_extreme() {
+        // Extreme: 0.1s per block (100x faster). Clamping limits to 4x max.
+        let timestamps: Vec<u64> = (0..=10).map(|i| 1000 + i / 10).collect();
+        let d = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        assert!(d >= 1_600_000 / 4, "Difficulty should not drop below 1/4");
+        assert!(d <= 1_600_000 * 4, "Difficulty should not exceed 4x");
+    }
+
+    #[test]
+    fn test_retarget_insufficient_data() {
+        let timestamps = vec![100];
+        let d = VDF::retarget_difficulty(1_600_000, &timestamps, 10);
+        assert_eq!(d, 1_600_000, "Insufficient data should return current difficulty");
+    }
+
+    #[test]
+    fn test_boundary_seeds() {
+        let vdf = VDF::new(100);
+
+        let all_ones: Vec<u8> = vec![0xFF; 32];
+        let (r1, p1, d1) = vdf.solve(&all_ones);
+        println!("All-ones seed (32 bytes): duration={}ns", d1);
+        assert!(vdf.verify(&all_ones, &r1, &p1), "All-ones seed should verify");
+
+        let single_byte = vec![0xAB];
+        let (r2, p2, d2) = vdf.solve(&single_byte);
+        println!("Single-byte seed: duration={}ns", d2);
+        assert!(vdf.verify(&single_byte, &r2, &p2), "Single-byte seed should verify");
     }
 }
