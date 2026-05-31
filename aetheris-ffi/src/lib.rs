@@ -392,7 +392,13 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                 }
                 
                 println!("[P2P] Network listening on {}", addr);
-                
+
+                // Subscribe to all gossip topics
+                if let Err(e) = network.subscribe_topics() {
+                    println!("[P2P] Failed to subscribe to topics: {}", e);
+                    return;
+                }
+
                 // Broadcast our own Mixnet PK
                 let my_pk = {
                     let state = STATE.lock().unwrap();
@@ -434,13 +440,13 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                             end_height: start_height + 50 // Sync in batches of 50
                                         };
                                         if let Ok(data) = serde_json::to_vec(&sync_req) {
-                                            let _ = network.swarm.behaviour_mut().gossipsub.publish(network.block_topic.clone(), data);
+                                            let _ = network.swarm.behaviour_mut().gossipsub.publish(network.sync_topic.clone(), data);
                                         }
                                     }
                                     NetworkCommand::SendSyncResponse { blocks, peer_id: _ } => {
                                         let resp = aetheris_core::P2PMessage::SyncResponse { blocks };
                                         if let Ok(data) = serde_json::to_vec(&resp) {
-                                            let _ = network.swarm.behaviour_mut().gossipsub.publish(network.block_topic.clone(), data);
+                                            let _ = network.swarm.behaviour_mut().gossipsub.publish(network.sync_topic.clone(), data);
                                         }
                                     }
                                     NetworkCommand::BroadcastMixnetPK(pk) => {
@@ -465,7 +471,7 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                                 let mut keys = PEER_KEYS.lock().unwrap();
                                                 keys.insert(peer_id, pk);
                                             }
-                                        } else if message.topic == network.block_topic.hash() {
+                                        } else if message.topic == network.block_topic.hash() || message.topic == network.sync_topic.hash() {
                                             if let Ok(p2p_msg) = serde_json::from_slice::<aetheris_core::P2PMessage>(&message.data) {
                                                 match p2p_msg {
                                                     aetheris_core::P2PMessage::SyncRequest { start_height, end_height } => {

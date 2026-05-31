@@ -440,7 +440,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     
-                    // 2. Handle P2P Sync Messages
+                    // 2. Handle raw Transaction on tx_topic (from p2p.rs broadcast_transaction)
+                    if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
+                        if let Err(e) = mempool.lock().unwrap().add_tx(tx) {
+                            println!("❌ Rejected tx_topic transaction: {}", e);
+                        }
+                        continue;
+                    }
+
+                    // 3. Handle P2P Sync Messages
                     if let Ok(p2p_msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
                         match p2p_msg {
                             P2PMessage::SyncRequest { start_height, end_height } => {
