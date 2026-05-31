@@ -52,14 +52,18 @@ impl VDF {
         let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         
         let x = BigUint::from_bytes_be(seed) % &self.modulus;
-        let x = if x < BigUint::one() { BigUint::from(2u32) } else { x };
+        let x = if x < BigUint::from(2u32) { BigUint::from(2u32) } else { x };
 
         let two = BigUint::from(2u32);
         let mut y = x.clone();
-        
+
         for _ in 0..self.difficulty {
             y = y.modpow(&two, &self.modulus);
         }
+
+        let l = self.generate_l(&x, &y);
+
+        // r = 2^T mod l  (modpow with exponent T ~21 bits, very fast)
         
         let l = self.generate_l(&x, &y);
         
@@ -82,7 +86,7 @@ impl VDF {
         if result.is_empty() || proof.is_empty() { return false; }
 
         let x = BigUint::from_bytes_be(seed) % &self.modulus;
-        let x = if x < BigUint::one() { BigUint::from(2u32) } else { x };
+        let x = if x < BigUint::from(2u32) { BigUint::from(2u32) } else { x };
         let y = BigUint::from_bytes_be(result);
         let pi = BigUint::from_bytes_be(proof);
         
