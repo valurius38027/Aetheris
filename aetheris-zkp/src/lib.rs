@@ -188,23 +188,31 @@ impl Circuit<Fr> for ValueConservationCircuit {
     }
 
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fr>) -> Result<(), ErrorFront> {
-        // ── Region 1: Value Conservation ──
-        let last_cell = layouter.assign_region(
-            || "value conservation",
+        // ── Merged Region: Value Conservation + Running-sum Range Proofs ──
+        // Each amount gets 65 contiguous rows: [conservation_row + 64 range_check rows]
+        // Conservation row i has amount in advice[0] and range_z (linked via constrain_equal).
+        // Range gate at row i+1 checks amt_i - 2*z_1 ∈ {0,1} via Rotation::prev().
+        let total_amounts = MAX_INPUTS + MAX_OUTPUTS;
+        let two_inv = Fr::from(2).invert().unwrap();
+
+        let (last_sum_cell, range_final_cells): (_, Vec<_>) = layouter.assign_region(
+            || "value conservation + range proofs",
             |mut region| {
-                let mut row = 0;
+                let mut row: usize = 0;
                 let mut running_sum = Fr::zero();
-                let mut last = None;
+                let mut last_sum = None;
+                let mut final_cells = Vec::with_capacity(total_amounts);
 
                 for i in 0..MAX_INPUTS {
+                    let amount = self.input_amounts.get(i).cloned().unwrap_or(0);
+                    let amt_fr = Fr::from(amount);
+
+                    // ── Conservation row ──
                     if row == 0 {
                         config.first_row_selector.enable(&mut region, row)?;
                     } else {
                         config.selector.enable(&mut region, row)?;
                     }
-
-                    let amount = self.input_amounts.get(i).cloned().unwrap_or(0);
-                    let amt_fr = Fr::from(amount);
 
                     let mut blinding_bytes = [0u8; 32];
                     if let Some(b) = self.input_blindings.get(i) {
@@ -214,21 +222,44 @@ impl Circuit<Fr> for ValueConservationCircuit {
 
                     running_sum += amt_fr;
 
-                    region.assign_advice(|| "input amount", config.advice[0], row, || Value::known(amt_fr))?;
+                    let amt_cell = region.assign_advice(|| "input amount", config.advice[0], row, || Value::known(amt_fr))?;
                     region.assign_advice(|| "input blinding", config.advice[1], row, || Value::known(blind_fr))?;
                     region.assign_advice(|| "input commitment", config.advice[2], row, || Value::known(amt_fr + blind_fr))?;
-                    let cell = region.assign_advice(|| "running sum", config.advice[3], row, || Value::known(running_sum))?;
+                    last_sum = Some(region.assign_advice(|| "running sum", config.advice[3], row, || Value::known(running_sum))?);
                     region.assign_advice(|| "indicator", config.advice[4], row, || Value::known(Fr::one()))?;
+                    // C2: Constrain amount == range_z start value
+                    let z0_cell = region.assign_advice(|| "range_z start", config.range_z, row, || Value::known(amt_fr))?;
+                    region.constrain_equal(amt_cell.cell(), z0_cell.cell())?;
 
-                    last = Some(cell);
-                    row += 1;
+                    // ── 64 range proof rows (z_1..z_64) ──
+                    let mut z = amt_fr;
+                    for bit_idx in 0..64 {
+                        row += 1;
+                        let bit = (amount >> bit_idx) & 1;
+                        z = (z - Fr::from(u64::from(bit))) * two_inv;
+                        config.range_selector.enable(&mut region, row)?;
+                        let cell = region.assign_advice(
+                            || format!("range z_{}", bit_idx + 1),
+                            config.range_z,
+                            row,
+                            || Value::known(z),
+                        )?;
+                        if bit_idx == 63 {
+                            final_cells.push(cell);
+                            let next_indicator = if i + 1 < MAX_INPUTS { Fr::one() } else { -Fr::one() };
+                            region.assign_advice(|| "range running sum", config.advice[3], row, || Value::known(running_sum))?;
+                            region.assign_advice(|| "range indicator", config.advice[4], row, || Value::known(next_indicator))?;
+                        }
+                    }
+                    row += 1; // past the last range check row
                 }
 
                 for i in 0..MAX_OUTPUTS {
-                    config.selector.enable(&mut region, row)?;
-
                     let amount = self.output_amounts.get(i).cloned().unwrap_or(0);
                     let amt_fr = Fr::from(amount);
+
+                    // ── Conservation row ──
+                    config.selector.enable(&mut region, row)?;
 
                     let mut blinding_bytes = [0u8; 32];
                     if let Some(b) = self.output_blindings.get(i) {
@@ -238,72 +269,45 @@ impl Circuit<Fr> for ValueConservationCircuit {
 
                     running_sum -= amt_fr;
 
-                    region.assign_advice(|| "output amount", config.advice[0], row, || Value::known(amt_fr))?;
+                    let amt_cell = region.assign_advice(|| "output amount", config.advice[0], row, || Value::known(amt_fr))?;
                     region.assign_advice(|| "output blinding", config.advice[1], row, || Value::known(blind_fr))?;
                     region.assign_advice(|| "output commitment", config.advice[2], row, || Value::known(amt_fr + blind_fr))?;
-                    let cell = region.assign_advice(|| "running sum", config.advice[3], row, || Value::known(running_sum))?;
+                    last_sum = Some(region.assign_advice(|| "running sum", config.advice[3], row, || Value::known(running_sum))?);
                     region.assign_advice(|| "indicator", config.advice[4], row, || Value::known(-Fr::one()))?;
+                    let z0_cell = region.assign_advice(|| "range_z start", config.range_z, row, || Value::known(amt_fr))?;
+                    region.constrain_equal(amt_cell.cell(), z0_cell.cell())?;
 
-                    last = Some(cell);
-                    row += 1;
-                }
-
-                Ok(last)
-            },
-        )?;
-
-        if let Some(cell) = last_cell {
-            layouter.constrain_instance(cell.cell(), config.instance, 0)?;
-        }
-
-        // ── Region 2: Running-sum Range Proofs ──
-        let total_amounts = MAX_INPUTS + MAX_OUTPUTS;
-        let range_start = total_amounts; // first free row after conservation
-        let two_inv = Fr::from(2).invert().unwrap();
-
-        let final_cells: Vec<_> = layouter.assign_region(
-            || "range checks via running sum",
-            |mut region| {
-                let mut cells = Vec::with_capacity(total_amounts);
-                for i in 0..total_amounts {
-                    let amount = if i < MAX_INPUTS {
-                        self.input_amounts.get(i).cloned().unwrap_or(0)
-                    } else {
-                        self.output_amounts.get(i).cloned().unwrap_or(0)
-                    };
-                    let amt_fr = Fr::from(amount);
-                    let base = range_start + i * 65; // 65 rows per amount
-
-                    region.assign_advice(
-                        || format!("range z_0 [{}]", i),
-                        config.range_z,
-                        base,
-                        || Value::known(amt_fr),
-                    )?;
-
+                    // ── 64 range proof rows (z_1..z_64) ──
                     let mut z = amt_fr;
                     for bit_idx in 0..64 {
+                        row += 1;
                         let bit = (amount >> bit_idx) & 1;
                         z = (z - Fr::from(u64::from(bit))) * two_inv;
-
-                        let r = base + 1 + bit_idx;
-                        config.range_selector.enable(&mut region, r)?;
+                        config.range_selector.enable(&mut region, row)?;
                         let cell = region.assign_advice(
-                            || format!("range z_{} [{}]", bit_idx + 1, i),
+                            || format!("range z_{}", bit_idx + 1),
                             config.range_z,
-                            r,
+                            row,
                             || Value::known(z),
                         )?;
                         if bit_idx == 63 {
-                            cells.push(cell);
+                            final_cells.push(cell);
+                            region.assign_advice(|| "range running sum out", config.advice[3], row, || Value::known(running_sum))?;
+                            region.assign_advice(|| "range indicator out", config.advice[4], row, || Value::known(-Fr::one()))?;
                         }
                     }
+                    row += 1;
                 }
-                Ok(cells)
+
+                Ok((last_sum, final_cells))
             },
         )?;
 
-        for (i, cell) in final_cells.into_iter().enumerate() {
+        if let Some(cell) = last_sum_cell {
+            layouter.constrain_instance(cell.cell(), config.instance, 0)?;
+        }
+
+        for (i, cell) in range_final_cells.into_iter().enumerate() {
             layouter.constrain_instance(cell.cell(), config.instance, 1 + i)?;
         }
 

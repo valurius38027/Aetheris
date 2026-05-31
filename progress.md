@@ -803,4 +803,40 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 ---
 
+### Stage 18 — 5-Agent Comprehensive Re-Audit (2026-05-31)
+
+5 parallel agents audited all 7 crates + FFI + wallet + tests. Found 12 CRITICAL + 8 HIGH new issues.
+
+#### 🔴 CRITICAL
+
+| ID | Module | Issue | Location |
+|----|--------|-------|----------|
+| C1 | VDF | Seed ≡ 1 mod N → trivial VDF solve (check only `x<1`, not `x<2`) | `vdf.rs:54-55` |
+| C2 | ZKP | No cross-constraint between advice[0] (amount) and range_z (range proof) → soundness hole | `aetheris-zkp/src/lib.rs:219,281` |
+| C3 | ZKP | `create_commitment` (hash+mask) vs circuit (`unwrap_or(Fr::zero())`) — different Fr for same blinding | `aetheris-zkp/src/lib.rs:63-72` vs `213` |
+| C4 | ZKP | Random CRS per process — proofs cannot cross process boundaries | `aetheris-zkp/src/lib.rs:40-44` |
+| C5 | Recursive | NonNative mul gate uses Fq modulus; witness uses Fr modulus — gate never satisfiable | `recursive/src/lib.rs:1327,1392` |
+| C6 | Recursive | Lookup guard is advice column — prover sets to 0, bypasses entire MSM table | `recursive/src/lib.rs:446-457` |
+| C7 | Recursive | NonNative add selector only active on row 0 — 4-row gate 3 rows unenforced | `recursive/src/lib.rs:1275-1300,1464` |
+| C8 | State | Stale snapshot → block loss on restart; snapshot short-circuits block replay | `state.rs:59` |
+| C9 | Wallet | Test mnemonics compiled into release binary — anyone derives genesis viewing key | `ffi/lib.rs:172-173` |
+| C10 | Wallet | Hardcoded nullifier index=0 — every send after first produces same nullifier | `wallet/main.rs:228` |
+| C11 | Mixnet | Mixnet packets absorbed at first hop — no re-encryption/forwarding | `main.rs:348-364` |
+| C12 | Test | `consensus.rs` — MathematicalArbitrator has ZERO tests | `consensus.rs` |
+
+#### 🟠 HIGH
+
+| ID | Module | Issue |
+|----|--------|-------|
+| H1 | ZKP | `i64::MIN` as `public_amount` causes overflow panic |
+| H2 | ZKP | `Fr::from_bytes` silently falls back to `Fr::zero()` — blinding collision |
+| H3 | Recursive | Accumulator starts at G, not identity — verifier must know to subtract G |
+| H4 | Recursive | No prime-order subgroup check on Grumpkin points — low-order point injection |
+| H5 | Node | `parent_hash` vs `ledger_lock.last_block_hash` — different computation, entropy chain broken |
+| H6 | FFI | Debug log prints viewing key to stdout |
+| H7 | FFI | `USER_PASSWORD` global `String` never zeroized |
+| H8 | Test | `test_change_output` asserts `commitment.len()` as amount — wrong field |
+
+---
+
 *Last updated: 2026-05-31*
