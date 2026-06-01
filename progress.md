@@ -867,11 +867,13 @@ Fixed 8 of 9 critical bugs (89%), 1 FALSE POSITIVE:
 | H6 | ✅ | Removed debug `println` that exposed viewing key |
 | H7 | ✅ | `USER_PASSWORD` wrapped in `Zeroizing<String>` for auto-zeroize on drop |
 | H8 | ✅ | Removed invalid assertion (`commitment.len()` as amount) from test |
+| FFI tests | ✅ | Added `reset_ffi_test_state()` + fix encrypted status decryption (was reading AES-GCM as plaintext) |
 
 ---
 
-*Last updated: 2026-06-01* (alpha-3 tag: C1–C6 + C8–C11 + H1+H2+H5+H6+H7+H8 + genesis hash fix)
+*Last updated: 2026-06-01* (alpha-3 tag: C1–C6 + C8–C11 + H1+H2+H5+H6+H7+H8 + FFI tests + docs aligned)
 
 ### FFI Tests
 
-**Pre-existing failures** (unchanged by our fixes): 2 FFI tests fail due to global state sharing (`STATE`, `TOKIO_RUNTIME`) between test cases and no P2P peers in test environment. Genesis hash mismatch was the primary FFI blocking issue and is now resolved via structural validation.
+**Status**: ✅ `--test-threads=1` 下 2/2 通过。并行模式受 Windows sled 文件锁限制。
+**Root causes fixed**: (1) 全局静态残留 → `reset_ffi_test_state()` 清理 12 statics (2) 状态数据 AES-GCM 加密 → 测试改为解密后读取 JSON

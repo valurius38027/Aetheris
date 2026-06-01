@@ -1,6 +1,6 @@
 # Aetheris (AET) 生产成熟路线图
 
-**评估版本**: Alpha-3 (2026-05-31)
+**评估版本**: Alpha-3 (2026-06-01)
 **目标**: Mainnet Beta — 预计 6-8 个月
 **MVP (Testnet)**: 预计 4 个月
 
@@ -11,11 +11,11 @@
 | # | 项目 | 优先级 | 状态 | 说明 |
 |---|------|--------|------|------|
 | A-1 | 第三方安全审计 | P0 | ❌ | 聘请外部团队审计所有 7 crate + FFI boundary |
-| A-2 | FFI 敏感数据 Zeroize | P1 | ❌ | `USER_PASSWORD` 从全局 `String` 改为 `SecretBox`；viewing_key/mnemonic 操作后清除 |
+| A-2 | FFI 敏感数据 Zeroize | P1 | ✅ | `USER_PASSWORD` 从全局 `String` 改为 `Zeroizing<String>` |
 | A-3 | 统一密钥派生 | P1 | ❌ | FFI (Keccak256) 与钱包 (blake3) viewing key 派生统一 |
-| A-4 | 移除二进制测试种子 | P1 | ❌ | `TEST_SEED_MNEMONIC`/`TEST_DEV_MNEMONIC` 移至 `#[cfg(test)]` |
+| A-4 | 移除二进制测试种子 | P1 | ✅ | `TEST_SEED_MNEMONIC`/`TEST_DEV_MNEMONIC` 移至 `#[cfg(debug_assertions)]` |
 | A-5 | C# 前端安全整治 | P1 | ⏸️ | 桥密钥会话化 + 移除 `aetheris_get_genesis_phrase()` |
-| A-6 | `unwrap_or(Fr::zero())` 审计 | P2 | ❌ | 全局搜索类似 Z-5 的静默降级模式 |
+| A-6 | `unwrap_or(Fr::zero())` 审计 | P2 | ✅ | 已全部替换为 blake3 hash + mask + `expect()` |
 
 ## Phase B — 性能工程 (Performance Engineering, 1-2 月)
 
