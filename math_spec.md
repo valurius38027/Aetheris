@@ -4,18 +4,103 @@
 
 ## 1. 可验证延迟函数 (VDF)
 
-为了实现公平的时间发行，Aetheris 采用 **Wesolowski VDF**，运行在 **RSA-2048 群**上。
+为了实现公平的时间发行，Aetheris 采用 **Wesolowski VDF**，运行在 **虚二次域类群 (Imaginary Quadratic Class Group)** 上。
 
-### 1.1 RSA-2048 选择
-使用 RSA-2048 而非类群是基于实现成熟度和性能考虑（现有类群实现缺乏生产级审计，且类群运算在软件中比 RSA 慢约 5-10 倍）。
-- **模数**: 使用 RSA Factoring Challenge 的 RSA-2048 半素数（`0x9c...47`），其因数未公开。选择已知半素数而非自行生成保证**(1) 无后门**：即使模数创建者也无法声称其因数；(2) **可验证性**：任何人都可验证该模数与 RSA Factoring Challenge 一致。
-- **群运算**: 模 $N$ 的平方运算 $\text{mod } N$，使用标准大整数快速幂算法。
+### 1.1 类群选择
+
+使用类群而非 RSA 群是基于 **零信任假设** 的安全考虑：
+
+| 方案 | 群阶可知性 | 可信设置 | 本方案选型理由 |
+|------|-----------|---------|---------------|
+| RSA-2048 群 | 若因数泄露则可知 | ❌ 需信任 RSA Labs 销毁了因数 | — |
+| **类群 Cl(Δ)** | **数学上不可知** | ✅ **零信任** | 即使无限计算能力也无法确定 h(Δ) |
+
+#### 1.1.1 虚二次域类群定义
+
+设 $D < 0$ 是一个 **基本判别式 (fundamental discriminant)**，即 $D \equiv 1 \pmod 4$ 且无平方因子，或 $D \equiv 0 \pmod 4$ 且 $D/4 \equiv 2,3 \pmod 4$ 且无平方因子。
+
+虚二次域 $\mathbb{Q}(\sqrt{D})$ 的类群 $\text{Cl}(D)$ 是 **二元二次型 (binary quadratic forms)** 在 Gauss 合成下的商群。
+
+#### 1.1.2 二元二次型
+
+一个二元二次型是三元组 $(a, b, c)$，表示多项式：
+
+$$f(x,y) = ax^2 + bxy + cy^2, \quad a,b,c \in \mathbb{Z}$$
+
+其 **判别式 (discriminant)** 为：
+
+$$\Delta = b^2 - 4ac = D$$
+
+我们只考虑 **本原 (primitive)** 型：$\gcd(a,b,c) = 1$，且 **正定 (positive definite)**：$a > 0$。
+
+#### 1.1.3 Gauss 合成（群运算）
+
+类群的群运算是 **形式合成 (form composition)** 后跟 **规约 (reduction)**：
+
+**合成算法**：给定 $f_1 = (a_1, b_1, c_1)$ 和 $f_2 = (a_2, b_2, c_2)$，计算 $f_3 = (a_3, b_3, c_3) = f_1 \circ f_2$：
+
+1. 计算 $g = \gcd(a_1, a_2, (b_1 + b_2)/2)$
+2. 计算 $s = \gcd(a_1/g, a_2/g)$，$n = a_1/g \cdot s$
+3. 解线性同余：$B \equiv b_1 \pmod{2a_1/g}$，$B \equiv b_2 \pmod{2a_2/g}$，$B^2 \equiv D \pmod{4g}$
+4. 计算 $a_3 = a_1 a_2 / g^2$，$b_3 = B \bmod 2a_3$，$c_3 = (B^2 - D) / (4a_3)$
+
+**规约算法**（确保唯一代表元）：对形式 $(a,b,c)$ 重复以下步骤直至 $|\sqrt{|D|/3}| < b \le \sqrt{|D|/3}$：
+
+1. 设 $r = \lfloor (b + \sqrt{|D|}) / (2a) \rfloor$，计算 $b' = 2ar - b$，$a' = ar^2 - br + c$
+2. 更新 $(a,b,c) = (a', b', a)$
+
+在规约后，每个类由唯一的一个 **已规约形式 (reduced form)** 表示：$|b| \le a \le \sqrt{|D|/3}$，且若 $a = |b|$ 则 $b \ge 0$。
+
+**群阶 $h(D)$**（类数）数学上不可计算——给定 $|D|$ 比特长 $k$，计算 $h(D)$ 的复杂度至少为 $O(2^{k/2 - o(k)})$。
+
+#### 1.1.4 Hash-to-Form 算法
+
+将种子 $s$ 确定性映射到类群元素（平方运算的初始值）：
+
+1. $h = \text{blake3}(b\text{"AETHERIS_VDF_CLASSGEN"} \| s)$
+2. 计算 $b = h \bmod 2\sqrt{|D|/3}$，使 $b \equiv D \pmod 2$
+3. 设 $a = \lfloor \sqrt{(b^2 - D)/4} \rfloor$，若 $4a \nmid (b^2 - D)$ 则递增 $b$
+4. 返回 $(a, b, (b^2 - D)/(4a))$ 的规约形式
+
+#### 1.1.5 算力门槛常数增速
+
+类群合成运算比 RSA 模乘慢约 2-3x，但这是 **常数倍数**——不改变 Wesolowski VDF 的序贯性安全属性。难度重定向机制自动补偿此常数差距。
+
+#### 1.1.6 判别式选择
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| $|D|$ | 2048 bits | 判别式大小（与 RSA-2048 等效安全级别） |
+| $D$ 形式 | $D \equiv 1 \pmod 4$ | 基本判别式，无平方因子 |
+| 生成方式 | 确定性 from blake3 seed | 可重复性，无需可信设置 |
 
 ### 1.2 计算逻辑
-- **输入**: $x \in G, T$ (时间参数/难度)。
-- **输出**: $y = x^{2^T}$。
-- **证明 $\pi$**: 为了证明 $y$ 的正确性，证明者计算 $\pi = x^{\lfloor 2^T / l \rfloor}$，其中 $l = Hash(x, y)$ 是一个大质数。
-- **验证**: 校验 $y = \pi^l \cdot x^{2^T \pmod l}$ 是否成立。
+
+- **群**: $\text{Cl}(D)$，虚二次域类群，判别式 $D$（2048 bit）
+- **群元素**: 已规约二元二次型 $(a,b,c)$
+- **元素运算**: $\cdot$ 表示 Gauss 合成后规约
+
+**Wesolowski VDF 协议**：
+
+- **输入**: 种子 $s$（转为群元素 $x \in \text{Cl}(D)$），时间参数 $T$（难度）
+- **平方链**: 重复平方 $T$ 次：$y = x^{2^T} = \underbrace{x \cdot x \cdot \dots \cdot x}_{2^T \text{ 次合成}}$
+- **证明 $\pi$**: 设 $l = \text{HashToPrime}(x, y)$ 为大素数，令 $q = \lfloor 2^T / l \rfloor$，则 $\pi = x^q$
+- **验证**: 校验 $y \stackrel{?}{=} \pi^l \cdot x^{2^T \bmod l}$
+  - 计算 $r = 2^T \bmod l$（$O(\log T)$ 次模运算）
+  - 验证 $\pi^l \cdot x^r = y$（两次合成运算）
+
+**与 RSA-VDF 的数学等价性**：
+
+| 组件 | RSA 群 | 类群 Cl(D) |
+|------|--------|-----------|
+| 群元素 | 整数 $\bmod N$ | 二元二次型 $(a,b,c)$ |
+| 群运算 · | 模乘 $(\times \bmod N)$ | Gauss 合成 + 规约 |
+| 单位元 | $1$ | $(1, b, (b^2-D)/4)$ |
+| 平方 | $(\cdot)^2 \bmod N$ | $(a,b,c) \circ (a,b,c)$ |
+| 指数 | 重复平方 | Double-and-add |
+| 阶 | $\varphi(N)$（不可知） | $h(D)$（不可知） |
+
+注意：Wesolowski 证明的验证方程式 **形式完全相同**——仅群运算具体实现不同。
 
 ### 1.3 难度自平衡 (Difficulty Self-Balancing)
 
@@ -49,8 +134,9 @@ $$T_{n+1} = \text{clamp}\left(T_n \times \frac{T_{target} \times N}{\sum_{i=n-N}
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
+| $|D|$ | 2048 bits | 类群判别式大小 |
 | $T_{genesis}$ | 1,600,000 | 初始难度（2026 年参考值） |
-| $T_{target}$ | 10 秒 | 目标出块时间 |
+| $T_{target}$ | 10 sec | 目标出块时间 |
 | $N$ | 10 | 重定向窗口 |
 | $M$ | 4 | 最大调整倍数（±4x 每窗口） |
 
@@ -114,7 +200,7 @@ Aetheris 的安全性不依赖"诚实多数"假设。以下定理证明即使在
 **定理 6.1（主权完整性）**：设节点 $V$ 被攻击者完全日蚀，仅接收攻击者提供的链 $C_{adv}$。若 $C_{adv}$ 包含任意非法状态转换（如伪造交易、双花、价值不守恒），则 $V$ 的本地验证必将拒绝 $C_{adv}$。
 
 *证明*：每个区块包含 VDF 证明 $\pi_{vdf}$ 和 ZK 聚合证明 $\Pi_n$。$V$ 独立验证：
-1. Wesolowski VDF 验证：$y \stackrel{?}{=} \pi^l \cdot x^{2^T \bmod l}$，此验证纯本地，零外部输入。
+1. Wesolowski VDF 验证（类群 $\text{Cl}(D)$）：$y \stackrel{?}{=} \pi^l \cdot x^{2^T \bmod l}$，群运算为 Gauss 合成，判别式 $D$ 的因子数学不可知，确保无 trapdoor。此验证纯本地，零外部输入。
 2. ZK 聚合证明验证：$\text{Verify}(\Pi_n, \text{State}_n)$，由 Halo2 的可靠性保证。
 3. Nullifier 唯一性检查：每个 Nullifier 在本地状态树中唯一。
 4. 创世锚定：链的根哈希必须等于本地存储的创世哈希。

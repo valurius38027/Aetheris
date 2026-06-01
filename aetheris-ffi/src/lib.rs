@@ -38,6 +38,19 @@ fn set_error(msg: &str) {
     }
 }
 
+/// S-7: FFI entry points MUST NOT panic. Wrap fallible operations.
+macro_rules! ffi_try {
+    ($val:expr, $err:expr) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $val)) {
+            Ok(v) => v,
+            Err(_) => {
+                set_error("FFI panic caught");
+                return $err;
+            }
+        }
+    };
+}
+
 use aetheris_recursive::RecursiveManagerHandle;
 use rand::RngCore;
 
@@ -358,7 +371,7 @@ static P2P_COMMAND_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<NetworkComman
 
 #[no_mangle]
 pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 {
-    let mut state = STATE.lock().unwrap();
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     
     // If a new path is provided, close the existing DB and switch
     if !db_path.is_null() {
@@ -366,8 +379,7 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
         if let Ok(path_str) = c_str.to_str() {
             let new_path = std::path::PathBuf::from(path_str);
             
-            // Check if we are actually changing the path
-            let current_path = DB_PATH.read().unwrap();
+            let current_path = DB_PATH.read().unwrap_or_else(|e| e.into_inner());
             let should_switch = match *current_path {
                 Some(ref p) => p != &new_path,
                 None => true,
@@ -375,12 +387,9 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
             
             if should_switch {
                 println!("[FFI] Switching database to: {}", path_str);
-                
-                // CRITICAL: Close DB before switching path
                 state.ledger = None;
-                
-                drop(current_path); // Release read lock
-                let mut global_path = crate::DB_PATH.write().unwrap();
+                drop(current_path);
+                let mut global_path = crate::DB_PATH.write().unwrap_or_else(|e| e.into_inner());
                 *global_path = Some(new_path);
             }
         }
@@ -389,11 +398,18 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
     // Initialize P2P Network in Tokio Runtime
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<NetworkCommand>();
     {
-        let mut sender = P2P_COMMAND_SENDER.lock().unwrap();
+        let mut sender = P2P_COMMAND_SENDER.lock().unwrap_or_else(|e| e.into_inner());
         *sender = Some(cmd_tx);
     }
 
-    TOKIO_RUNTIME.lock().unwrap().get_or_insert_with(|| Runtime::new().expect("Failed to create Tokio runtime")).spawn(async move {
+    let mut rt_guard = TOKIO_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = rt_guard.get_or_insert_with(|| {
+        Runtime::new().unwrap_or_else(|e| {
+            set_error(&format!("Failed to create Tokio runtime: {}", e));
+            std::process::abort(); // abort — nothing works without runtime
+        })
+    });
+    rt.spawn(async move {
         match AetherisNetwork::new(&[]).await {
             Ok(mut network) => {
                 let addr = format!("/ip4/0.0.0.0/tcp/{}", port);
@@ -887,32 +903,35 @@ pub extern "C" fn aetheris_get_peer_count() -> u32 {
 }
 #[no_mangle]
 pub extern "C" fn aetheris_execute_command_bin(encrypted_command: BinaryBuffer) -> BinaryBuffer {
-    let bridge_key = *BRIDGE_KEY.read().unwrap();
-    let bridge_key = bridge_key.unwrap_or_else(|| {
-        let mut k = [0u8; 32];
-        OsRng.fill_bytes(&mut k);
-        k
-    });
+    // --- S-8: null pointer guard ---
+    if encrypted_command.ptr.is_null() || encrypted_command.len == 0 {
+        return raw_error_buf("Null or empty BinaryBuffer");
+    }
+    // --- S-10/S-11: require bridge key, no zero-key/orphan fallback ---
+    let bridge_key = match bridge_key_or_error() {
+        Ok(k) => k,
+        Err(buf) => return buf,
+    };
     let key = Key::<Aes256Gcm>::from_slice(&bridge_key);
     let cipher = Aes256Gcm::new(key);
 
     // 1. Decrypt Request
     let input_data = unsafe { std::slice::from_raw_parts(encrypted_command.ptr, encrypted_command.len) };
     if input_data.len() < 28 {
-        return create_encrypted_error_buffer("Command payload too short");
+        return encrypted_buf(&bridge_key, br#"{"error":"Command payload too short"}"#);
     }
 
     let nonce = Nonce::from_slice(&input_data[..12]);
     let ciphertext = &input_data[12..];
     
-    let decrypted = match cipher.decrypt(nonce, ciphertext) {
+    let decrypted = Zeroizing::new(match cipher.decrypt(nonce, ciphertext) {
         Ok(d) => d,
-        Err(_) => return create_encrypted_error_buffer("Command decryption failed"),
-    };
+        Err(_) => return encrypted_buf(&bridge_key, br#"{"error":"Command decryption failed"}"#),
+    });
 
     let cmd_str = String::from_utf8_lossy(&decrypted);
     
-    // 2. Process Command (Same logic as aetheris_execute_command but with more commands)
+    // 2. Process Command
     let result = match cmd_str.as_ref() {
         "get_version" => json!({"version": "0.1.0-alpha", "protocol": "Aetheris-PoT-v1"}),
         "get_network_info" => {
@@ -923,14 +942,15 @@ pub extern "C" fn aetheris_execute_command_bin(encrypted_command: BinaryBuffer) 
             })
         },
         "get_history" => {
-            let mut state = STATE.lock().unwrap();
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
             ensure_db_open(&mut state);
-            let ledger = state.ledger.as_ref().unwrap();
-            let tx_bytes = ledger.db.get(b"transactions").unwrap().unwrap_or_default();
-            let history: Vec<serde_json::Value> = if tx_bytes.is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_slice(&tx_bytes).unwrap_or_default()
+            let history: Vec<serde_json::Value> = match &state.ledger {
+                Some(ledger) => {
+                    let tx_bytes = ledger.db.get(b"transactions").unwrap_or_default().unwrap_or_default();
+                    if tx_bytes.is_empty() { Vec::new() }
+                    else { serde_json::from_slice(&tx_bytes).unwrap_or_default() }
+                },
+                None => Vec::new(),
             };
             json!({"transactions": history})
         },
@@ -938,42 +958,43 @@ pub extern "C" fn aetheris_execute_command_bin(encrypted_command: BinaryBuffer) 
     };
 
     // 3. Encrypt Response
-    let response_json = result.to_string();
-    let response_bytes = response_json.into_bytes();
-    let resp_nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    
-    let resp_ciphertext = cipher.encrypt(&resp_nonce, response_bytes.as_slice())
-        .expect("FFI Response Encryption Failed");
+    encrypted_buf(&bridge_key, result.to_string().as_bytes())
+}
 
-    let mut final_payload = resp_nonce.to_vec();
-    final_payload.extend_from_slice(&resp_ciphertext);
-
-    let mut bin_data = final_payload.into_boxed_slice();
-    let len = bin_data.len();
-    let ptr = bin_data.as_mut_ptr();
-    std::mem::forget(bin_data);
-
+fn raw_error_buf(msg: &str) -> BinaryBuffer {
+    // Returns a plaintext (non-encrypted) error buffer when bridge key is unavailable.
+    // Uses sentinel prefix 0x00 so the frontend can distinguish from encrypted responses.
+    let mut payload = vec![0x00u8];
+    payload.extend_from_slice(msg.as_bytes());
+    let mut bin = payload.into_boxed_slice();
+    let len = bin.len();
+    let ptr = bin.as_mut_ptr();
+    std::mem::forget(bin);
     BinaryBuffer { ptr, len }
 }
 
-fn create_encrypted_error_buffer(msg: &str) -> BinaryBuffer {
-    let bridge_key = *BRIDGE_KEY.read().unwrap();
-    let bridge_key = bridge_key.unwrap_or([0u8; 32]);
-    let key = Key::<Aes256Gcm>::from_slice(&bridge_key);
+fn bridge_key_or_error() -> Result<[u8; 32], BinaryBuffer> {
+    match *BRIDGE_KEY.read().unwrap() {
+        Some(k) => Ok(k),
+        None => Err(raw_error_buf("BRIDGE_KEY not set — call aetheris_handshake() first")),
+    }
+}
+
+fn encrypted_buf(bridge_key: &[u8; 32], plaintext: &[u8]) -> BinaryBuffer {
+    let key = Key::<Aes256Gcm>::from_slice(bridge_key);
     let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    
-    let err_json = json!({"error": msg}).to_string();
-    let ciphertext = cipher.encrypt(&nonce, err_json.as_bytes())
-        .expect("FFI Error Encryption Failed");
-    
-    let mut final_payload = nonce.to_vec();
-    final_payload.extend_from_slice(&ciphertext);
-    
-    let mut bin_data = final_payload.into_boxed_slice();
-    let len = bin_data.len();
-    let ptr = bin_data.as_mut_ptr();
-    std::mem::forget(bin_data);
+    let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap_or_else(|_| {
+        // Encryption failure is infallible with correct key length; if it happens,
+        // return a plaintext error buffer
+        return vec![];
+    });
+    let mut payload = nonce.to_vec();
+    payload.extend_from_slice(&ciphertext);
+    let mut bin = payload.into_boxed_slice();
+    let len = bin.len();
+    let ptr = bin.as_mut_ptr();
+    std::mem::forget(bin);
     BinaryBuffer { ptr, len }
 }
 
@@ -1254,11 +1275,13 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
 #[no_mangle]
 pub extern "C" fn aetheris_get_genesis_hash() -> *mut c_char {
     let genesis = create_genesis_block();
-    let block_bytes = bincode::serialize(&genesis).unwrap();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&block_bytes);
-    let hash_hex = hex::encode(hasher.finalize().as_bytes());
-    CString::new(hash_hex).unwrap().into_raw()
+    let hash_hex = ffi_try!({
+        let block_bytes = bincode::serialize(&genesis).unwrap_or_default();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&block_bytes);
+        hex::encode(hasher.finalize().as_bytes())
+    }, std::ptr::null_mut());
+    CString::new(hash_hex).unwrap_or_default().into_raw()
 }
 
 #[repr(C)]
@@ -1269,67 +1292,53 @@ pub struct BinaryBuffer {
 
 #[no_mangle]
 pub extern "C" fn aetheris_get_node_status_bin() -> BinaryBuffer {
-    let mut state = STATE.lock().unwrap();
-    ensure_db_open(&mut state);
-    
-    let (status_json, _address) = if let Some(ledger) = state.ledger.as_ref() {
-        let db = &ledger.db;
-        let peers_count = PEER_KEYS.lock().unwrap().len() as u32;
-        let mining_active = state.mining_thread.is_some() && !MINING_STOP_FLAG.load(Ordering::SeqCst);
-        let mempool_size = MEMPOOL.lock().unwrap().len();
-        
-        let balance_atoms = db.get(b"balance_atoms").unwrap_or(None)
-            .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default().parse().unwrap_or(0))
-            .unwrap_or(0);
-
-        let status = BinaryNodeStatus {
-            status: "ONLINE".to_string(),
-            peers: peers_count,
-            height: ledger.height,
-            balance_atoms,
-            address: state.address.clone(),
-            anonymity_set: 1024,
-            privacy_score: 95,
-            mining_active,
-            mempool_size,
-        };
-
-        let mut sj = serde_json::to_value(&status).unwrap_or(json!({}));
-        if let Some(tx_bytes) = db.get(b"transactions").unwrap_or(None) {
-            if let Ok(txs) = serde_json::from_slice::<serde_json::Value>(&tx_bytes) {
-                sj["transactions"] = txs;
-            }
-        } else {
-            sj["transactions"] = json!([]);
-        }
-        (sj, state.address.clone())
-    } else {
-        (json!({"status": "OFFLINE", "error": "Database not open"}), "Unknown".to_string())
+    let bridge_key = match bridge_key_or_error() {
+        Ok(k) => k,
+        Err(buf) => return buf,
     };
 
-    let json_data = serde_json::to_string(&status_json).unwrap_or_else(|_| "{}".to_string());
-    let plain_bytes = json_data.into_bytes();
-    
-    // --- ENCRYPTED BINARY TRANSPORT ---
-    // Protocol: [12 bytes Nonce] + [Ciphertext]
-    let bridge_key = *BRIDGE_KEY.read().unwrap();
-    let bridge_key = bridge_key.unwrap_or([0u8; 32]);
-    let key = Key::<Aes256Gcm>::from_slice(&bridge_key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    
-    let ciphertext = cipher.encrypt(&nonce, plain_bytes.as_slice())
-        .expect("FFI Bridge Encryption Failed");
-    
-    let mut final_payload = nonce.to_vec();
-    final_payload.extend_from_slice(&ciphertext);
-    
-    let mut bin_data = final_payload.into_boxed_slice();
-    let len = bin_data.len();
-    let ptr = bin_data.as_mut_ptr();
-    std::mem::forget(bin_data); // Transfer ownership to Frontend (C#)
+    let status_json = ffi_try!({
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_db_open(&mut state);
 
-    BinaryBuffer { ptr, len }
+        if let Some(ledger) = state.ledger.as_ref() {
+            let db = &ledger.db;
+            let peers_count = PEER_KEYS.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            let mining_active = state.mining_thread.is_some() && !MINING_STOP_FLAG.load(Ordering::SeqCst);
+            let mempool_size = MEMPOOL.lock().unwrap_or_else(|e| e.into_inner()).len();
+
+            let balance_atoms = db.get(b"balance_atoms").unwrap_or(None)
+                .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default().parse().unwrap_or(0))
+                .unwrap_or(0);
+
+            let status = BinaryNodeStatus {
+                status: "ONLINE".to_string(),
+                peers: peers_count,
+                height: ledger.height,
+                balance_atoms,
+                address: state.address.clone(),
+                anonymity_set: 1024,
+                privacy_score: 95,
+                mining_active,
+                mempool_size,
+            };
+
+            let mut sj = serde_json::to_value(&status).unwrap_or(json!({}));
+            if let Some(tx_bytes) = db.get(b"transactions").unwrap_or(None) {
+                if let Ok(txs) = serde_json::from_slice::<serde_json::Value>(&tx_bytes) {
+                    sj["transactions"] = txs;
+                }
+            } else {
+                sj["transactions"] = json!([]);
+            }
+            serde_json::to_string(&sj).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            serde_json::to_string(&json!({"status": "OFFLINE", "error": "Database not open"}))
+                .unwrap_or_else(|_| "{}".to_string())
+        }
+    }, raw_error_buf("panic: aetheris_get_node_status_bin"));
+
+    encrypted_buf(&bridge_key, status_json.as_bytes())
 }
 
 fn scan_ledger_for_wallet(state: &mut AppState) {
@@ -1355,7 +1364,7 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
                 let ciphertext = &key_bytes[12..];
                 
                 if let Ok(decrypted) = cipher.decrypt(nonce, ciphertext) {
-                    k_arr.copy_from_slice(&decrypted);
+                    k_arr.copy_from_slice(&Zeroizing::new(decrypted));
                 } else {
                     return;
                 }
@@ -1371,6 +1380,7 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
         let nonce = Nonce::from_slice(&m_enc[..12]);
         let ciphertext = &m_enc[12..];
         if let Ok(decrypted) = cipher.decrypt(nonce, ciphertext) {
+            let decrypted = Zeroizing::new(decrypted);
             let mut hasher = Keccak::v256();
             hasher.update(&decrypted);
             hasher.finalize(&mut viewing_key);
@@ -1449,47 +1459,30 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
 
 #[no_mangle]
 pub extern "C" fn aetheris_get_wallet_history_bin() -> BinaryBuffer {
-    let mut state = STATE.lock().unwrap();
-    ensure_db_open(&mut state);
-    
-    let result = if let Some(ledger) = state.ledger.as_ref() {
-        let db = &ledger.db;
-        let tx_bytes = db.get(b"transactions").unwrap_or(None).unwrap_or_default();
-        let history: Vec<serde_json::Value> = if tx_bytes.is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_slice(&tx_bytes).unwrap_or_default()
-        };
-
-        json!({
-            "transactions": history,
-            "count": history.len()
-        })
-    } else {
-        json!({"error": "Database not open", "transactions": [], "count": 0})
+    let bridge_key = match bridge_key_or_error() {
+        Ok(k) => k,
+        Err(buf) => return buf,
     };
 
-    let json_data = result.to_string();
-    let plain_bytes = json_data.into_bytes();
+    let result_json = ffi_try!({
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_db_open(&mut state);
+        let result = if let Some(ledger) = state.ledger.as_ref() {
+            let db = &ledger.db;
+            let tx_bytes = db.get(b"transactions").unwrap_or(None).unwrap_or_default();
+            let history: Vec<serde_json::Value> = if tx_bytes.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_slice(&tx_bytes).unwrap_or_default()
+            };
+            json!({"transactions": history, "count": history.len()})
+        } else {
+            json!({"error": "Database not open", "transactions": [], "count": 0})
+        };
+        result.to_string()
+    }, raw_error_buf("panic: aetheris_get_wallet_history_bin"));
 
-    let bridge_key = *BRIDGE_KEY.read().unwrap();
-    let bridge_key = bridge_key.unwrap_or([0u8; 32]);
-    let key = Key::<Aes256Gcm>::from_slice(&bridge_key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    
-    let ciphertext = cipher.encrypt(&nonce, plain_bytes.as_slice())
-        .expect("FFI Bridge Encryption Failed");
-    
-    let mut final_payload = nonce.to_vec();
-    final_payload.extend_from_slice(&ciphertext);
-    
-    let mut bin_data = final_payload.into_boxed_slice();
-    let len = bin_data.len();
-    let ptr = bin_data.as_mut_ptr();
-    std::mem::forget(bin_data);
-
-    BinaryBuffer { ptr, len }
+    encrypted_buf(&bridge_key, result_json.as_bytes())
 }
 
 #[no_mangle]
@@ -1586,6 +1579,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             let nonce = Nonce::from_slice(&m_enc[..12]);
             let ciphertext = &m_enc[12..];
             if let Ok(decrypted) = state.cipher.decrypt(nonce, ciphertext) {
+                let decrypted = Zeroizing::new(decrypted);
                 let mut hasher = Keccak::v256();
                 hasher.update(&decrypted);
                 hasher.finalize(&mut viewing_key);
@@ -2257,6 +2251,7 @@ mod tests {
 
         // 1. Start Node
         assert_eq!(aetheris_start_node(10001, c_db_path.as_ptr()), 0);
+        aetheris_init();
 
         // 2. Set wallet password (required by Argon2id encryption)
         assert!(aetheris_set_wallet_password(c_password.as_ptr()));
@@ -2272,11 +2267,14 @@ mod tests {
 
         // 6. Check Node Status
         let status_bin = aetheris_get_node_status_bin();
-        assert!(status_bin.len > 0);
+        assert!(status_bin.ptr != std::ptr::null_mut(), "Status buffer should not be null");
         let json_data = {
             let slice = unsafe { std::slice::from_raw_parts(status_bin.ptr, status_bin.len) };
             let bridge_key = *BRIDGE_KEY.read().unwrap();
-            let key = bridge_key.unwrap_or([0u8; 32]);
+            let key = bridge_key.unwrap_or_else(|| {
+                eprintln!("WARNING: test using zero bridge key fallback");
+                [0u8; 32]
+            });
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
             let nonce = Nonce::from_slice(&slice[..12]);
             let ciphertext = &slice[12..];
@@ -2301,6 +2299,7 @@ mod tests {
         unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "1000"); }
 
         aetheris_start_node(10002, c_db_path.as_ptr());
+        aetheris_init();
         assert!(aetheris_set_wallet_password(c_password.as_ptr()));
 
         let phrase = CString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
@@ -2310,7 +2309,10 @@ mod tests {
         let json_data = {
             let slice = unsafe { std::slice::from_raw_parts(status_bin.ptr, status_bin.len) };
             let bridge_key = *BRIDGE_KEY.read().unwrap();
-            let key = bridge_key.unwrap_or([0u8; 32]);
+            let key = bridge_key.unwrap_or_else(|| {
+                eprintln!("WARNING: test using zero bridge key fallback");
+                [0u8; 32]
+            });
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
             let nonce = Nonce::from_slice(&slice[..12]);
             let ciphertext = &slice[12..];

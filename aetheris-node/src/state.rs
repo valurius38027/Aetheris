@@ -252,6 +252,11 @@ impl LedgerState {
             if block.transactions[1].outputs.len() != 2 || block.transactions[1].public_amount != 0 {
                 return Err("Genesis transfer transaction malformed".into());
             }
+
+            // Log genesis hash for debugging (non-deterministic due to ZKP randomness)
+            let block_data = bincode::serialize(&block).unwrap_or_default();
+            let block_hash = hex::encode(blake3::hash(&block_data).as_bytes());
+            println!("[GENESIS] Genesis block hash: {}", block_hash);
         } else {
             // V-2: Validate difficulty matches expected chain value
             if block.header.difficulty != self.current_difficulty {
@@ -439,7 +444,7 @@ mod tests {
             public_amount: 0,
             proof: vec![0u8; 32],
         };
-        let block = Block {
+        let _block = Block {
             header: BlockHeader {
                 parent_hash: [1u8; 32],
                 state_root: [0u8; 32],
