@@ -1324,7 +1324,7 @@ impl NonNativeChip {
                 r_sum = r_sum + meta.query_advice(limbs[3], Rotation(i as i32)) * p;
             }
             
-            let m = Expression::Constant(Fp::from_str_vartime("28948022309329048855892746252171976963363056481941560715954676764349963632653").unwrap());
+            let m = Expression::Constant(Fp::from_str_vartime("21888242871839275222246405745257275088548364400416034343698204186575808495617").unwrap());
             
             vec![s_mul * (a_sum * b_sum - (q_sum * m + r_sum))]
         });
@@ -1462,7 +1462,7 @@ impl NonNativeChip {
             || "nonnative add",
             |mut region| {
                 self.config.s_add.enable(&mut region, 0)?;
-                
+
                 let mut res_limbs = Vec::new();
                 let mut carry = Value::known(BigUint::zero());
                 let limb_base = BigUint::from(2u64).pow(64);
