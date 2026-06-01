@@ -38,8 +38,7 @@ static CACHED_PK: OnceLock<halo2_proofs::plonk::ProvingKey<G1Affine>> = OnceLock
 
 fn ensure_params() -> &'static ParamsKZG<Bn256> {
     CACHED_PARAMS.get_or_init(|| {
-        let mut seed = [0u8; 32];
-        CryptoRng.fill_bytes(&mut seed);
+        let seed = *b"Aetheris ZK CRS deterministic v1";
         ParamsKZG::<Bn256>::setup(PROVING_K, &mut ChaCha20Rng::from_seed(seed))
     })
 }
@@ -343,8 +342,7 @@ impl ZKProofSystem {
     /// Set up KZG parameters (Common Reference String)
     /// In production, this would be generated via a MPC ceremony.
     pub fn setup_params(k: u32) -> ParamsKZG<Bn256> {
-        let mut seed = [0u8; 32];
-        CryptoRng.fill_bytes(&mut seed);
+        let seed = *b"Aetheris ZK CRS deterministic v1";
         ParamsKZG::<Bn256>::setup(k, &mut ChaCha20Rng::from_seed(seed))
     }
 
