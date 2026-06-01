@@ -468,18 +468,20 @@ impl ZKProofSystem {
     /// Aggregate multiple transaction proofs into a single authenticated commitment
     /// using a Merkle tree over tx proofs, bound with the previous block proof,
     /// block height, and state root.
+    /// Each tx must supply its output commitments for individual proof verification.
     pub fn aggregate_proofs(
         last_block_proof: &[u8],
         tx_proofs: &[Vec<u8>],
+        tx_commitments: &[Vec<[u8; 32]>],
         public_amounts: &[i64],
         height: u64,
         state_root: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
-        if tx_proofs.len() != public_amounts.len() {
+        if tx_proofs.len() != public_amounts.len() || tx_proofs.len() != tx_commitments.len() {
             return Err("Proof count mismatch".to_string());
         }
-        for (i, tx_proof) in tx_proofs.iter().enumerate() {
-            if !Self::verify_conservation(tx_proof, &[], public_amounts[i]) {
+        for (i, (tx_proof, comms)) in tx_proofs.iter().zip(tx_commitments.iter()).enumerate() {
+            if !Self::verify_conservation(tx_proof, comms, public_amounts[i]) {
                 return Err(format!("Invalid transaction proof at index {} for block {}", i, height));
             }
         }
@@ -514,10 +516,12 @@ impl ZKProofSystem {
 
     /// Verify an aggregate proof by recomputing the Merkle root from provided
     /// tx proofs and checking the binding hash chain.
+    /// Each tx must supply its output commitments for individual proof verification.
     pub fn verify_aggregate(
         aggregate_proof: &[u8],
         prev_block_proof: &[u8],
         tx_proofs: &[Vec<u8>],
+        tx_commitments: &[Vec<[u8; 32]>],
         public_amounts: &[i64],
         height: u64,
         state_root: &[u8; 32]
@@ -531,11 +535,11 @@ impl ZKProofSystem {
 
         let stored_merkle_root = &aggregate_proof[22 + 32..22 + 32 + 32];
 
-        if tx_proofs.len() != public_amounts.len() {
+        if tx_proofs.len() != public_amounts.len() || tx_proofs.len() != tx_commitments.len() {
             return false;
         }
         for (i, proof) in tx_proofs.iter().enumerate() {
-            if !Self::verify_conservation(proof, &[], public_amounts[i]) {
+            if !Self::verify_conservation(proof, &tx_commitments[i], public_amounts[i]) {
                 return false;
             }
         }
@@ -813,8 +817,8 @@ mod tests {
     #[test]
     fn test_aggregate_empty_roundtrip() {
         let prev_proof = b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
-        let agg = ZKProofSystem::aggregate_proofs(&prev_proof, &[], &[], 1, &[0u8; 32]).unwrap();
-        assert!(ZKProofSystem::verify_aggregate(&agg, &prev_proof, &[], &[], 1, &[0u8; 32]),
+        let agg = ZKProofSystem::aggregate_proofs(&prev_proof, &[], &[], &[], 1, &[0u8; 32]).unwrap();
+        assert!(ZKProofSystem::verify_aggregate(&agg, &prev_proof, &[], &[], &[], 1, &[0u8; 32]),
             "empty aggregate roundtrip should verify");
         println!("[TEST AGG] Empty aggregate roundtrip: OK (len={})", agg.len());
     }

@@ -118,7 +118,7 @@ mod tests {
                 timestamp: 100,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(b"genesis", &[], &[], 0, &[0u8; 32]).unwrap(),
+                aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(b"genesis", &[], &[], &[], 0, &[0u8; 32]).unwrap(),
                 height: 1,
                 difficulty: 10,
             },
@@ -137,7 +137,7 @@ mod tests {
             let (res, proof, _) = vdf.solve(&b.header.parent_hash);
             b.header.vdf_result = res;
             b.header.vdf_proof = proof;
-            b.header.aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&state.last_aggregate_proof, &[], &[], i as u64, &[0u8; 32]).unwrap();
+            b.header.aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&state.last_aggregate_proof, &[], &[], &[], i as u64, &[0u8; 32]).unwrap();
             
             state.apply_block(b).unwrap();
         }
@@ -386,8 +386,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          let vdf = VDF::new(current_difficulty);
                          let seed = parent_hash.to_vec();
                          
-                         // Verify VDF proof (Wesolowski or ZK)
-                         if vdf.verify(&seed, &proposal.vdf_result, &proposal.vdf_proof) || proposal.vdf_proof.starts_with(b"vdf_zkp_") {
+                          // Verify VDF proof (Wesolowski only — vdf_zkp_ bypass removed in alpha-3 audit)
+                          if vdf.verify(&seed, &proposal.vdf_result, &proposal.vdf_proof) {
                              if proposal.height > current_height {
                                  println!("📉 We are behind! Local height: {}, Received proposal for: {}. Requesting sync...", current_height, proposal.height);
                                  let sync_req = P2PMessage::SyncRequest { 
@@ -538,9 +538,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     
                     // Generate a real block proof (In production, this is the recursive link)
                     let tx_proofs: Vec<Vec<u8>> = txs.iter().map(|t| t.proof.clone()).collect();
+                    let tx_commitments: Vec<Vec<[u8; 32]>> = txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect()).collect();
                     let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.public_amount as i64).collect();
                     let state_root = ledger.lock().unwrap().get_state_root();
-                    let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
+                    let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_commitments, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
                     last_block_proof = aggregate_proof.clone();
 
                     // 3. Propose Block
