@@ -877,3 +877,75 @@ Fixed 8 of 9 critical bugs (89%), 1 FALSE POSITIVE:
 
 **Status**: ✅ `--test-threads=1` 下 2/2 通过。并行模式受 Windows sled 文件锁限制。
 **Root causes fixed**: (1) 全局静态残留 → `reset_ffi_test_state()` 清理 12 statics (2) 状态数据 AES-GCM 加密 → 测试改为解密后读取 JSON
+
+---
+
+## Stage 21 — Comprehensive Security Audit (2026-06-01)
+
+Multi-agent parallel audit covering FFI boundary, ZKP/node state, and P2P network.
+
+### 🔴 CRITICAL (Fixed this stage)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| S-1 | **Double-spend**: `HashSet::insert` return value for nullifiers ignored in `apply_block_with_validation` (`state.rs:339`) | ✅ Check `insert()` return — reject block on `false` |
+| S-2 | **VDF proof bypass**: `proposal.vdf_proof.starts_with(b"vdf_zkp_")` skipped all VDF verification for gossip proposals (`main.rs:390`) | ✅ Removed the `||` clause; Wesolowski verify only |
+| S-3 | **Aggregate proof empty commitments**: `aggregate_proofs`/`verify_aggregate` called `verify_conservation` with `&[]` — block-level proof verification never checked output commitment binding | ✅ Added `tx_commitments: &[Vec<[u8; 32]>]` param; wired to real commitments at all call sites |
+
+### 🔴 CRITICAL (Unfixed — requires external action)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| S-4 | **KZG CRS deterministic seed**: `ChaCha20Rng::from_seed(b"Aetheris ZK CRS deterministic v1")` — toxic waste computable by anyone; proofs forgeable | Replace with MPC ceremony output |
+| S-5 | **Mixnet key from PeerId**: `my_mix_sk` copies only 8 bytes of public PeerId, rest zeroed (`main.rs:220`) | Generate true random keypair |
+| S-6 | **C# hardcoded bridge key**: `AetherisBackend.cs` uses static key; never calls `aetheris_handshake()`; always mismatches Rust's dynamic key | Make C# call `aetheris_handshake()` |
+
+### 🟠 HIGH (Unfixed)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| S-7 | Panic unwind across FFI (`expect`/`unwrap` in extern "C") | Use `catch_unwind` or fallible returns |
+| S-8 | `BinaryBuffer` null ptr deref (`from_raw_parts`) | Add null check |
+| S-9 | Dead C# P/Invoke: `aetheris_execute_command`, `aetheris_get_genesis_phrase` removed from Rust | Remove or restore matching exports |
+| S-10 | Bridge key zero-fallback: `[0u8; 32]` used when `BRIDGE_KEY` is None | Return error instead of encrypting with null key |
+| S-11 | Orphan random key: `execute_command_bin` generates ephemeral key but never stores it | Fail unconditionally if `BRIDGE_KEY` is None |
+| S-12 | `zeroize` not used on decrypted secrets (viewing_key, mnemonic, k_arr, blindings) | Wrap in `Zeroizing<>` |
+| S-13 | ECC addition gate `dx.invert().unwrap_or(Fp::ZERO)` — same-point case unconstrained (`recursive/lib.rs:658`) | Route equal points through double gate |
+| S-14 | `EXPECTED_GENESIS_HASH` constant defined but never validated | Compute `block_hash` and compare at genesis accept |
+| S-15 | Peer send-identity: `proposal.sender` not compared against `peer_id` from gossipsub envelope | Verify sender field |
+| S-16 | Missing gossipsub `report_message_validation_result` — messages held in Strict mode | Call `Accept`/`Reject` after processing |
+| S-17 | Dead constraints: `Fp::from(100) == Fp::from(100)` in recursive circuit | Remove; ensure pi_hash is correctly constrained |
+
+### 🟡 MEDIUM (Unfixed)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| S-18 | `STATE` lock held during encryption/serialization (blocks other FFI callers) | Scope lock to critical reads only |
+| S-19 | `aetheris_handshake` exposes raw key to all in-process callers | Document as session key; add freshness |
+| S-20 | Mnemonic not zeroized after decryption | Use `Zeroizing<String>` |
+| S-21 | Viewing key on stack without zeroize (CLI + FFI) | Use `Zeroizing<[u8; 32]>` |
+| S-22 | No peer banning for invalid messages | Implement `PeerScoreParams` |
+| S-23 | Eclipse attack surface: no subnet diversity, unbounded max peers | Bound peers, enforce outbound ratio |
+| S-24 | No inbound rate limiting (`max_transmit_size` = 10 MB) | Set to ~1 MB, add per-peer rate counters |
+| S-25 | Mnemonic printed to stdout in plaintext (`wallet.rs:147`) | Print to stderr with warning |
+| S-26 | `ledger_outputs.json` not authenticated | Sign with node's peer identity key |
+| S-27 | Sled DB: no encryption at rest; `db: Db` is pub | Make private; encrypt sensitive trees |
+| S-28 | Snapshot load lacks integrity auth (no MAC) | Append blake3 MAC with node-local key |
+| S-29 | Non-native carry constraint incorrect (carry ∈ {0,1} but can be 2/3 for 256-bit add) | Range-check 2 bits instead |
+| S-30 | Rollback does not persist `last_aggregate_proof` for height > 0 | Persist from previous block |
+
+### 🟢 LOW
+
+| ID | Finding | Status |
+|----|---------|--------|
+| S-31 | Debug `println!` of wallet address (debug_assertions only) | Acceptable |
+| S-32 | BRIDGE_KEY TOCTOU between read and use (key never mutated post-init) | Acceptable |
+| S-33 | MEMPOOL race between miner drain and sender read | Acceptable (atomic counter preferred) |
+| S-34 | mDNS auto-discovery accepts all peers | Add allowlist |
+| S-35 | `generate_l` double finalize (blake3 state reuse issue) | Cosmetic; no security impact |
+| S-36 | VDF seed clamp safe (seed ≡ 0 mod N impossible) | Comment only |
+| S-37 | `create_commitment` top-bit masking loses 2 bits entropy | Use modular reduction as refinement |
+
+---
+
+*Last updated: 2026-06-01* (alpha-3 tag + Stage 21 security audit: S-1~S-3 fixed, 37 findings total)

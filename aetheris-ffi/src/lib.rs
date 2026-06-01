@@ -319,6 +319,7 @@ fn create_genesis_block() -> aetheris_core::Block {
             aggregate_proof: ZKProofSystem::aggregate_proofs(
                 &[0u8; 32],
                 &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
+                &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
                 &txs.iter().map(|t| t.public_amount as i64).collect::<Vec<_>>(),
                 0,
                 &[0u8; 32]
@@ -1648,6 +1649,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(
                 &ledger.last_aggregate_proof, 
                 &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
+                &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
                 &txs.iter().map(|t| t.public_amount as i64).collect::<Vec<_>>(),
                 ledger.height,
                 &[0u8; 32]
@@ -1764,6 +1766,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             let aggregate_proof = match ZKProofSystem::aggregate_proofs(
                 &ledger.last_aggregate_proof, 
                 &tx_proofs,
+                &vec![vec![]; tx_proofs.len()],
                 &tx_public_amounts,
                 ledger.height,
                 &state_root

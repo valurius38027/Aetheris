@@ -316,10 +316,12 @@ impl LedgerState {
         // Verify Aggregate ZK Proof
         let public_amounts: Vec<i64> = block.transactions.iter().map(|tx| tx.public_amount as i64).collect();
         let tx_proofs: Vec<Vec<u8>> = block.transactions.iter().map(|tx| tx.proof.clone()).collect();
+        let tx_commitments: Vec<Vec<[u8; 32]>> = block.transactions.iter().map(|tx| tx.outputs.iter().map(|o| o.commitment).collect()).collect();
         if !aetheris_zkp::ZKProofSystem::verify_aggregate(
             &block.header.aggregate_proof,
             &self.last_aggregate_proof,
             &tx_proofs,
+            &tx_commitments,
             &public_amounts,
             block.header.height,
             &block.header.state_root
@@ -336,7 +338,9 @@ impl LedgerState {
         // 4. Update State (Nullifiers & Commitments) — now safe after persist
         for tx in &block.transactions {
             for nf in &tx.inputs {
-                self.nullifiers.insert(*nf);
+                if !self.nullifiers.insert(*nf) {
+                    return Err("double-spend: nullifier already spent".to_string());
+                }
             }
             for out in &tx.outputs {
                 self.commitments.insert(out.commitment);
@@ -521,6 +525,7 @@ mod tests {
             &state.last_aggregate_proof,
             &[],
             &[],
+            &[],
             1,
             &[0u8; 32],
         ).unwrap();
@@ -580,7 +585,7 @@ mod tests {
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
         let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &state.last_aggregate_proof, &[], &[], 1, &[0u8; 32],
+            &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
         ).unwrap();
         let block = Block {
             header: BlockHeader {
@@ -680,7 +685,7 @@ mod tests {
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_a, proof_a, _) = vdf.solve(&state.last_block_hash);
         let agg_a = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &state.last_aggregate_proof, &[], &[], 1, &[0u8; 32],
+            &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
         ).unwrap();
         let block_a = Block {
             header: BlockHeader {
@@ -709,7 +714,7 @@ mod tests {
         };
         let (vdf_b, proof_b, _) = vdf.solve(&block_0_hash);
         let agg_b = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &agg_a, &[], &[], 1, &[0xBBu8; 32],
+            &agg_a, &[], &[], &[], 1, &[0xBBu8; 32],
         ).unwrap();
         let block_b = Block {
             header: BlockHeader {
