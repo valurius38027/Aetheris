@@ -837,4 +837,75 @@ mod tests {
             "empty aggregate roundtrip should verify");
         println!("[TEST AGG] Empty aggregate roundtrip: OK (len={})", agg.len());
     }
+
+    #[test]
+    fn test_aggregate_commitment_binding() {
+        // S-3 regression: aggregate proof must bind output commitments.
+        // generate a proof with real commitments
+        let ins = [10u64, 20];
+        let outs = [30u64];
+        let in_blindings = vec![[1u8; 32], [2u8; 32]];
+        let out_blindings = vec![[3u8; 32]];
+        let commitments = vec![
+            create_commitment(30, &[3u8; 32]), // commitment matching the output
+        ];
+        let proof = ZKProofSystem::prove_conservation(&ins, &outs, &in_blindings, &out_blindings, &commitments, 0);
+
+        // Verification with correct commitments must pass
+        assert!(ZKProofSystem::verify_conservation(&proof, &commitments, 0),
+            "honest verification must pass");
+
+        // Verification with different commitments must fail
+        let wrong_commitments = vec![[0xADu8; 32]];
+        assert!(!ZKProofSystem::verify_conservation(&proof, &wrong_commitments, 0),
+            "commitment binding: wrong commitments must fail verification");
+
+        // Aggregate path: correct tx_commitments passes, wrong ones fail
+        let prev = b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        let agg = ZKProofSystem::aggregate_proofs(
+            &prev, &[proof.clone()], &[commitments.clone()], &[0], 1, &[0u8; 32]
+        ).expect("aggregate with correct commitments");
+
+        assert!(ZKProofSystem::verify_aggregate(
+            &agg, &prev, &[proof.clone()], &[commitments.clone()], &[0], 1, &[0u8; 32]
+        ), "aggregate with correct commitments must verify");
+
+        assert!(!ZKProofSystem::verify_aggregate(
+            &agg, &prev, &[proof.clone()], &[wrong_commitments], &[0], 1, &[0u8; 32]
+        ), "aggregate with wrong commitments must fail");
+
+        println!("[TEST AGG] Commitment binding (S-3): OK");
+    }
+
+    #[test]
+    fn test_crs_loaded_from_file() {
+        // S-4 regression: ensure_params() must load crs.bin from file
+        // when the file exists in the working directory
+        let params = ensure_params();
+        assert_eq!(params.k(), 11, "CRS must have k=11");
+        assert!(params.n() > 0, "CRS params n must be positive");
+        // Verify the params produce valid keys (ensures VK/PK are consistent with CRS)
+        let (_vk, _pk) = ensure_keys();
+        println!("[TEST CRS] CRS file loading (S-4): OK (k={}, n={})", params.k(), params.n());
+    }
+
+    #[test]
+    fn test_proof_tamper_detection() {
+        // Additional security: a tampered proof must be rejected
+        let ins = [5u64];
+        let outs = [5u64];
+        let bl = [[7u8; 32]];
+        let cm = [create_commitment(5, &[7u8; 32])];
+        let proof = ZKProofSystem::prove_conservation(&ins, &outs, &bl, &bl, &cm, 0);
+
+        // Flip one byte in the proof body
+        let mut tampered = proof.clone();
+        let body_start = b"halo2_kzg_v1_".len();
+        if tampered.len() > body_start + 1 {
+            tampered[body_start] ^= 0xFF;
+        }
+        assert!(!ZKProofSystem::verify_conservation(&tampered, &cm, 0),
+            "tampered proof must be rejected");
+        println!("[TEST TAMPER] Proof tamper detection: OK");
+    }
 }

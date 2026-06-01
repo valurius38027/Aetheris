@@ -360,4 +360,24 @@ mod tests {
         println!("Single-byte seed: duration={}ns", d2);
         assert!(vdf.verify(&single_byte, &r2, &p2), "Single-byte seed should verify");
     }
+
+    #[test]
+    fn test_vdf_bypass_rejected() {
+        // S-2 regression: vdf_zkp_ prefix must NOT bypass Wesolowski verification.
+        // The old bypass (removed from main.rs:390) let arbitrary proofs through.
+        // Here we verify VDF.verify rejects any vdf_zkp_ prefixed data.
+        let vdf = VDF::new(100);
+        let seed = b"any_seed".to_vec();
+        let result = b"any_result".to_vec();
+
+        // A trivial vdf_zkp_ prefixed proof must be rejected
+        assert!(!vdf.verify(&seed, &result, b"vdf_zkp_"),
+            "bare vdf_zkp_ prefix must not bypass verify");
+        assert!(!vdf.verify(&seed, &result, b"vdf_zkp_v2_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "vdf_zkp_v2_ proof must not bypass verify");
+        assert!(!vdf.verify(&seed, &result, b"vdf_zkp_anything_at_all"),
+            "arbitrary vdf_zkp_ data must not bypass verify");
+
+        println!("[TEST VDF] Bypass rejection (S-2): OK");
+    }
 }
