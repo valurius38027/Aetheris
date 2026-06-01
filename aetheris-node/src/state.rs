@@ -55,47 +55,76 @@ impl LedgerState {
     }
 
     pub fn restore_from_db(&mut self) {
-        // Try snapshot first (O(1) startup)
-        if self.load_snapshot() {
+        // 1. Try snapshot (fast path for most fields)
+        let snapshot_height = if self.load_snapshot() {
+            Some(self.height)
+        } else {
+            // Reset to genesis defaults for replay-from-scratch
+            self.nullifiers.clear();
+            self.commitments.clear();
+            self.all_outputs.clear();
+            self.last_block_hash = [0u8; 32];
+            self.last_aggregate_proof = b"genesis_proof".to_vec();
+            self.current_difficulty = VDF_DIFFICULTY;
+            self.timestamps.clear();
+            self.height = 0;
+            None
+        };
+
+        // 2. Get authoritative block count from DB
+        let db_height = self.db.get(b"height")
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                let arr: [u8; 8] = v.as_ref().try_into().ok()?;
+                Some(u64::from_le_bytes(arr))
+            })
+            .unwrap_or(0);
+
+        // 3. If snapshot is current, fast-path done
+        if snapshot_height == Some(db_height) {
             return;
         }
 
-        // Fallback: full replay (O(n) — slow for large chains)
-        println!("[STATE] No snapshot found, replaying {} blocks from DB...", self.height);
-        self.current_difficulty = VDF_DIFFICULTY;
-        self.timestamps.clear();
-        for i in 0..self.height {
-            if let Ok(Some(block_bytes)) = self.db.get(format!("block_{}", i).as_bytes()) {
-                if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(&block_bytes);
-                    self.last_block_hash = hasher.finalize().into();
-                    self.last_aggregate_proof = block.header.aggregate_proof.clone();
-                    self.timestamps.push(block.header.timestamp);
+        // 4. Replay blocks from current height up to db_height
+        let start = self.height;
+        if db_height > start {
+            println!("[STATE] Replaying blocks {}-{} from DB...", start, db_height - 1);
+            for i in start..db_height {
+                if let Ok(Some(block_bytes)) = self.db.get(format!("block_{}", i).as_bytes()) {
+                    if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&block_bytes);
+                        self.last_block_hash = hasher.finalize().into();
+                        self.last_aggregate_proof = block.header.aggregate_proof.clone();
+                        self.timestamps.push(block.header.timestamp);
 
-                    // Recompute difficulty at each adjustment interval
-                    if self.height > 0 && i > 0 && i % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
-                        let window_start = self.timestamps.len().saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL as usize);
-                        let window: Vec<u64> = self.timestamps[window_start..].to_vec();
-                        self.current_difficulty = VDF::retarget_difficulty(
-                            self.current_difficulty, &window, TARGET_BLOCK_TIME,
-                        );
-                    }
+                        // Recompute difficulty at each adjustment interval
+                        if i % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && self.timestamps.len() >= 2 {
+                            let window_start = self.timestamps.len().saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL as usize);
+                            let window: Vec<u64> = self.timestamps[window_start..].to_vec();
+                            self.current_difficulty = VDF::retarget_difficulty(
+                                self.current_difficulty, &window, TARGET_BLOCK_TIME,
+                            );
+                        }
 
-                    for tx in &block.transactions {
-                        for nf in &tx.inputs { self.nullifiers.insert(*nf); }
-                        for out in &tx.outputs { 
-                            self.commitments.insert(out.commitment);
-                            self.all_outputs.push(out.clone());
+                        for tx in &block.transactions {
+                            for nf in &tx.inputs { self.nullifiers.insert(*nf); }
+                            for out in &tx.outputs {
+                                self.commitments.insert(out.commitment);
+                                self.all_outputs.push(out.clone());
+                            }
                         }
                     }
                 }
             }
+            self.height = db_height;
         }
-        // Also check DB for persisted difficulty
+
+        // 5. Load persisted difficulty (may be more recent than replay-derived)
         if let Ok(Some(diff_bytes)) = self.db.get(b"current_difficulty") {
             let diff_str = String::from_utf8_lossy(&diff_bytes);
-            self.current_difficulty = diff_str.parse().unwrap_or(VDF_DIFFICULTY);
+            self.current_difficulty = diff_str.parse().unwrap_or(self.current_difficulty);
         }
     }
 
