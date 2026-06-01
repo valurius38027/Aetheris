@@ -23,6 +23,8 @@ struct WalletData {
     nonce: [u8; 12],
     last_scanned_index: usize,
     utxos: Vec<OwnedUTXO>,
+    #[serde(default)]
+    nullifier_counter: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,6 +160,7 @@ fn main() -> Result<()> {
                 nonce,
                 last_scanned_index: 0,
                 utxos: Vec::new(),
+                nullifier_counter: 0,
             };
             save_wallet(&wallet)?;
             println!("Wallet encrypted and saved to {}", WALLET_FILE);
@@ -225,7 +228,7 @@ fn main() -> Result<()> {
             phrase.zeroize();
             let seed = Seed::new(&mnemonic, "");
             let sk = &seed.as_bytes()[0..32];
-            let nf_in = create_nullifier(sk, 0);
+            let nf_in = create_nullifier(sk, wallet.nullifier_counter);
 
             println!("   Generating ZK-SNARK proof...");
             let in_amounts = vec![input_utxo.amount];
@@ -250,6 +253,7 @@ fn main() -> Result<()> {
                 proof,
             };
 
+            wallet.nullifier_counter += 1;
             wallet.utxos = remaining_utxos;
             save_wallet(&wallet)?;
 
