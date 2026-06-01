@@ -7,7 +7,7 @@
 ### 1.1 密码学后端与累积器 (Accumulator)
 - **现状**: 目前使用 Mock 数据结构表示累积器（`lhs`, `rhs` 为随机场元素）。
 - **差距**: 生产环境需要集成真正的 **Halo2 Accumulation Scheme**。
-  - **IPA (Inner Product Argument)**: Aetheris 采用 Pasta 曲线对，需要实现基于 IPA 的延迟开启逻辑。
+  - **IPA (Inner Product Argument)**: Aetheris 当前采用 BN254/Grumpkin 曲线对（非 Pasta），需要实现基于 IPA 的延迟开启逻辑。
   - **Circuit-in-Circuit Verification**: 需要在电路中实现 Pallas 曲线上的 Vesta 验证逻辑（或反之），这涉及复杂的椭圆曲线点运算电路（Fp-in-Fq）。
 
 ### 1.2 Poseidon 哈希函数实现
@@ -33,8 +33,8 @@
 ## 2. 生产级路线图 (Roadmap)
 
 ### 阶段 1: 密码学基础加固 (短期)
-- [x] 引入 `PoseidonChip` 实现（含 Round Constants 和 MDS 矩阵）。
-- [x] 定义 Pasta 曲线上的 `EccChip`，处理点加、倍点和标量乘法。
+- [x] 实现 Poseidon 自定义哈希 chip（round constants 和 MDS 矩阵为自生成非标准版本，需替换为审计库）。
+- [x] 在 BN254/Grumpkin（非 Pasta）曲线上实现 ECC 电路基础（点加、倍点、标量乘法）。
 - [x] 实现基础的 IPA 累积逻辑（含承诺折叠和 MSM 验证）。
 - [x] 实现 `RangeCheckChip` 及其 Lookup Table 优化。
 - [x] 实现真正的 IPA 证明反序列化逻辑（32-byte field elements）。

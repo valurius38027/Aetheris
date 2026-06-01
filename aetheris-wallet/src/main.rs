@@ -13,6 +13,7 @@ use argon2::{Argon2, PasswordHasher};
 use argon2::password_hash::SaltString;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit};
 use aes_gcm::aead::Aead;
+use tiny_keccak::{Hasher, Keccak};
 
 const WALLET_FILE: &str = "wallet.json";
 
@@ -275,11 +276,12 @@ fn main() -> Result<()> {
 
             println!("Incremental Scan from index {}...", wallet.last_scanned_index);
 
-            let mnemonic = Mnemonic::from_phrase(&phrase, Language::English)?;
-            let seed = Seed::new(&mnemonic, "");
-            let vk_hash = blake3::hash(seed.as_bytes());
+            let _mnemonic = Mnemonic::from_phrase(&phrase, Language::English)?;
+            // Viewing key = Keccak256(mnemonic), matching FFI wallet derivation
             let mut vk = [0u8; 32];
-            vk.copy_from_slice(&vk_hash.as_bytes()[..32]);
+            let mut hasher = Keccak::v256();
+            hasher.update(phrase.as_bytes());
+            hasher.finalize(&mut vk);
             phrase.zeroize();
 
             if let Ok(data) = fs::read_to_string("ledger_outputs.json") {

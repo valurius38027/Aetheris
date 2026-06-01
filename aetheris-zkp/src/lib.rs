@@ -29,7 +29,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore, aead::Aead};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 
-const PROVING_K: u32 = 10;
+const PROVING_K: u32 = 11;
 
 // Cached CRS and proving key — generated once, shared across prover & verifier.
 static CACHED_PARAMS: OnceLock<ParamsKZG<Bn256>> = OnceLock::new();
@@ -93,11 +93,12 @@ pub struct ValueConfig {
 /// sum(inputs) == sum(outputs) AND all amounts are in [0, 2^64)
 #[derive(Default)]
 pub struct ValueConservationCircuit {
-    pub input_amounts: Vec<u64>,
-    pub output_amounts: Vec<u64>,
-    pub input_blindings: Vec<[u8; 32]>,
-    pub output_blindings: Vec<[u8; 32]>,
-    pub public_amount: i64,
+    input_amounts: Vec<u64>,
+    output_amounts: Vec<u64>,
+    input_blindings: Vec<[u8; 32]>,
+    output_blindings: Vec<[u8; 32]>,
+    public_amount: i64,
+    commitment_hash: Fr,
 }
 
 impl ValueConservationCircuit {
@@ -108,6 +109,7 @@ impl ValueConservationCircuit {
             input_blindings: vec![[0u8; 32]; MAX_INPUTS],
             output_blindings: vec![[0u8; 32]; MAX_OUTPUTS],
             public_amount: 0,
+            commitment_hash: Fr::zero(),
         }
     }
 }
@@ -313,8 +315,18 @@ impl Circuit<Fr> for ValueConservationCircuit {
             layouter.constrain_instance(cell.cell(), config.instance, 0)?;
         }
 
+        let comm_cell = layouter.assign_region(|| "commitment hash", |mut region| {
+            region.assign_advice(
+                || "comm_hash",
+                config.advice[0],
+                0,
+                || Value::known(self.commitment_hash),
+            )
+        })?;
+        layouter.constrain_instance(comm_cell.cell(), config.instance, 1)?;
+
         for (i, cell) in range_final_cells.into_iter().enumerate() {
-            layouter.constrain_instance(cell.cell(), config.instance, 1 + i)?;
+            layouter.constrain_instance(cell.cell(), config.instance, 2 + i)?;
         }
 
         Ok(())
@@ -345,6 +357,18 @@ pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 
 pub struct ZKProofSystem;
 
+/// Hash output commitments into a Fr public instance to bind them to the proof.
+fn hash_commitments(commitments: &[[u8; 32]]) -> Fr {
+    let mut hasher = blake3::Hasher::new();
+    for comm in commitments.iter() {
+        hasher.update(comm);
+    }
+    let h = hasher.finalize();
+    let mut bytes = *h.as_bytes();
+    bytes[31] &= 0x2F;
+    Fr::from_bytes(&bytes).expect("masked blake3 output always a valid Fr")
+}
+
 impl ZKProofSystem {
     /// Set up KZG parameters (Common Reference String)
     /// In production, this would be generated via a MPC ceremony.
@@ -354,20 +378,24 @@ impl ZKProofSystem {
     }
 
     /// Generates a production-grade KZG proof using globally cached CRS & keys.
+    /// Binds output commitments as public instance via `commitment_hash`.
     pub fn prove_conservation(
         in_amounts: &[u64], 
         out_amounts: &[u64],
         in_blindings: &[[u8; 32]],
         out_blindings: &[[u8; 32]],
-        _commitments: &[[u8; 32]],
+        commitments: &[[u8; 32]],
         public_amount: i64,
     ) -> Vec<u8> {
+        let comm_hash_fr = hash_commitments(&commitments);
+
         let circuit = ValueConservationCircuit {
             input_amounts: in_amounts.to_vec(),
             output_amounts: out_amounts.to_vec(),
             input_blindings: in_blindings.to_vec(),
             output_blindings: out_blindings.to_vec(),
             public_amount,
+            commitment_hash: comm_hash_fr,
         };
 
         let params = ensure_params();
@@ -379,8 +407,8 @@ impl ZKProofSystem {
             -Fr::from(public_amount.unsigned_abs())
         };
 
-        let mut instance_values = vec![-pub_amt_fr];
-        instance_values.resize(1 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
+        let mut instance_values = vec![-pub_amt_fr, comm_hash_fr];
+        instance_values.resize(2 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
         let instances = vec![instance_values];
 
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
@@ -403,10 +431,13 @@ impl ZKProofSystem {
     }
 
     /// Verifies a production-grade KZG proof using globally cached CRS & keys.
-    pub fn verify_conservation(proof_bytes: &[u8], _commitments: &[[u8; 32]], public_amount: i64) -> bool {
+    /// The proof is bound to the output commitments via `commitments` public instance.
+    pub fn verify_conservation(proof_bytes: &[u8], commitments: &[[u8; 32]], public_amount: i64) -> bool {
         if !proof_bytes.starts_with(b"halo2_kzg_v1_") {
             return false;
         }
+
+        let comm_hash_fr = hash_commitments(&commitments);
 
         let params = ensure_params();
         let (vk, _) = ensure_keys();
@@ -417,8 +448,8 @@ impl ZKProofSystem {
             -Fr::from(public_amount.unsigned_abs())
         };
 
-        let mut instance_values = vec![-pub_amt_fr];
-        instance_values.resize(1 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
+        let mut instance_values = vec![-pub_amt_fr, comm_hash_fr];
+        instance_values.resize(2 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
         let instances = vec![instance_values];
 
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[b"halo2_kzg_v1_".len()..]);

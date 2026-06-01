@@ -976,27 +976,10 @@ fn create_encrypted_error_buffer(msg: &str) -> BinaryBuffer {
     BinaryBuffer { ptr, len }
 }
 
-#[no_mangle]
-pub extern "C" fn aetheris_execute_command(command_json: *const c_char) -> *mut c_char {
-    let cmd_str = unsafe {
-        if command_json.is_null() { return CString::new("{\"error\": \"Null command\"}").unwrap().into_raw(); }
-        CStr::from_ptr(command_json).to_string_lossy()
-    };
-
-    let result = match cmd_str.as_ref() {
-        "get_version" => json!({"version": "0.1.0-alpha", "protocol": "Aetheris-PoT-v1"}),
-        "get_network_info" => {
-            json!({
-                "p2p_active": true,
-                "protocol_version": 1,
-                "user_agent": "Aetheris-Kernel-Rust/0.1.0"
-            })
-        },
-        _ => json!({"error": "Unknown command"}),
-    };
-
-    CString::new(result.to_string()).unwrap().into_raw()
-}
+// ── Note: aetheris_execute_command (plaintext JSON) intentionally removed during alpha-3.
+// All FFI communication must use aetheris_execute_command_bin (AES-GCM encrypted).
+// The plaintext path was a security bypass: callers could skip handshake encryption.
+// See https://github.com/anomalyco/Aetheris/issues/FFI-encryption-uniformity
 
 #[no_mangle]
 pub extern "C" fn aetheris_init() -> i32 {
