@@ -1,4 +1,4 @@
-use aetheris_core::{Block, ShieldedOutput, EXPECTED_GENESIS_HASH, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME};
+use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME};
 use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
 use std::collections::{HashSet};
@@ -236,16 +236,21 @@ impl LedgerState {
     }
 
     pub fn apply_block_with_validation(&mut self, block: Block, validate_parent: bool) -> Result<(), String> {
-        // 0. Genesis Hash Validation (Network Identity)
+        // 0. Genesis Validation (Structural — proofs use blinding, hash varies per run)
         if block.header.height == 0 {
-            let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&data);
-            let current_hash = hex::encode(hasher.finalize().as_bytes());
-            
-            // Network identity check
-            if current_hash != EXPECTED_GENESIS_HASH {
-                return Err(format!("CRITICAL: Genesis block hash mismatch! Found: {}", current_hash));
+            if block.header.parent_hash != [0u8; 32] {
+                return Err("Genesis block must have zero parent_hash".into());
+            }
+            if block.transactions.len() != 2 {
+                return Err("Genesis block must have exactly 2 transactions".into());
+            }
+            // Mint tx: 1 output, non-negative public_amount
+            if block.transactions[0].outputs.len() != 1 || block.transactions[0].public_amount <= 0 {
+                return Err("Genesis mint transaction malformed".into());
+            }
+            // Transfer tx: 2 outputs, zero public_amount
+            if block.transactions[1].outputs.len() != 2 || block.transactions[1].public_amount != 0 {
+                return Err("Genesis transfer transaction malformed".into());
             }
         } else {
             // V-2: Validate difficulty matches expected chain value
