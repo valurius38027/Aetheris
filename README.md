@@ -15,10 +15,12 @@ Aetheris 是一种基于 **Proof of Time (PoT)** 与 **Mathematical Arbitration*
 
 - `aetheris-core`: 定义核心区块、交易及状态转移逻辑。
 - `aetheris-crypto`: 实现 VDF、Keccak、AES-GCM 等加密原语。
-- `aetheris-zkp`: 基于 Halo2 的零知识证明系统。
-- `aetheris-ffi`: 为跨语言集成提供的 C-ABI 接口层。
-- `aetheris-node`: 完整的 P2P 节点实现。
-- `Aetheris.App`: 参考 C# 桌面客户端实现。
+- `aetheris-zkp`: 基于 Halo2 的零知识证明系统（含屏蔽交易电路）。
+- `aetheris-recursive`: 递归证明聚合（Halo2 IPA + 非原生算术）。
+- `aetheris-ffi`: 为跨语言集成提供的 C-ABI 接口层（30+ extern "C" 函数）。
+- `aetheris-node`: 完整的 P2P 节点实现（libp2p + sled DB）。
+- `aetheris-wallet`: CLI 钱包（助记词、UTXO 扫描、交易签名）。
+- `Aetheris.App` / `Aetheris.CLI`: 参考 C# 桌面客户端实现。
 
 ## 集成指南 (FFI)
 
@@ -26,7 +28,7 @@ Aetheris 是一种基于 **Proof of Time (PoT)** 与 **Mathematical Arbitration*
 
 所有前端与内核的通信均采用 **AES-GCM 256** 加密。
 
-1. **Bridge Key**: 预共享密钥 `AETHERIS_SECURE_BRIDGE_2026_KEY!`。
+1. **Bridge Key**: 通过 `aetheris_handshake()` 动态交换的 AES-256 会话密钥（非预共享）。
 2. **BinaryBuffer 结构**:
    ```rust
    #[repr(C)]
@@ -47,7 +49,12 @@ Aetheris 是一种基于 **Proof of Time (PoT)** 与 **Mathematical Arbitration*
 
 运行全场景集成测试：
 ```bash
-python backend_test.py
+cargo test --workspace --lib
+```
+
+FFI 测试需串行执行（sled Windows 文件锁）：
+```bash
+cargo test -p aetheris-ffi --lib -- --test-threads=1
 ```
 
 ## 许可证
