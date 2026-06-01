@@ -855,6 +855,19 @@ Fixed 8 of 9 critical bugs (89%), 1 FALSE POSITIVE:
 | H7 | FFI | `USER_PASSWORD` global `String` never zeroized |
 | H8 | Test | `test_change_output` asserts `commitment.len()` as amount — wrong field |
 
+### Stage 20 — HIGH Priority Fixes H1–H8 (2026-06-01)
+
+| ID | Status | Summary |
+|----|--------|---------|
+| H1 | ✅ | Use `public_amount.unsigned_abs()` instead of `-public_amount` (overflows at i64::MIN) |
+| H2 | ✅ | Fixed by C3 — all `Fr::from_bytes` now use masked inputs + `expect()`, never `unwrap_or(0)` |
+| H3 | ⏳ | Accumulator starts at G, not identity — verifier must subtract G |
+| H4 | ⏳ | No prime-order subgroup check on Grumpkin points |
+| H5 | ✅ | `parent_hash` reads from `ledger.last_block_hash` (actual hash) instead of `block.header.parent_hash` |
+| H6 | ✅ | Removed debug `println` that exposed viewing key |
+| H7 | ✅ | `USER_PASSWORD` wrapped in `Zeroizing<String>` for auto-zeroize on drop |
+| H8 | ✅ | Removed invalid assertion (`commitment.len()` as amount) from test |
+
 ---
 
-*Last updated: 2026-06-01* (alpha-3 tag: C1+C2+C4+C8+C9+C10 fixed)
+*Last updated: 2026-06-01* (alpha-3 tag: C1–C6 + C8–C11 + H1+H2+H5+H6+H7+H8 fixed)
