@@ -351,9 +351,7 @@ fn broadcast_block_proposal(proposal: BlockProposal) {
     }
 }
 
-static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    Runtime::new().expect("Failed to create Tokio runtime")
-});
+static TOKIO_RUNTIME: Lazy<Mutex<Option<Runtime>>> = Lazy::new(|| Mutex::new(None));
 
 static P2P_COMMAND_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<NetworkCommand>>>> = Lazy::new(|| Mutex::new(None));
 
@@ -394,7 +392,7 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
         *sender = Some(cmd_tx);
     }
 
-    TOKIO_RUNTIME.spawn(async move {
+    TOKIO_RUNTIME.lock().unwrap().get_or_insert_with(|| Runtime::new().expect("Failed to create Tokio runtime")).spawn(async move {
         match AetherisNetwork::new(&[]).await {
             Ok(mut network) => {
                 let addr = format!("/ip4/0.0.0.0/tcp/{}", port);
@@ -2240,8 +2238,28 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Reset all global FFI state between tests to prevent cross-test pollution.
+    fn reset_ffi_test_state() {
+        *TOKIO_RUNTIME.lock().unwrap() = None;
+        if let Ok(mut state) = STATE.lock() {
+            state.ledger = None;
+            state.mining_thread = None;
+            state.address = String::new();
+        }
+        *P2P_COMMAND_SENDER.lock().unwrap() = None;
+        *USER_PASSWORD.write().unwrap() = None;
+        *DB_PATH.write().unwrap() = None;
+        *BRIDGE_KEY.write().unwrap() = None;
+        *LAST_ERROR.write().unwrap() = String::new();
+        PEER_KEYS.lock().unwrap().clear();
+        MEMPOOL.lock().unwrap().clear();
+        MINING_STOP_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+        std::env::remove_var("AETHERIS_VDF_DIFFICULTY");
+    }
+
     #[test]
     fn test_full_wallet_flow() {
+        reset_ffi_test_state();
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_db");
         let db_path_str = db_path.to_str().unwrap();
@@ -2269,11 +2287,16 @@ mod tests {
         // 6. Check Node Status
         let status_bin = aetheris_get_node_status_bin();
         assert!(status_bin.len > 0);
-        let json_data = unsafe {
-            let slice = std::slice::from_raw_parts(status_bin.ptr, status_bin.len);
-            String::from_utf8_lossy(slice).to_string()
+        let json_data = {
+            let slice = unsafe { std::slice::from_raw_parts(status_bin.ptr, status_bin.len) };
+            let bridge_key = *BRIDGE_KEY.read().unwrap();
+            let key = bridge_key.unwrap_or([0u8; 32]);
+            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+            let nonce = Nonce::from_slice(&slice[..12]);
+            let ciphertext = &slice[12..];
+            String::from_utf8_lossy(&cipher.decrypt(nonce, ciphertext).unwrap_or_default()).to_string()
         };
-        assert!(json_data.contains("ONLINE"));
+        assert!(json_data.contains("ONLINE"), "Status: {}", json_data);
         assert!(json_data.contains("aet1"));
 
         aetheris_free_buffer(status_bin);
@@ -2281,6 +2304,7 @@ mod tests {
 
     #[test]
     fn test_genesis_import() {
+        reset_ffi_test_state();
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("genesis_test_db");
         let db_path_str = db_path.to_str().unwrap();
@@ -2297,12 +2321,16 @@ mod tests {
         assert!(aetheris_import_wallet(phrase.as_ptr()));
 
         let status_bin = aetheris_get_node_status_bin();
-        let json_data = unsafe {
-            let slice = std::slice::from_raw_parts(status_bin.ptr, status_bin.len);
-            String::from_utf8_lossy(slice).to_string()
+        let json_data = {
+            let slice = unsafe { std::slice::from_raw_parts(status_bin.ptr, status_bin.len) };
+            let bridge_key = *BRIDGE_KEY.read().unwrap();
+            let key = bridge_key.unwrap_or([0u8; 32]);
+            let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+            let nonce = Nonce::from_slice(&slice[..12]);
+            let ciphertext = &slice[12..];
+            String::from_utf8_lossy(&cipher.decrypt(nonce, ciphertext).unwrap_or_default()).to_string()
         };
-
-        assert!(json_data.contains("balance_atoms") || json_data.contains("wallet"));
+        assert!(json_data.contains("balance_atoms") || json_data.contains("wallet"), "Status: {}", json_data);
 
         aetheris_free_buffer(status_bin);
     }
