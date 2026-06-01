@@ -394,7 +394,7 @@ pub struct EccConfig {
     pub x: Column<Advice>,
     pub y: Column<Advice>,
     pub bit: Column<Advice>, // For scalar multiplication bits
-    pub lookup_val: Column<Advice>, // Column that combines with s_lookup
+    pub lookup_val: Column<Fixed>, // Column that combines with s_lookup
     pub table_x: TableColumn, // Fixed-base lookup table X
     pub table_y: TableColumn, // Fixed-base lookup table Y
     pub table_idx: TableColumn, // Table index (window value)
@@ -426,7 +426,7 @@ impl EccChip {
         let x = meta.advice_column();
         let y = meta.advice_column();
         let bit = meta.advice_column();
-        let lookup_val = meta.advice_column();
+        let lookup_val = meta.fixed_column();
         let table_x = meta.lookup_table_column();
         let table_y = meta.lookup_table_column();
         let table_idx = meta.lookup_table_column();
@@ -440,14 +440,14 @@ impl EccChip {
         meta.enable_equality(x);
         meta.enable_equality(y);
         meta.enable_equality(bit);
-        meta.enable_equality(lookup_val);
+
 
         // Fixed-base Lookup Table Gate
         meta.lookup("fixed-base lookup", |meta| {
             let window_val = meta.query_advice(bit, Rotation::cur());
             let x_val = meta.query_advice(x, Rotation::cur());
             let y_val = meta.query_advice(y, Rotation::cur());
-            let s_lookup = meta.query_advice(lookup_val, Rotation::cur());
+            let s_lookup = meta.query_fixed(lookup_val, Rotation::cur());
 
             vec![
                 (s_lookup.clone() * window_val, table_idx),
@@ -901,8 +901,8 @@ impl EccChip {
                     
                     // Enable lookup by setting lookup_val to 1 (if s_lookup is advice)
                     // Or if using fixed selector, enable it.
-                    // Our configure uses: s_lookup (advice) * ...
-                    region.assign_advice(
+                    // Our configure uses: s_lookup (fixed) * ...
+                    region.assign_fixed(
                         || "enable_lookup", 
                         self.config.lookup_val, 
                         0, 

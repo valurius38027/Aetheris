@@ -12,6 +12,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aetheris_node::state::LedgerState;
+use bincode;
 
 struct Mempool {
     pending_txs: HashMap<[u8; 32], Transaction>,
@@ -346,14 +347,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 })) => {
                     // 0. Handle Mixnet/Cover Traffic (Whitepaper Section 5)
                     if let Ok(mix_msg) = serde_json::from_slice::<mixnet::MixMessage>(&message.data) {
-                        println!("🛡️ Received Mixnet packet from {}", peer_id);
+                        println!("[SHIELD] Received Mixnet packet from {}", peer_id);
                         // Use our static Mixnet key to unwrap the layer
                         match mixnet::LoopixMixer::unwrap(mix_msg, &my_mix_sk) {
-                            Ok((next_hop, _inner_data)) => {
+                            Ok((next_hop, inner_payload)) => {
                                 if let Some(hop) = next_hop {
-                                    println!("🌀 Mixnet: Routing packet to next hop: {}", hop);
+                                    // Forward: peel off this layer and re-encrypt for the next hop
+                                    if let Ok(inner_layer) = bincode::deserialize::<mixnet::OnionLayer>(&inner_payload) {
+                                        let fwd_msg = mixnet::MixMessage {
+                                            payload: inner_layer,
+                                            delay: thread_rng().gen_range(100..500),
+                                            target_hop: Some(hop.clone()),
+                                        };
+                                        if let Ok(data) = serde_json::to_vec(&fwd_msg) {
+                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
+                                            println!("[MIXNET] Forwarded packet to next hop: {}", hop);
+                                        }
+                                    }
                                 } else {
-                                    println!("📥 Mixnet: Packet reached destination (or cover traffic absorbed)");
+                                    println!("[MIXNET] Packet reached destination (or cover traffic absorbed)");
+                                    // TODO: Process inner_payload as application data
                                 }
                             }
                             Err(_) => {
@@ -566,3 +579,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
           }
       }
 }
+
