@@ -2,9 +2,9 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use tiny_keccak::{Keccak, Hasher as _};
+use tiny_keccak::Hasher as _;
 use clap::Parser;
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -343,6 +343,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     message_id: _id,
                     message,
                 })) => {
+                    // S-15: Verify peer send-identity matches propagation source
+                    if let Some(source) = message.source {
+                        if source != peer_id {
+                            println!("SECURITY: Message source {:?} != propagation source {:?}. Rejecting.", source, peer_id);
+                            continue;
+                        }
+                    }
+
                     // 0. Handle Mixnet/Cover Traffic (Whitepaper Section 5)
                     if let Ok(mix_msg) = serde_json::from_slice::<mixnet::MixMessage>(&message.data) {
                         println!("[SHIELD] Received Mixnet packet from {}", peer_id);
@@ -371,6 +379,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 // Silently drop to prevent side-channel analysis
                             }
                         }
+                        let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                            &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
+                        );
                         continue;
                     }
 
@@ -446,20 +457,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      }
                                  }
                              }
-                        } else {
-                            println!("Received invalid VDF proof from {}", proposal.sender);
-                        }
+                         } else {
+                             println!("Received invalid VDF proof from {}", proposal.sender);
+                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                 &_id, &peer_id, gossipsub::MessageAcceptance::Reject,
+                             );
+                         }
                     }
                     
                     // 2. Handle raw Transaction on tx_topic (from p2p.rs broadcast_transaction)
-                    if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
-                        if let Err(e) = mempool.lock().unwrap().add_tx(tx) {
-                            println!("❌ Rejected tx_topic transaction: {}", e);
-                        }
-                        continue;
-                    }
+                     if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
+                         if let Err(e) = mempool.lock().unwrap().add_tx(tx) {
+                             println!("Rejected tx_topic transaction: {}", e);
+                         }
+                         let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                             &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
+                         );
+                         continue;
+                     }
 
-                    // 3. Handle P2P Sync Messages
+                     // 3. Handle P2P Sync Messages
                     if let Ok(p2p_msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
                         match p2p_msg {
                             P2PMessage::SyncRequest { start_height, end_height } => {
@@ -508,12 +525,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 }
                                             }
 
-                                            arbitrator.advance_height();
-                                        }
-                                    }
-                                }
-                            }
-                            P2PMessage::Transaction(tx) => {
+                                             arbitrator.advance_height();
+                                         }
+                                     }
+                                 }
+                             }
+                             P2PMessage::Transaction(tx) => {
                                 println!("💸 Received Transaction from P2P network");
                                 if let Err(e) = mempool.lock().unwrap().add_tx(tx) {
                                     println!("❌ Rejected P2P transaction: {}", e);
@@ -522,6 +539,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
+                        let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                            &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
+                        );
                     }
                 }
                 _ => {}

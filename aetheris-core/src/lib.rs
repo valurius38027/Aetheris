@@ -11,7 +11,7 @@ pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // Adjust difficulty every 1
 pub const MAX_VDF_SPEED: u64 = 5_000_000; // Max 5M iterations/sec (Anti-acceleration threshold)
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
-pub const EXPECTED_GENESIS_HASH: &str = "78096181f215049a421f660f5454641579a32c636e0d9a695e2637a77519199c";
+pub const EXPECTED_GENESIS_HASH: &str = "15db1dd5d89d5d1e19ee65a2221e156ea84083f59a127b99a595fe6e305b914c";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShieldedOutput {

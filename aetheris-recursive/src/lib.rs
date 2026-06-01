@@ -32,8 +32,6 @@ use halo2curves::CurveAffine;
 use halo2curves::group::Curve;
 use halo2curves::group::prime::PrimeCurveAffine;
 
-type VestaScalar = Fq;
-
 use ff::{Field, PrimeField};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
@@ -640,6 +638,14 @@ impl EccChip {
     }
 
     pub fn add(&self, mut layouter: impl Layouter<Fp>, p1: &EcPoint, p2: &EcPoint) -> Result<EcPoint, ErrorFront> {
+        // S-13: If points are equal, use doubling formula
+        let is_same = p1.x.clone().zip(p2.x.clone()).zip(p1.y.clone().zip(p2.y.clone()))
+            .map(|((x1, x2), (y1, y2))| x1 == x2 && y1 == y2)
+            .assign()
+            .unwrap_or(false);
+        if is_same {
+            return self.double(layouter, p1);
+        }
         Ok(layouter.assign_region(
             || "ecc add",
             |mut region| {
@@ -1526,7 +1532,7 @@ impl Circuit<Fp> for RecursiveAggregationCircuit {
     }
 
     fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
-        let poseidon_spec = PoseidonSpec::<3, 2>::new_real(256, 8, 57);
+        let poseidon_spec = PoseidonSpec::<3, 2>::new_real(8, 57, 57);
         let poseidon_config = PoseidonChip::<3, 2>::configure(meta, poseidon_spec.mds);
         let ecc_config = EccChip::configure(meta);
         let nonnative_config = NonNativeChip::configure(meta);
@@ -1545,7 +1551,7 @@ impl Circuit<Fp> for RecursiveAggregationCircuit {
         let range_chip = RangeCheckChip::<12> { config: config.nonnative_config.range_config.clone() };
         range_chip.load(&mut layouter)?;
 
-        let poseidon_spec = PoseidonSpec::<3, 2>::new_real(256, 8, 57);
+        let poseidon_spec = PoseidonSpec::<3, 2>::new_real(8, 57, 57);
         let poseidon = PoseidonChip::<3, 2>::new(poseidon_spec.clone(), config.poseidon_config.clone());
         let ecc = EccChip::new(config.ecc_config.clone());
         let _nonnative = NonNativeChip::new(config.nonnative_config.clone());
@@ -1616,24 +1622,6 @@ impl Circuit<Fp> for RecursiveAggregationCircuit {
         // 6. Expose to instance column
         layouter.constrain_instance(pi_hash.cell.unwrap(), config.instance, 0)?;
 
-        // 7. Atomic Equality Check (Optimized)
-        // This ensures two values are equal within the circuit with minimum constraints.
-        // Instead of complex branch logic, we use a single constraint that (a - b) * inv = 0
-        // Or even simpler for production: use Halo2's built-in equality constraints for direct cell mapping.
-        let x_val = Value::known(Fp::from(100));
-        let y_val = Value::known(Fp::from(100));
-        
-        layouter.assign_region(
-            || "atomic equality check",
-            |mut region| {
-                let x_cell = region.assign_advice(|| "x", config.poseidon_config.state[0], 0, || x_val)?;
-                let y_cell = region.assign_advice(|| "y", config.poseidon_config.state[1], 0, || y_val)?;
-                
-                // Optimized equality: uses the permutation argument which is highly efficient in Halo2
-                region.constrain_equal(x_cell.cell(), y_cell.cell())?;
-                Ok(())
-            }
-        )?;
         
         Ok(())
     }
@@ -1972,7 +1960,7 @@ impl P2PRecursiveManager {
         
         // Ensure params are loaded
         if self.cached_params.is_none() || self.cached_pk.is_none() {
-            self.preload_params(18);
+            self.preload_params(14);
         }
 
         let params = self.cached_params.as_ref().unwrap();
@@ -2054,7 +2042,7 @@ impl P2PRecursiveManager {
 
         // Ensure params are loaded
         if self.cached_params.is_none() || self.cached_pk.is_none() {
-            self.preload_params(18);
+            self.preload_params(14);
         }
 
         let params = self.cached_params.as_ref().unwrap();
@@ -2324,8 +2312,7 @@ mod tests {
     #[test]
     fn test_batch_proof_generation() {
         let mut manager = P2PRecursiveManager::new(PeerId::random(), 1);
-        // Using k=17 for local verification.
-        let k = 17;
+        let k = 14;
         manager.preload_params(k);
         let tx_ids = vec![[0u8; 32], [1u8; 32]];
         let results = manager.generate_batch_atomic_proofs(tx_ids);
@@ -2344,7 +2331,7 @@ mod tests {
 
     #[test]
     fn test_recursive_aggregation_circuit() {
-        let k = 17; 
+        let k = 14; 
         
         // Use real generators for mock proof bytes to pass on-curve check
         let g = PallasAffine::generator();

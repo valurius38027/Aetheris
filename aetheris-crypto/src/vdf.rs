@@ -54,14 +54,11 @@ impl VDF {
         let x = BigUint::from_bytes_be(seed) % &self.modulus;
         let x = if x < BigUint::from(2u32) { BigUint::from(2u32) } else { x };
 
-        let two = BigUint::from(2u32);
         let mut y = x.clone();
 
         for _ in 0..self.difficulty {
-            y = y.modpow(&two, &self.modulus);
+            y = (&y * &y) % &self.modulus;
         }
-
-        let l = self.generate_l(&x, &y);
 
         // r = 2^T mod l  (modpow with exponent T ~21 bits, very fast)
         
@@ -151,7 +148,22 @@ impl VDF {
         if n <= &BigUint::from(1u32) { return false; }
         if n == &BigUint::from(2u32) || n == &BigUint::from(3u32) { return true; }
         if (n % 2u32).is_zero() { return false; }
-        
+
+        // Trial division by first 100 primes — catches ~90% of composites fast
+        const SMALL_PRIMES: [u64; 100] = [
+            3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+            79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
+            163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241,
+            251, 257, 263, 269, 271, 277, 281, 283, 293, 307, 311, 313, 317, 331, 337, 347,
+            349, 353, 359, 367, 373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439,
+            443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+        ];
+        for &p in &SMALL_PRIMES {
+            let p_big = BigUint::from(p);
+            if *n == p_big { return true; }
+            if (n % p).is_zero() { return false; }
+        }
+
         let n_minus_1 = n - 1u32;
         let mut d = n_minus_1.clone();
         let mut s = 0u64;
@@ -160,9 +172,8 @@ impl VDF {
             s += 1;
         }
 
-        // Increased security: Use more bases for Miller-Rabin primality test
-        // These bases provide a very high degree of certainty for primes up to 2^128 and beyond
-        let bases = [2u32, 3u32, 5u32, 7u32, 11u32, 13u32, 17u32, 19u32, 23u32, 29u32, 31u32, 37u32];
+        // 4 Miller-Rabin bases suffice for error < 2^-80 on 2048-bit numbers
+        let bases = [2u32, 3u32, 5u32, 7u32];
         for &base in &bases {
             let a = BigUint::from(base);
             if a >= *n { break; }

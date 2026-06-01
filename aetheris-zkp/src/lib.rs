@@ -26,7 +26,6 @@ use std::fs;
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rand::rngs::OsRng as CryptoRng;
-use rand::RngCore;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore, aead::Aead};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
@@ -400,7 +399,7 @@ impl ZKProofSystem {
         in_blindings: &[[u8; 32]],
         out_blindings: &[[u8; 32]],
         commitments: &[[u8; 32]],
-        public_amount: i64,
+    public_amount: i64,
     ) -> Vec<u8> {
         let comm_hash_fr = hash_commitments(&commitments);
 
@@ -694,6 +693,7 @@ impl ZKProofSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
 
     fn make_proof(in_amounts: &[u64], out_amounts: &[u64], public_amount: i64) -> Vec<u8> {
         let in_blindings: Vec<[u8; 32]> = (0..in_amounts.len())
@@ -707,7 +707,8 @@ mod tests {
 
     fn random_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        CryptoRng.fill_bytes(&mut key);
+        let mut rng = CryptoRng;
+        rng.fill_bytes(&mut key);
         key
     }
 

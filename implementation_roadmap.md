@@ -19,12 +19,12 @@
 
 ## Phase B — 性能工程 (Performance Engineering, 1-2 月)
 
-| # | 项目 | 说明 |
-|---|------|------|
-| B-1 | VDF 增量证明 | VDF 循环中同时跟踪余数，消除独立的 `x.modpow(&q)`，目标降至 0.1x VDF 耗时 |
-| B-2 | Halo2 证明基准 | `ValueConservationCircuit` 当前 6 列/k=10；建立 prove/verify 时间基线，评估 MSM 窗口化、GPU 加速 |
-| B-3 | sled DB 批量写入 | 当前每区块独立 insert+flush；批量 checkpoint + WAL 优化，目标 10-100x |
-| B-4 | 序列化基准测试 | serde_json vs bincode vs protobuf 在 BlockProposal/交易集上的基准 |
+| # | 项目 | 状态 | 说明 |
+|---|------|------|------|
+| B-1 | Class Group VDF 迁移 | ⏳ | RSA-2048 → 虚二次域类群 Cl(D)，自实现二元二次型合成/规约算法 (~290 行纯 Rust)，消除信任假设 |
+| B-2 | Halo2 证明基准 | ✅ | 76 测试 22s／26× 加速：Profile 优化 + Poseidon r_f 256→8 + k 18→14 + V1 planner （待切换） |
+| B-3 | sled DB 批量写入 | ❌ | 当前每区块独立 insert+flush；批量 checkpoint + WAL 优化，目标 10-100x |
+| B-4 | 序列化基准测试 | ❌ | serde_json vs bincode vs protobuf 在 BlockProposal/交易集上的基准 |
 
 ## Phase C — 网络健壮性 (Network Robustness, 1-2 月)
 
@@ -52,6 +52,16 @@
 | E-1 | 递归聚合结合律证明 | `Aetheris_Recursive_Aggregation.v` 完善 Halo2 Accumulation Scheme 证明 |
 | E-2 | TLA+ 并发模型 | VDF 发行 + 主权同步逻辑建模，验证日蚀定理 |
 | E-3 | CI 验证门禁 | Coq 证明 + TLA+ 模型检查作为 CI 流程 |
+| E-4 | Class Group VDF Coq 证明 | 证明二元二次型合成运算的正确性、Wesolowski 验证方程在 Cl(D) 上的可靠性、群阶 h(D) 在信息论意义上不可计算 |
+
+## Phase F — 部署与运维 (Deployment & Ops, 1 月)
+
+| # | 项目 | 说明 |
+|---|------|------|
+| F-1 | 多平台构建 | Linux x86_64/aarch64、macOS、Windows MSVC + 代码签名 |
+| F-2 | 升级机制 | 节点版本协商 + 向后兼容区块格式 |
+| F-3 | 监控集成 | Prometheus metrics：VDF 时间、网络延迟、内存、Peer 数 |
+| F-4 | 文档 | RPC API 文档、CLI 手册、节点运维指南 |
 
 ## Phase F — 部署与运维 (Deployment & Ops, 1 月)
 

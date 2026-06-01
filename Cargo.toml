@@ -50,3 +50,28 @@ poseidon-circuit = { git = "https://github.com/privacy-scaling-explorations/pose
 
 [patch.crates-io]
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+
+[profile.dev]
+opt-level = 1
+debug = 1
+lto = "thin"
+codegen-units = 256
+incremental = true
+
+[profile.test]
+opt-level = 2
+debug = 1
+codegen-units = 256
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+incremental = false
+debug = false
+
+[profile.release.package.halo2_proofs]
+opt-level = 3
+codegen-units = 1
