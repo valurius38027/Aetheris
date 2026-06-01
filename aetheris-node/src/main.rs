@@ -197,9 +197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // In production, we'd get the last parent hash from DB
     if current_height > 0 {
-        if let Some(block) = ledger.lock().unwrap().get_block(current_height - 1) {
-            parent_hash = block.header.parent_hash;
-        }
+        parent_hash = ledger.lock().unwrap().last_block_hash;
     }
 
     let mut arbitrator = MathematicalArbitrator::new();

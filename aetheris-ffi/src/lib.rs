@@ -23,6 +23,7 @@ use std::sync::RwLock;
 use rand::Rng;
 
 use aetheris_node::state::LedgerState;
+use zeroize::Zeroizing;
 
 static LAST_ERROR: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static DB_PATH: Lazy<RwLock<Option<std::path::PathBuf>>> = Lazy::new(|| RwLock::new(None));
@@ -30,7 +31,7 @@ static DB_PATH: Lazy<RwLock<Option<std::path::PathBuf>>> = Lazy::new(|| RwLock::
 // FFI Bridge Encryption Key — Dynamically generated per session.
 // Frontend retrieves it via aetheris_handshake() after aetheris_init().
 static BRIDGE_KEY: Lazy<RwLock<Option<[u8; 32]>>> = Lazy::new(|| RwLock::new(None));
-static USER_PASSWORD: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
+static USER_PASSWORD: Lazy<RwLock<Option<Zeroizing<String>>>> = Lazy::new(|| RwLock::new(None));
 fn set_error(msg: &str) {
     if let Ok(mut err) = LAST_ERROR.write() {
         *err = msg.to_string();
@@ -740,7 +741,7 @@ pub extern "C" fn aetheris_set_wallet_password(password: *const c_char) -> bool 
     let c_str = unsafe { CStr::from_ptr(password) };
     if let Ok(p) = c_str.to_str() {
         let mut pw = USER_PASSWORD.write().unwrap();
-        *pw = Some(p.to_string());
+        *pw = Some(Zeroizing::new(p.to_string()));
         
         // If DB is already open, we might need to re-initialize the cipher
         // but for now, we assume this is called before DB operations.
@@ -1120,7 +1121,8 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     hasher.finalize(&mut res);
     let address = format!("aet1{}", &hex::encode(res)[..24]);
     
-    println!("[FFI] IMPORT: Address derived: {}, Viewing Key: {}", address, hex::encode(viewing_key));
+    #[cfg(debug_assertions)]
+    println!("[FFI] IMPORT: Address: {}", address);
     
     // Drop immutable borrow of db to allow mutable borrow of state
     let genesis = create_genesis_block();
@@ -1400,7 +1402,6 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
     let mut new_tx_history = Vec::new();
 
     println!("[FFI] SCANNING_LEDGER: Searching for owned outputs among {} commitments...", ledger.all_outputs.len());
-    println!("[FFI] SCANNING_LEDGER: Using Viewing Key: {}", hex::encode(viewing_key));
 
     for output in &ledger.all_outputs {
         println!("[FFI] Trial decrypting output with commitment: {}", hex::encode(output.commitment));

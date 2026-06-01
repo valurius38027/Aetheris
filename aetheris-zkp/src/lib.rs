@@ -376,7 +376,7 @@ impl ZKProofSystem {
         let pub_amt_fr = if public_amount >= 0 {
             Fr::from(public_amount as u64)
         } else {
-            -Fr::from((-public_amount) as u64)
+            -Fr::from(public_amount.unsigned_abs())
         };
 
         let mut instance_values = vec![-pub_amt_fr];
@@ -414,7 +414,7 @@ impl ZKProofSystem {
         let pub_amt_fr = if public_amount >= 0 {
             Fr::from(public_amount as u64)
         } else {
-            -Fr::from((-public_amount) as u64)
+            -Fr::from(public_amount.unsigned_abs())
         };
 
         let mut instance_values = vec![-pub_amt_fr];

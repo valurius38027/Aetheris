@@ -34,6 +34,7 @@ argon2 = "0.5"
 libp2p = "0.53"
 futures-util = "0.3"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -170,9 +170,6 @@ mod tests {
 
         assert_eq!(tx.outputs.len(), 2, "Should have two outputs (recipient + change)");
         assert!(change_amount > 0, "Change should be positive when output < input");
-
-        let sum_outputs: u64 = tx.outputs.iter().map(|o| o.commitment.len() as u64).sum();
-        println!("Sum of output commitment sizes (for debug): {}", sum_outputs);
     }
 
     #[test]
