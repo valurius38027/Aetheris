@@ -217,7 +217,11 @@ impl Circuit<Fr> for ValueConservationCircuit {
                     if let Some(b) = self.input_blindings.get(i) {
                         blinding_bytes.copy_from_slice(b);
                     }
-                    let blind_fr = Fr::from_bytes(&blinding_bytes).unwrap_or(Fr::zero());
+                    // C3: Must match create_commitment() — hash blinding with blake3 then mask top bits
+                    let h = blake3::hash(&blinding_bytes);
+                    let mut masked = *h.as_bytes();
+                    masked[31] &= 0x2F;
+                    let blind_fr = Fr::from_bytes(&masked).expect("masked bytes always valid Fr");
 
                     running_sum += amt_fr;
 
@@ -264,7 +268,10 @@ impl Circuit<Fr> for ValueConservationCircuit {
                     if let Some(b) = self.output_blindings.get(i) {
                         blinding_bytes.copy_from_slice(b);
                     }
-                    let blind_fr = Fr::from_bytes(&blinding_bytes).unwrap_or(Fr::zero());
+                    let h = blake3::hash(&blinding_bytes);
+                    let mut masked = *h.as_bytes();
+                    masked[31] &= 0x2F;
+                    let blind_fr = Fr::from_bytes(&masked).expect("masked bytes always valid Fr");
 
                     running_sum -= amt_fr;
 

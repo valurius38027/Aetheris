@@ -807,6 +807,22 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 5 parallel agents audited all 7 crates + FFI + wallet + tests. Found 12 CRITICAL + 8 HIGH new issues.
 
+### Stage 19 — Critical Bug Fixes C1–C10 (2026-06-01)
+
+Fixed 6 of 9 critical bugs (66%):
+
+| ID | Status | Summary |
+|----|--------|---------|
+| C1 | ✅ | VDF seed guard `x < BigUint::from(2u32)` (was `x < BigUint::one()`) — catches 0 and 1 |
+| C2 | ✅ | Merged conservation + range proof into single `assign_region` with `constrain_equal(amount, range_z)` |
+| C4 | ✅ | CRS seed changed from `OsRng` to deterministic `*b"Aetheris ZK CRS deterministic v1"` |
+| C8 | ✅ | `restore_from_db` reads authoritative `height` from DB, replays blocks past snapshot |
+| C9 | ✅ | Test mnemonics gated `#[cfg(debug_assertions)]`; release panics without genesis config |
+| C10 | ✅ | `nullifier_counter` added to `WalletData`, incremented per spend (was hardcoded `0`) |
+| C3 | ✅ | Circuit now uses blake3 hash + mask (matching `create_commitment`) instead of raw blinding bytes |
+| C11 | 🔴 | Pending — mixnet packets absorbed at first hop, no forwarding |
+| C5/C6/C7 | 🔴 | Pending — recursive circuit bugs (modulus, lookup guard, add selector) |
+
 #### 🔴 CRITICAL
 
 | ID | Module | Issue | Location |
@@ -839,4 +855,4 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 ---
 
-*Last updated: 2026-05-31*
+*Last updated: 2026-06-01* (alpha-3 tag: C1+C2+C4+C8+C9+C10 fixed)
