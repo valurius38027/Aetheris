@@ -216,9 +216,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mempool = Arc::new(Mutex::new(Mempool::new()));
     let mut last_block_proof = vec![0u8; 32]; // Initial proof for genesis
     
-    // Mixnet Static Keys (Prototype: Hardcoded for each peer)
+    // Mixnet Static Keys — generated from OsRng; not derived from public PeerId
     let mut my_mix_sk = [0u8; 32];
-    my_mix_sk[..8].copy_from_slice(&swarm.local_peer_id().to_bytes()[..8]);
+    OsRng.fill_bytes(&mut my_mix_sk);
     let my_mix_pk = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(my_mix_sk));
     
     // Recovery proof state
