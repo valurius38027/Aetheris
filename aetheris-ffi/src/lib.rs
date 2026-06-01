@@ -169,7 +169,9 @@ struct GenesisConfig {
     allocations: Vec<GenesisAllocation>,
 }
 
+#[cfg(debug_assertions)]
 const TEST_SEED_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+#[cfg(debug_assertions)]
 const TEST_DEV_MNEMONIC: &str = "crystal sudden zero dynamic unique secret manual adjust orbit current focus total";
 
 fn load_genesis_config() -> Option<GenesisConfig> {
@@ -206,14 +208,18 @@ fn create_genesis_block() -> aetheris_core::Block {
             hex::decode_to_slice(&cfg.allocations[1].viewing_key, &mut dev_viewing_key).unwrap_or_default();
         }
     } else {
-        // Fallback to deriving from test mnemonics if no config found
-        let mut hasher = Keccak::v256();
-        hasher.update(TEST_SEED_MNEMONIC.as_bytes());
-        hasher.finalize(&mut seed_viewing_key);
+        #[cfg(debug_assertions)]
+        {
+            let mut hasher = Keccak::v256();
+            hasher.update(TEST_SEED_MNEMONIC.as_bytes());
+            hasher.finalize(&mut seed_viewing_key);
 
-        let mut hasher = Keccak::v256();
-        hasher.update(TEST_DEV_MNEMONIC.as_bytes());
-        hasher.finalize(&mut dev_viewing_key);
+            let mut hasher = Keccak::v256();
+            hasher.update(TEST_DEV_MNEMONIC.as_bytes());
+            hasher.finalize(&mut dev_viewing_key);
+        }
+        #[cfg(not(debug_assertions))]
+        panic!("No genesis config found. Use --config to specify genesis allocations.");
     }
     
     // 2. Initial Mint: System -> Genesis Seed (21M AET)
@@ -1132,13 +1138,6 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     // Hardcoded genesis recipients for the prototype's "scanning" logic
     let genesis_seed_addr = "aet12f615319124ce9db1669040f"; 
     let dev_addr = "aet147cafe7b55906a973197db85";
-
-    // Re-derive viewing keys for debugging in create_genesis_block
-    let mut dbg_seed_vk = [0u8; 32];
-    let mut hasher = Keccak::v256();
-    hasher.update(TEST_SEED_MNEMONIC.as_bytes());
-    hasher.finalize(&mut dbg_seed_vk);
-    println!("[FFI] DEBUG: Genesis Seed VK expected: {}", hex::encode(dbg_seed_vk));
 
     // tx[0] is Mint (21M to Seed)
     let mint_tx = &genesis.transactions[0];
