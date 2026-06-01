@@ -870,4 +870,8 @@ Fixed 8 of 9 critical bugs (89%), 1 FALSE POSITIVE:
 
 ---
 
-*Last updated: 2026-06-01* (alpha-3 tag: C1–C6 + C8–C11 + H1+H2+H5+H6+H7+H8 fixed)
+*Last updated: 2026-06-01* (alpha-3 tag: C1–C6 + C8–C11 + H1+H2+H5+H6+H7+H8 + genesis hash fix)
+
+### FFI Tests
+
+**Pre-existing failures** (unchanged by our fixes): 2 FFI tests fail due to global state sharing (`STATE`, `TOKIO_RUNTIME`) between test cases and no P2P peers in test environment. Genesis hash mismatch was the primary FFI blocking issue and is now resolved via structural validation.
