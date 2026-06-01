@@ -57,14 +57,20 @@ $$\Delta = b^2 - 4ac = D$$
 
 将种子 $s$ 确定性映射到类群元素（平方运算的初始值）：
 
-1. $h = \text{blake3}(b\text{"AETHERIS_VDF_CLASSGEN"} \| s)$
-2. 计算 $b = h \bmod 2\sqrt{|D|/3}$，使 $b \equiv D \pmod 2$
-3. 设 $a = \lfloor \sqrt{(b^2 - D)/4} \rfloor$，若 $4a \nmid (b^2 - D)$ 则递增 $b$
-4. 返回 $(a, b, (b^2 - D)/(4a))$ 的规约形式
+1. $h = \text{blake3}(\text{"AETHERIS_CLASSGROUP_HASH2FORM"} \| s \| \text{counter\_le})$
+2. 取 $h$ 的前 192 bit 为 $b_{\text{candidate}}$
+3. 令 $b_{\text{offset}} = b_{\text{candidate}} \bmod (2\sqrt{|D|})$，调整使 $b \equiv D \pmod 2$
+4. 用 $k$-搜索法找合法 $a$：
+   - 设 $c = \frac{b^2 - D}{4}$, $\kappa = \sqrt{c/|D|}$
+   - 对 $k = k_{\min} \ldots k_{\max}$（$k_{\min} = \text{counter} \bmod 200 + 4$）：
+     - $a = \lfloor \kappa \cdot k \rfloor$
+     - 若 $a \mid c \land a < \sqrt{|D|}$，接受
+5. 若找不到，递增 counter，重复步骤 1–4
+6. 返回 $(a, b, c/a)$ 的规约形式
 
 #### 1.1.5 算力门槛常数增速
 
-类群合成运算比 RSA 模乘慢约 2-3x，但这是 **常数倍数**——不改变 Wesolowski VDF 的序贯性安全属性。难度重定向机制自动补偿此常数差距。
+类群合成运算比 RSA 模乘慢约 2-3x（**待 benchmark 确认**），但这是 **常数倍数**——不改变 Wesolowski VDF 的序贯性安全属性。难度重定向机制自动补偿此常数差距。
 
 #### 1.1.6 判别式选择
 
@@ -135,7 +141,7 @@ $$T_{n+1} = \text{clamp}\left(T_n \times \frac{T_{target} \times N}{\sum_{i=n-N}
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | $|D|$ | 2048 bits | 类群判别式大小 |
-| $T_{genesis}$ | 1,600,000 | 初始难度（2026 年参考值） |
+| $T_{genesis}$ | 1,600,000 | 初始难度（占位值——基于 RSA 模乘估算，主网上线前需硬件实测校准）⚠️ |
 | $T_{target}$ | 10 sec | 目标出块时间 |
 | $N$ | 10 | 重定向窗口 |
 | $M$ | 4 | 最大调整倍数（±4x 每窗口） |

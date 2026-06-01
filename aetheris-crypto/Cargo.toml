@@ -10,4 +10,5 @@ serde = { workspace = true }
 zeroize = { workspace = true }
 num-bigint = { workspace = true, features = ["rand"] }
 num-traits = { workspace = true }
+num-integer = { workspace = true }
 rand = { workspace = true }
