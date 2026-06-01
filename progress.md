@@ -809,7 +809,7 @@ The Merkle root is computed over sorted `nullifiers ∪ commitments`, providing:
 
 ### Stage 19 — Critical Bug Fixes C1–C10 (2026-06-01)
 
-Fixed 6 of 9 critical bugs (66%):
+Fixed 8 of 9 critical bugs (89%), 1 FALSE POSITIVE:
 
 | ID | Status | Summary |
 |----|--------|---------|
@@ -820,8 +820,10 @@ Fixed 6 of 9 critical bugs (66%):
 | C9 | ✅ | Test mnemonics gated `#[cfg(debug_assertions)]`; release panics without genesis config |
 | C10 | ✅ | `nullifier_counter` added to `WalletData`, incremented per spend (was hardcoded `0`) |
 | C3 | ✅ | Circuit now uses blake3 hash + mask (matching `create_commitment`) instead of raw blinding bytes |
-| C11 | 🔴 | Pending — mixnet packets absorbed at first hop, no forwarding |
-| C5/C6/C7 | 🔴 | Pending — recursive circuit bugs (modulus, lookup guard, add selector) |
+| C11 | ✅ | Mixnet packets now forwarded to next hop after unwrap instead of absorbed |
+| C6 | ✅ | `lookup_val` changed from `Column<Advice>` to `Column<Fixed>` — prover can't bypass MSM lookup |
+| C5 | ✅ | Gate modulus fixed to BN254 Fr (was wrong modulus `28948...`); witness already used correct Fr |
+| C7 | ⛔ | FALSE POSITIVE — selector on row 0 is correct; gate uses rotations to span all 4 rows |
 
 #### 🔴 CRITICAL
 
