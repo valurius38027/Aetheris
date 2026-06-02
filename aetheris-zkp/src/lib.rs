@@ -50,10 +50,13 @@ fn ensure_params() -> &'static ParamsKZG<Bn256> {
                 }
             }
         }
-        // Fallback: deterministic seed for development/testing only
-        eprintln!("[ZK] WARNING: No crs.bin found. Using deterministic seed (DEV ONLY — proofs are forgeable!)");
-        let seed = *b"Aetheris ZK CRS deterministic v1";
-        ParamsKZG::<Bn256>::setup(PROVING_K, &mut ChaCha20Rng::from_seed(seed))
+        // H-5: Deterministic fallback allowed only in debug builds (tests/CI)
+        if cfg!(debug_assertions) {
+            eprintln!("[ZK] WARNING: No crs.bin found. Using deterministic seed (DEV ONLY — proofs are forgeable!)");
+            let seed = *b"Aetheris ZK CRS deterministic v1";
+            return ParamsKZG::<Bn256>::setup(PROVING_K, &mut ChaCha20Rng::from_seed(seed));
+        }
+        panic!("[ZK] FATAL: No crs.bin found. Run the gen_crs tool or place crs.bin in the working directory.");
     })
 }
 

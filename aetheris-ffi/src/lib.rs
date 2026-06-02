@@ -156,7 +156,7 @@ struct WalletTransaction {
     confirmed_height: Option<u64>,
 }
 
-use aetheris_core::{EXPECTED_GENESIS_HASH, calculate_block_reward_atoms};
+use aetheris_core::{EXPECTED_GENESIS_HASH, ATOMS_PER_AET, calculate_block_reward_atoms};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct GenesisAllocation {
@@ -1180,11 +1180,9 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
 
     // 3. Persist Genesis Block to Ledger
     {
-        // Calculate and Verify Genesis Hash
-        let block_bytes = bincode::serialize(&genesis).unwrap();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&block_bytes);
-        let current_hash = hex::encode(hasher.finalize().as_bytes());
+        // C-4: Use deterministic genesis_identity_hash (excludes random ZKP proof bytes)
+        let genesis_hash = aetheris_core::genesis_identity_hash(&genesis);
+        let current_hash = hex::encode(genesis_hash);
         
         let config = load_genesis_config();
         let is_mainnet = config.as_ref().map(|c| c.network == "aetheris-mainnet-alpha").unwrap_or(false);
@@ -1193,6 +1191,9 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
             println!("[FFI] CRITICAL: Mainnet Genesis hash mismatch!");
             println!("[FFI] Expected: {}", EXPECTED_GENESIS_HASH);
             println!("[FFI] Found:    {}", current_hash);
+            if !cfg!(debug_assertions) {
+                return false;
+            }
         } else if !is_mainnet {
             println!("[FFI] Running on Custom Network. Genesis Hash: {}", current_hash);
         }
@@ -1240,12 +1241,9 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
         db.insert(b"transactions", serde_json::to_vec(&tx_history).unwrap()).unwrap();
     }
     
-    // Store the hash of the genesis header as the chain tip if it's not already set
+    // Store the deterministic genesis identity hash as the chain tip
     if db.get(b"last_block_hash").unwrap().is_none() {
-        let block_bytes = bincode::serialize(&genesis).unwrap();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&block_bytes);
-        let genesis_hash: [u8; 32] = hasher.finalize().into();
+        let genesis_hash = aetheris_core::genesis_identity_hash(&genesis);
         db.insert(b"last_block_hash", &genesis_hash).unwrap();
     }
     
@@ -1266,12 +1264,10 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
 pub extern "C" fn aetheris_get_genesis_hash() -> *mut c_char {
     let genesis = create_genesis_block();
     let hash_hex = ffi_try!({
-        let block_bytes = bincode::serialize(&genesis).unwrap_or_default();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&block_bytes);
-        hex::encode(hasher.finalize().as_bytes())
-    }, std::ptr::null_mut());
-    CString::new(hash_hex).unwrap_or_default().into_raw()
+        let hash = aetheris_core::genesis_identity_hash(&genesis);
+        hex::encode(hash)
+    }, std::ptr::null_mut() as *mut c_char);
+    CString::new(hash_hex).unwrap().into_raw()
 }
 
 #[repr(C)]
