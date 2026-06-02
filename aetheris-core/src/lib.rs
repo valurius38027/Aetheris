@@ -61,6 +61,17 @@ pub enum P2PMessage {
     Transaction(Transaction),
 }
 
+pub const ATOMS_PER_AET: u64 = 100_000_000;
+
+pub fn calculate_block_reward_atoms(height: u64) -> u64 {
+    let initial_reward = 50 * ATOMS_PER_AET;
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        return 0;
+    }
+    initial_reward >> halvings
+}
+
 pub fn block_hash(block: &Block) -> Hash {
     let encoded = bincode::serialize(block).unwrap();
     blake3::hash(&encoded).into()

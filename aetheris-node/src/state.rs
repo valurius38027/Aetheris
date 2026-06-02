@@ -1,4 +1,4 @@
-use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME};
+use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
 use std::collections::{HashSet};
@@ -334,6 +334,9 @@ impl LedgerState {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }
 
+        // C-3: Validate issuance rules before any state mutation
+        self.validate_issuance_rules(&block, block.header.height)?;
+
         let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
 
         // P-5: Persist block to disk BEFORE updating in-memory state (write-ahead)
@@ -384,6 +387,50 @@ impl LedgerState {
 
         // 7. Persist state snapshot for fast O(1) startup
         self.save_snapshot();
+
+        Ok(())
+    }
+
+    /// C-3: Validate issuance rules — enforced by consensus before any state mutation.
+    ///
+    /// Rules:
+    /// - At most one coinbase per block, must be first transaction
+    /// - Coinbase must have no inputs, public_amount must equal block reward
+    /// - Non-coinbase transactions must have public_amount == 0
+    /// - Genesis is exempt (structural validation already handled)
+    fn validate_issuance_rules(&self, block: &Block, height: u64) -> Result<(), String> {
+        if height == 0 {
+            return Ok(());
+        }
+        let expected_reward = calculate_block_reward_atoms(height);
+        let mut coinbase_count = 0u64;
+
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            if tx.public_amount > 0 {
+                coinbase_count += 1;
+                if idx != 0 {
+                    return Err("coinbase must be first transaction".into());
+                }
+                if !tx.inputs.is_empty() {
+                    return Err("coinbase must have no inputs".into());
+                }
+                if tx.public_amount != expected_reward {
+                    return Err(format!(
+                        "invalid block reward: expected {}, got {}",
+                        expected_reward, tx.public_amount
+                    ));
+                }
+            } else if coinbase_count > 0 && idx > 0 {
+                // Non-coinbase tx: public_amount must be 0 (already true)
+            }
+        }
+
+        if coinbase_count == 0 {
+            return Err("block must contain a coinbase transaction".into());
+        }
+        if coinbase_count > 1 {
+            return Err("block must not contain multiple coinbase transactions".into());
+        }
 
         Ok(())
     }
