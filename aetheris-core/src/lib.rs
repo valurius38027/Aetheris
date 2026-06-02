@@ -72,6 +72,24 @@ pub fn calculate_block_reward_atoms(height: u64) -> u64 {
     initial_reward >> halvings
 }
 
+/// C-4: Deterministic genesis identity hash — excludes proof bytes and
+/// randomness-dependent fields (ephemeral_key, ciphertext nonce). Only
+/// hashes the immutable economic parameters: amounts, commitments, and
+/// timestamp. Stable across runs and machines for the same config.
+pub fn genesis_identity_hash(block: &Block) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"AETHERIS_GENESIS_V1");
+    hasher.update(&block.header.parent_hash);
+    hasher.update(&block.header.timestamp.to_le_bytes());
+    for tx in &block.transactions {
+        hasher.update(&tx.public_amount.to_le_bytes());
+        for out in &tx.outputs {
+            hasher.update(&out.commitment);
+        }
+    }
+    hasher.finalize().into()
+}
+
 pub fn block_hash(block: &Block) -> Hash {
     let encoded = bincode::serialize(block).unwrap();
     blake3::hash(&encoded).into()
