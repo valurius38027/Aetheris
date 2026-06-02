@@ -258,9 +258,35 @@ Each stage of work should be logged here. Template:
 
 ---
 
+### Stage 29 — Phase 1.1.2: VerificationStrategy IPA Implementation (2026-06-02)
+
+**Scope**: SingleStrategyIPA + AccumulatorStrategyIPA for IPA commitment scheme. Systematic audit fixes (domain separation, blind docs, transcript brands, unwrap removal, k bounds).
+
+#### Changes Made:
+- `aetheris-zkp/src/ipa/strategy.rs` (new): SingleStrategyIPA and AccumulatorStrategyIPA with concrete VerifierIPA<C> bound
+- `aetheris-zkp/src/ipa/mod.rs`: Added `SingleStrategyIPA`, `AccumulatorStrategyIPA` re-exports
+- `aetheris-zkp/src/ipa/commitment.rs`: derive_point domain prefix, ThetaChallenge/RoundChallenge centralized, unwrap removal, k runtime bounds
+- `aetheris-zkp/src/ipa/prover.rs`: unwrap removal, k safe extraction
+- `aetheris-zkp/src/ipa/verifier.rs`: unwrap removal
+- `AGENTS.md` (new): clarified iteration loop requiring re-review after every fix round
+
+#### Verification:
+- `cargo test -p aetheris-zkp`: ✅ 20/20 (12 Phase 1.1.0 + 2 Phase 1.1.1 + 6 new strategy tests)
+- `cargo check -p aetheris-zkp`: ✅ zero warnings
+
+#### Issues Resolved:
+- 1.1.1a: SRS domain separation ✅
+- 1.1.1b: Blind commitment documented as intentional ✅
+- 1.1.1c: Transcript brand separation centralized ✅
+- Unwrap removal: 3 .invert().unwrap() → Option::from(…).ok_or(…)? ✅
+- k runtime bound: debug_assert → if k >= 32 { return Err } ✅
+- k safe extraction: try_into().unwrap() → copy_from_slice + length check ✅
+
+---
+
 ## Stage Log — Future Entries
 
-**Date**: 2026-05-31
+**Date**: 2026-06-01
 
 **Scope**: Make all 7 crates compile against halo2 `main` branch API.
 

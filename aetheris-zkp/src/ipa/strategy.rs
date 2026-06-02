@@ -146,9 +146,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipa::commitment::{GuardIPA, ParamsIPA};
+    use crate::ipa::commitment::GuardIPA;
     use crate::ipa::prover::ProverIPA;
-    use crate::ipa::verifier::VerifierIPA;
     use halo2_backend::poly::commitment::{Blind, Params, ParamsProver, Prover as ProverTrait};
     use halo2_backend::poly::query::{ProverQuery, VerifierQuery};
     use halo2_backend::poly::Coeff;
@@ -157,7 +156,7 @@ mod tests {
     use halo2_proofs::halo2curves::group::Curve as GroupCurve;
     use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
     use halo2_proofs::transcript::{
-        Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+        Blake2bRead, Blake2bWrite, Challenge255, Transcript, TranscriptReadBuffer,
         TranscriptWriterBuffer,
     };
     use rand_core::OsRng;
@@ -178,6 +177,13 @@ mod tests {
     ) -> Vec<u8> {
         let mut transcript =
             Blake2bWrite::<Vec<u8>, EpAffine, Challenge255<EpAffine>>::init(Vec::new());
+
+        // Write commitment as common_point to simulate the real Halo2 flow where
+        // the multi-open protocol writes all instance/advice commitments before
+        // calling the prover. This ensures theta is bound to the commitment.
+        let comm = params.commit(engine, poly, Blind(Fq::ZERO));
+        transcript.common_point(comm.to_affine()).expect("common_point should succeed");
+
         let prover = ProverIPA::new(params);
 
         let query = ProverQuery::new(Fq::from(3u64), poly, Blind(Fq::ZERO));
@@ -257,6 +263,9 @@ mod tests {
         let mut transcript =
             Blake2bRead::<&[u8], EpAffine, Challenge255<EpAffine>>::init(&proof_bytes[..]);
 
+        // Write commitment as common_point to match the prover's transcript state
+        transcript.common_point(comm_affine).expect("common_point should succeed");
+
         let strategy = SingleStrategyIPA::new(&params);
         let verifier = VerifierIPA::<EpAffine>::new();
 
@@ -294,6 +303,9 @@ mod tests {
         let mut transcript =
             Blake2bRead::<&[u8], EpAffine, Challenge255<EpAffine>>::init(&proof_bytes[..]);
 
+        // Write commitment as common_point to match the prover's transcript state
+        transcript.common_point(comm_affine).expect("common_point should succeed");
+
         let strategy = SingleStrategyIPA::new(&params);
         let verifier = VerifierIPA::<EpAffine>::new();
 
@@ -330,6 +342,9 @@ mod tests {
 
         let mut transcript =
             Blake2bRead::<&[u8], EpAffine, Challenge255<EpAffine>>::init(&proof_bytes[..]);
+
+        // Write commitment as common_point to match the prover's transcript state
+        transcript.common_point(comm_affine).expect("common_point should succeed");
 
         let strategy = AccumulatorStrategyIPA::new(&params);
         let verifier = VerifierIPA::<EpAffine>::new();

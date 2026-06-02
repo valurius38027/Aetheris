@@ -67,10 +67,6 @@ where
                 .filter(|q| q.point == point)
                 .collect();
 
-            let theta: ChallengeScalar<C, ThetaChallenge> =
-                transcript.squeeze_challenge_scalar();
-            let theta_val = *theta;
-
             let n = point_queries[0].poly.values.len();
             for q in &point_queries {
                 assert_eq!(
@@ -79,6 +75,13 @@ where
                     "all queries at the same point must have the same polynomial length"
                 );
             }
+
+            transcript.write_scalar(C::ScalarExt::from(n.trailing_zeros() as u64))?;
+
+            let theta: ChallengeScalar<C, ThetaChallenge> =
+                transcript.squeeze_challenge_scalar();
+            let theta_val = *theta;
+
             let mut combined = vec![C::ScalarExt::ZERO; n];
             let mut pow = C::ScalarExt::ONE;
             for q in &point_queries {
@@ -101,7 +104,6 @@ where
             let mut b_cur = b;
             let mut g_cur: Vec<C> = g.to_vec();
             let mut len = n;
-            transcript.write_scalar(C::ScalarExt::from(n.trailing_zeros() as u64))?;
             while len > 1 {
                 let half = len / 2;
                 let (a_lo, a_hi) = a_cur.split_at(half);

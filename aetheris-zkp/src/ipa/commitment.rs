@@ -198,6 +198,12 @@ where
         scalars.extend(poly.iter());
         let bases = &self.g;
         let size = scalars.len();
+        debug_assert!(
+            size <= self.n as usize,
+            "commit: polynomial length {} exceeds domain size {}",
+            size,
+            self.n
+        );
         assert!(bases.len() >= size, "commit: bases len {} < poly len {}", bases.len(), size);
         engine.msm(&scalars, &bases[..size])
     }
@@ -215,6 +221,13 @@ where
     /// IPA uses the same params for prover and verifier (no separation),
     /// so verifier needs to compute commitments from instance column evaluations.
     /// Unlike KZG which sets false for ParamsVerifierKZG, IPA keeps true.
+    /// IPA must commit instances (COMMIT_INSTANCE = true) because unlike KZG,
+    /// IPA does not have a separation between prover and verifier params. The
+    /// verifier needs the instance commitments to reconstruct the multi-open
+    /// protocol's common input for challenge derivation. With COMMIT_INSTANCE,
+    /// the multi-open protocol writes instance polynomial commitments to the
+    /// transcript as common inputs before the prover/verifier run, ensuring
+    /// Fiat-Shamir soundness (challenges bind to all instance data).
     const COMMIT_INSTANCE: bool = true;
 
     fn empty_msm(&'params self) -> MSMIPA<C> {

@@ -61,6 +61,22 @@ where
                 .filter(|q| q.point == point)
                 .collect();
 
+            // Read k (number of IPA rounds = log2(n)) written by prover
+            let k_raw: C::ScalarExt =
+                transcript.read_scalar().map_err(|_| Error::OpeningError)?;
+            let k_repr = PrimeField::to_repr(&k_raw);
+            let k_bytes = k_repr.as_ref();
+            if k_bytes.len() < 4 {
+                return Err(Error::OpeningError);
+            }
+            let mut k_buf = [0u8; 4];
+            k_buf.copy_from_slice(&k_bytes[..4]);
+            let k = u32::from_le_bytes(k_buf) as usize;
+            if k >= 32 {
+                return Err(Error::OpeningError);
+            }
+            let n = 1 << k;
+
             let theta: ChallengeScalar<C, ThetaChallenge> =
                 transcript.squeeze_challenge_scalar();
             let theta_val = *theta;
@@ -83,22 +99,6 @@ where
                 combined_eval += pow * q.eval;
                 pow *= theta_val;
             }
-
-            // Read k (number of IPA rounds = log2(n)) written by prover
-            let k_raw: C::ScalarExt =
-                transcript.read_scalar().map_err(|_| Error::OpeningError)?;
-            let k_repr = PrimeField::to_repr(&k_raw);
-            let k_bytes = k_repr.as_ref();
-            if k_bytes.len() < 4 {
-                return Err(Error::OpeningError);
-            }
-            let mut k_buf = [0u8; 4];
-            k_buf.copy_from_slice(&k_bytes[..4]);
-            let k = u32::from_le_bytes(k_buf) as usize;
-            if k >= 32 {
-                return Err(Error::OpeningError);
-            }
-            let n = 1 << k;
 
             // Read L_i, R_i and squeeze x_i for each round
             let mut l_points = Vec::with_capacity(k);
