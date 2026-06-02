@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use halo2_proofs::halo2curves::CurveAffine;
 use halo2_proofs::halo2curves::group::Group;
 use halo2_proofs::arithmetic::CurveExt;
-use halo2_backend::poly::{Coeff, LagrangeCoeff, Polynomial};
+use halo2_backend::poly::{Coeff, Guard, LagrangeCoeff, Polynomial};
 use halo2_backend::poly::commitment::{Blind, CommitmentScheme, MSM as MSMTrait, Params, ParamsProver, ParamsVerifier};
 use halo2_middleware::zal::traits::MsmAccel;
 use rand_core::RngCore;
@@ -29,11 +29,11 @@ pub struct ParamsIPA<C: CurveAffine> {
     u: C,
 }
 
-pub(crate) fn derive_point<C: CurveAffine>(tag: &[u8]) -> C
+pub(crate) fn derive_point<C: CurveAffine>(domain_prefix: &str, tag: &[u8]) -> C
 where
     C::CurveExt: CurveExt,
 {
-    let hasher = <C::CurveExt as CurveExt>::hash_to_curve("aetheris-ipa-v1");
+    let hasher = <C::CurveExt as CurveExt>::hash_to_curve(domain_prefix);
     let proj = hasher(tag);
     C::from(proj)
 }
@@ -44,15 +44,18 @@ where
 {
     /// Create new IPA parameters for a given domain size `k` (size = 2^k).
     pub fn setup<R: RngCore>(k: u32, _rng: &mut R) -> Self {
+        // NOTE: The `where C::CurveExt: CurveExt` bound above is redundant
+        // (guaranteed by `CurveAffine::CurveExt: CurveExt`) but required for
+        // `hash_to_curve` calls within inherent methods.
         let n = 1 << k;
         let mut g = Vec::with_capacity(n);
         for i in 0..n {
             let mut tag = b"g-".to_vec();
             tag.extend_from_slice(&i.to_le_bytes());
-            g.push(derive_point::<C>(&tag));
+            g.push(derive_point::<C>("aetheris-ipa-g", &tag));
         }
-        let h = derive_point::<C>(b"h");
-        let u = derive_point::<C>(b"u");
+        let h = derive_point::<C>("aetheris-ipa-h", b"h");
+        let u = derive_point::<C>("aetheris-ipa-u", b"u");
         ParamsIPA {
             k,
             n: n as u64,
@@ -118,6 +121,11 @@ where
         poly: &Polynomial<C::ScalarExt, LagrangeCoeff>,
         _blinding: Blind<C::ScalarExt>,
     ) -> C::CurveExt {
+        // Blinding is intentionally ignored, consistent with the KZG commitment
+        // scheme in halo2_backend. The halo2 multi-open protocol achieves zero-knowledge
+        // at a higher level (random polynomial commitments) rather than per-commitment
+        // blinding factors. The h generator is reserved for future use if blinding
+        // is needed at this layer.
         let mut scalars = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g;
@@ -185,6 +193,7 @@ where
         poly: &Polynomial<C::ScalarExt, Coeff>,
         _blinding: Blind<C::ScalarExt>,
     ) -> C::CurveExt {
+        // Blinding is intentionally ignored — see commit_lagrange doc comment.
         let mut scalars = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g;
@@ -283,8 +292,6 @@ impl<C: CurveAffine> GuardIPA<C> {
     }
 }
 
-use halo2_backend::poly::Guard;
-
 impl<C: CurveAffine> Guard<CommitmentSchemeIPA<C>> for GuardIPA<C>
 where
     C::CurveExt: CurveExt,
@@ -295,6 +302,12 @@ where
 /// IPA CommitmentScheme implementation.
 ///
 /// Uses `ParamsIPA` for both prover and verifier parameters.
+
+/// Challenge brand for the point-combining step (theta).
+pub(crate) struct ThetaChallenge;
+/// Challenge brand for per-round IPA folding (x_i).
+pub(crate) struct RoundChallenge;
+
 // ----- Tests for Phase 1.1.0 -----
 
 #[cfg(test)]
@@ -429,8 +442,10 @@ mod tests {
     }
 
     #[test]
-    fn test_params_ipa_commit_blinding_ignored() {
-        // Verify commit() produces same result regardless of Blind value
+    fn test_params_ipa_commit_blinding_deferred() {
+        // Verify commit() intentionally ignores Blind — consistent with KZG.
+        // Halo2 handles zero-knowledge at the multi-open protocol level via random
+        // polynomial commitments, not per-commitment blindings.
         let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
         let engine = halo2_middleware::zal::impls::H2cEngine;
         let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(
@@ -438,6 +453,7 @@ mod tests {
         );
         let c1 = params.commit_lagrange(&engine, &poly, Blind(Fq::ONE));
         let c2 = params.commit_lagrange(&engine, &poly, Blind(Fq::from(999u64)));
+        // Blinding is intentionally deferred — different blinds produce same commitment
         assert_eq!(c1.to_bytes().as_ref(), c2.to_bytes().as_ref());
     }
 

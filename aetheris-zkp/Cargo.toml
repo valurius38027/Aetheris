@@ -4,15 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ark-ff = { workspace = true }
-ark-std = { workspace = true }
-ark-relations = { workspace = true }
-ark-r1cs-std = { workspace = true }
-ark-groth16 = { workspace = true }
-ark-snark = { workspace = true }
-ark-bls12-381 = { workspace = true }
-ark-serialize = { workspace = true }
 halo2_proofs = { workspace = true }
+halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+halo2_middleware = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
 halo2curves = { workspace = true }
 rand_chacha = { workspace = true }
 rand = { workspace = true }

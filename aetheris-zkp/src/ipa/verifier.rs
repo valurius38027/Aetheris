@@ -9,9 +9,7 @@ use halo2_proofs::arithmetic::{CurveExt, Field};
 use halo2_proofs::halo2curves::group::Curve as GroupCurve;
 use halo2_proofs::halo2curves::CurveAffine;
 
-use crate::ipa::commitment::{derive_point, CommitmentSchemeIPA, GuardIPA, MSMIPA, ParamsIPA};
-
-struct IpaChallenge;
+use crate::ipa::commitment::{derive_point, CommitmentSchemeIPA, GuardIPA, MSMIPA, ParamsIPA, ThetaChallenge, RoundChallenge};
 
 #[derive(Debug)]
 pub struct VerifierIPA<C: CurveAffine> {
@@ -63,7 +61,7 @@ where
                 .filter(|q| q.point == point)
                 .collect();
 
-            let theta: ChallengeScalar<C, IpaChallenge> =
+            let theta: ChallengeScalar<C, ThetaChallenge> =
                 transcript.squeeze_challenge_scalar();
             let theta_val = *theta;
 
@@ -90,9 +88,16 @@ where
             let k_raw: C::ScalarExt =
                 transcript.read_scalar().map_err(|_| Error::OpeningError)?;
             let k_repr = PrimeField::to_repr(&k_raw);
-            let k = u32::from_le_bytes(
-                k_repr.as_ref()[..4].try_into().unwrap(),
-            ) as usize;
+            let k_bytes = k_repr.as_ref();
+            if k_bytes.len() < 4 {
+                return Err(Error::OpeningError);
+            }
+            let mut k_buf = [0u8; 4];
+            k_buf.copy_from_slice(&k_bytes[..4]);
+            let k = u32::from_le_bytes(k_buf) as usize;
+            if k >= 32 {
+                return Err(Error::OpeningError);
+            }
             let n = 1 << k;
 
             // Read L_i, R_i and squeeze x_i for each round
@@ -102,7 +107,7 @@ where
             for _ in 0..k {
                 let l = transcript.read_point().map_err(|_| Error::OpeningError)?;
                 let r = transcript.read_point().map_err(|_| Error::OpeningError)?;
-                let x: ChallengeScalar<C, IpaChallenge> =
+                let x: ChallengeScalar<C, RoundChallenge> =
                     transcript.squeeze_challenge_scalar();
                 l_points.push(l);
                 r_points.push(r);
@@ -123,16 +128,16 @@ where
             for i in 0..n {
                 let mut tag = b"g-".to_vec();
                 tag.extend_from_slice(&i.to_le_bytes());
-                g_cur.push(derive_point::<C>(&tag));
+                g_cur.push(derive_point::<C>("aetheris-ipa-g", &tag));
             }
 
-            let u = derive_point::<C>(b"u");
+            let u = derive_point::<C>("aetheris-ipa-u", b"u");
 
             // Fold b and G through the IPA challenges (same folding as prover)
             let mut len = n;
             for i in 0..k {
                 let half = len / 2;
-                let x_inv = challenges[i].invert().unwrap();
+                let x_inv: C::ScalarExt = Option::from(challenges[i].invert()).ok_or(Error::OpeningError)?;
                 let (b_lo, b_hi) = b_cur.split_at(half);
                 let (g_lo, g_hi) = g_cur.split_at(half);
 
@@ -157,7 +162,7 @@ where
             // Add x_i^{-1} * L_i + x_i * R_i for each round
             for i in 0..k {
                 let x = challenges[i];
-                let x_inv = x.invert().unwrap();
+                let x_inv: C::ScalarExt = Option::from(x.invert()).ok_or(Error::OpeningError)?;
                 msm.append_term(x_inv, l_points[i].to_curve());
                 msm.append_term(x, r_points[i].to_curve());
             }

@@ -94,66 +94,201 @@ Phase 4   生产就绪     ─→  文档/清理
 
 > Phase 0 完成前不要开始 Phase 1。
 > 以下所有工作只在 Pasta 代码上进行——**不在 BN254 上修任何东西**。
+>
+> **关键架构决策**: Pasta 曲线不支持 KZG（需要 `Engine` trait），因此 Phase 1.1 必须从零实现 IPA 承诺方案，
+> 再在 IPA 之上搭建电路。这是**唯一路径**——不存在"先用 KZG 后换 IPA"的中间态。
+> IPA 承诺方案和 IPA 递归积累是两层不同的概念：前者是单层证明的承诺机制（Phase 1.1），
+> 后者是跨区块的递归压缩（Phase 1.4）。
 
 ### 1.0 ZK 抽象 trait 初始化
 - **来源**: protocol_design_ruling.md §5
 - **动作**:
-  1. `aetheris-zkp/src/trait.rs` 定义 `ZkProverSystem`
-  2. 当前 BN254 代码不动（放在 `drop/` 下当参考）
-  3. 新建 `aetheris-zkp/src/halo2_pasta.rs` 写 Pasta 实现
-  4. `lib.rs` 重导出 `pub type ZKProofSystem = Halo2PastaBackend;`
-- **验证**: `cargo build -p aetheris-zkp`
+   1. `aetheris-zkp/src/trait_.rs` 定义 `ZkProverSystem`
+   2. `aetheris-zkp/src/halo2_bn254.rs` 保留 BN254 实现作参考（不编译）
+   3. 新建 `aetheris-zkp/src/halo2_pasta.rs` 写 Pasta + IPA 实现
+   4. `lib.rs` 重导出 `pub type ZKProofSystem = Halo2PastaBackend;`
+- **验证**: `cargo check -p aetheris-zkp`（BN254 不编译，仅检查模块结构）
+- **状态**: ✅已完成
 
-### 1.1 Pasta 曲线迁移 — aetheris-zkp
-- **来源**: B-1, A-21
+### 1.1 实现 IPA 承诺方案底层
+
+> **核心**: 填补 PSE fork 缺失的 IPA commitment scheme。
+> 在 `halo2_backend::poly::ipa/` 层级实现（或等效地在 `aetheris-zkp` 内直接实现），
+> 实现 `CommitmentScheme`、`Prover`、`Verifier` trait 的 IPA 变体。
+> Pasta 曲线 (Ep/EpAffine/Fq) 已实现 `CurveAffine`，无需 `Engine`。
+
+#### 1.1.0 ParamsIPA + MSMAccumulatorIPA + GuardIPA
+- **来源**: 新（PSE fork 无现成 IPA）
+- **文件**: `aetheris-zkp/src/ipa/commitment.rs`
+- **动作**: ✅已完成（commit `7cb6877`）
+    1. `ParamsIPA<C: CurveAffine>` struct: `g: Vec<C>`, `h: C`, `u: C`, `k: u32`
+    2. 实现 `Params<C>` trait: `k()`, `n()`, `downsize()`, `commit_lagrange()`, `write()`, `read()`
+    3. 实现 `ParamsProver<C>` trait: `new(k)`, `commit()`, `get_g()`
+    4. 实现 `ParamsVerifier<C>` trait: `empty_msm()`, `COMMIT_INSTANCE`
+    5. `MSMIPA<C>` struct, 实现 `MSM<C>` trait
+    6. `GuardIPA<C>` struct, 实现 `Guard<CommitmentSchemeIPA<C>>` trait
+    7. `CommitmentSchemeIPA<C>` struct, 实现 `CommitmentScheme` trait
+    8. 12 个单元测试（`#[cfg(test)]` 在 `commitment.rs` 内）
+- **验证**: ✅ 12 个测试通过
+
+#### 1.1.1 CommitmentSchemeIPA + ProverIPA + VerifierIPA
+- **来源**: 新
+- **文件**: `aetheris-zkp/src/ipa/prover.rs`, `verifier.rs`
+- **动作**: ✅已完成（commit `7cb6877`）
+    1. `ProverIPA<'params, C>`: IPA multi-open 证明生成，完全 inner product argument 协议
+    2. `VerifierIPA<C>`: 从 transcript 读取 proof，重建 MSM 验证方程
+    3. 关联类型完整: `Guard = GuardIPA<C>`, `MSMAccumulator = MSMIPA<C>`
+- **验证**: ✅ `cargo check --workspace` 零错误
+
+#### 1.1.1a 🔴 SRS Domain Separation Fix (pre-1.1.2)
+- **来源**: Systematic audit 1.2
 - **动作**:
-  1. 替换 Cargo.toml 依赖：`ark_bn254`/`ark_grumpkin` → `pallas`/`vesta`
-  2. 重写 `ValueConservationCircuit` 使用 Pasta 域
-  3. **一次性实现正确 running-sum 约束**（原 A-1：跨 range 行 `advice[3]` 受约束）
-  4. **一次性实现 input membership + nullifier correctness**（原 C-2：Merkle path 证明 + Poseidon nullifier 约束）
-  5. Generator 用哈希到曲线安全派生，非硬编码
-- **文件**: `aetheris-zkp/src/`（新建 `halo2_pasta.rs`，保留旧 BN254 代码作参考但不编译）
-- **验证**: `cargo test -p aetheris-zkp` 全部通过；手动构造无效 proof 被拒绝
+    1. `derive_point` 加入 `circuit_id` 或上下文 tag: `hash_to_curve("aetheris-ipa-v1|circuit_id")`
+    2. 或 `derive_point` 接受 domain 参数，调用者传入混淆上下文
+- **文件**: `aetheris-zkp/src/ipa/commitment.rs:32-39`
 
-### 1.2 Pasta 曲线迁移 — aetheris-recursive
+#### 1.1.1b 🔴 Blind Commitment Fix (pre-1.1.2)
+- **来源**: Systematic audit 1.1
+- **动作**:
+    1. `commit()` = `MSM(poly, G) + blind·H`
+    2. 对 `commit_lagrange()` 同样处理
+- **文件**: `aetheris-zkp/src/ipa/commitment.rs:182-194, 115-127`
+
+#### 1.1.1c 🟡 Transcript Brand Separation (pre-1.1.2)
+- **来源**: Systematic audit 1.4
+- **动作**: 用不同的 `IpaChallenge` 品牌区分 IPA 点和轮挑战
+- **文件**: `prover.rs:14`, `verifier.rs:14`
+
+#### 1.1.2 验证策略（VerificationStrategy）
+- **来源**: 新
+- **文件**: `aetheris-zkp/src/ipa/strategy.rs`
+- **前置**: 1.1.1a (domain fix) + 1.1.1b (blind fix) + 1.1.1c (brand separation)
+- **动作**:
+    1. `SingleStrategyIPA<C>`: 实现 `VerificationStrategy`，单 proof 验证
+       - 直接使用 `ParamsIPA.g()` 避免 O(n) recompute
+       - `GuardIPA::use_challenges()` + `msm_accumulator()` 实现
+    2. `AccumulatorStrategyIPA<C>`: 实现 `VerificationStrategy`，累加多个 proof
+       - 实现 batch verification: `MSM = P + Σ(x⁻¹·L + x·R) + ...`
+       - 在 `GuardIPA` 上实现 `use_challenges()` 和 `msm_accumulator()` 方法
+    3. 修复审计项 **4.2**: 策略携带 `&ParamsIPA`，避免 verifier O(n) 重新计算 G_i
+- **验证**: `SingleStrategyIPA` 在 roundtrip 中返回 `true`
+
+#### 1.1.3 IPA 模块集成 + 基本测试
+- **来源**: 新 + 系统审计 1.3, 2.2, 2.3, 3.3
+- **文件**: `aetheris-zkp/src/ipa/` 全模块
+- **动作**:
+    1. IPA roundtrip 测试：`test_ipa_single_proof_roundtrip`, `test_ipa_multi_proof_roundtrip`, `test_ipa_tampered_proof_rejected`
+    2. 🔴 修复 **2.2**: `x_inv = x_val.invert()` — 处理 `x=0` 边界（使用 `Option` 而非 `unwrap()`）
+    3. 🟡 修复 **2.3**: `k` 编码为 u32 而非 scalar 域元素
+    4. 🟢 修复 **3.3**: verifier 中所有 `unwrap()` 替换为正确 error 传播
+    5. 🟡 修复 **2.1**: `commit_lagrange` / `commit` 加 degree 检查 `poly.len() ≤ 2^k`
+    6. 🟡 修复 **5.1**: `COMMIT_INSTANCE` 加文档说明或移除
+- **验证**: 所有 IPA 基础测试通过
+
+### 1.2 Pasta 电路 + Halo2PastaBackend
+
+> **前置**: 1.1（IPA 承诺方案可用）
+> 电路在 `Fq`（Pallas 标量场 = Vesta 基场）上运行，使用 IPA 承诺方案。
+
+#### 1.2.0 ValueConservationCircuit 移植到 Pasta
+- **来源**: B-1
+- **文件**: `aetheris-zkp/src/halo2_pasta.rs`
+- **动作**:
+   1. 所有 `Fp`（BN254 标量场）替换为 `Fq`（Pallas 标量场）
+   2. 使用 `CommitmentSchemeIPA<EpAffine>` 类型参数
+   3. 约束逻辑（running_sum, bit_constraint, constrain_equal）保持不变
+   4. `without_witnesses()` 和 `dummy()` 适配 Pasta 域
+- **验证**: ValueConservationCircuit 实例化不 panic
+
+#### 1.2.1 修复 running-sum 约束（A-1）
+- **来源**: A-1
+- **文件**: `aetheris-zkp/src/halo2_pasta.rs`
+- **动作**: 确保跨 range 行正确约束，`advice[3]` 和 `advice[1]` 在每行都被 gate 约束
+- **验证**: 手动构造超出 range 的 amount → proof 验证失败
+
+#### 1.2.2 输入 membership proof + nullifier correctness（C-2）
+- **来源**: C-2
+- **文件**: `aetheris-zkp/src/halo2_pasta.rs`
+- **动作**:
+   1. Merkle path 验证电路：递归验证 `leaf = hash(child0, child1)` 在每一层
+   2. Poseidon hash 约束（用 Pasta 原生域 `Fq`）
+   3. Nullifier 约束：`nullifier = Poseidon(sk, record_id)`
+   4. 输入 commitment 在 Merkle 树中的存在性验证
+- **验证**: 正确 membership proof 验证通过；伪造 leaf 被拒绝
+
+#### 1.2.3 Generator 哈希到曲线安全派生
+- **来源**: 原 1.1.5
+- **文件**: `aetheris-zkp/src/halo2_pasta.rs`
+- **动作**: 使用 `hash_to_curve` 或 `try-and-increment` 从 blake3 种子派生 generator 点
+- **验证**: 相同种子 → 相同 generator；不在 inf 上
+
+#### 1.2.4 Halo2PastaBackend 实现 + 测试套件
+- **来源**: 原 1.1.2-1.1.4
+- **文件**: `aetheris-zkp/src/halo2_pasta.rs` + `tests/`
+- **动作**:
+   1. `Halo2PastaBackend` 实现 `ZkProverSystem` trait
+   2. `ensure_params()`: 加载/生成 `ParamsIPA<EpAffine>`
+   3. `ensure_keys()`: 生成 `ProvingKey<EpAffine>` + `VerifyingKey<EpAffine>`
+   4. `prove_conservation()`: 使用 `IPACommitmentScheme` + `ProverIPA` 创建 proof
+   5. `verify_conservation()`: 使用 `VerifierIPA` 验证 proof
+   6. `create_commitment()`: `Fq::from(amount) + Fq::from(blinding)` → `Fq::to_bytes()`
+   7. `create_nullifier()`: blake3(sk || commitment_index)
+   8. `build_merkle_root()`: blake3 Merkle tree
+   9. `aggregate_proofs()`: 先用 Merkle 哈希过渡（真实 IPA 积累在 1.4 升级）
+   10. 加密: `encrypt_output`, `encrypt_note`, `trial_decrypt`（非 ZK，直接保留 AES-GCM + x25519）
+- **验证**: `cargo test -p aetheris-zkp` 全部测试通过：
+  - 值守恒: `test_conservation_basic`, `rejects_wrong_public_amount`, `public_amount_net_zero`, `negative_public_amount`
+  - 加密: `test_encrypt_decrypt_roundtrip`, `wrong_key`, `tampered`
+  - Aggregate: `multi_tx_roundtrip`, `rejects_tampered`, `with_commitments_binding`
+  - 安全性: `proof_tamper_detection`, `commitment_consistency`
+
+#### 1.2.5 lib.rs 导出 + ZKProofSystem 切换
+- **来源**: 原 1.0.4
+- **文件**: `aetheris-zkp/src/lib.rs`
+- **动作**:
+   1. `pub type ZKProofSystem = Halo2PastaBackend;`
+   2. 导出 `create_commitment`, `create_nullifier`, `build_merkle_root`
+   3. `halo2_bn254.rs` 保留但不编译（`#[cfg(...)]` 或直接删引用）
+- **验证**: `cargo check -p aetheris-zkp` 零错误
+
+### 1.3 清理 aetheris-recursive
 - **来源**: B-1
 - **动作**:
-  1. 删除 `NonNativeChip`（~1500 行，Pasta 2-cycle 不再需要）
-  2. 删除 `KzgChip`（~200 行，无意义空操作）
-  3. 删除 `AccumulatorChip`（~200 行，线性组合不是 accumulator）
-  4. 删除旧的 `RecursiveAggregationCircuit`（~200 行，不是递归 SNARK）
-  5. 修复 `EccChip` identity 点 `(0,0)` 不在曲线上
-  6. Poseidon 用 Grain LFSR 生成标准参数
-- **验证**: `cargo test -p aetheris-recursive`
+   1. 删除 `NonNativeChip`（~1500 行，Pasta 2-cycle 不再需要）
+   2. 删除 `KzgChip`（~200 行，无意义空操作）
+   3. 删除 `AccumulatorChip`（~200 行，线性组合不是 accumulator）
+   4. 删除旧的 `RecursiveAggregationCircuit`（~200 行，不是递归 SNARK）
+   5. 修复 `EccChip` identity 点 `(0,0)` 不在曲线上
+   6. Poseidon 用 Grain LFSR 生成标准参数
+- **验证**: `cargo check -p aetheris-recursive`
 
-### 1.3 实现真实 Halo2 IPA 积累
-- **来源**: B-2, A-11 ~ A-15
-- **动作**: `<500` 行原生 Pasta 算术替代原来 ~2500 行错误代码
-  ```
-  struct Accumulator { Q: Point<Pasta>, transcript: [u8; 32] }
-  fn accumulate(π, acc_old) → acc_new:
-    verify_halo2(π)
-    challenge = Poseidon(acc.transcript, π.commitment)
-    Q_new = acc.Q + challenge • π.commitment
-  ```
+### 1.4 实现真实 IPA 积累（递归层）
+- **来源**: B-2, A-11 ~ A-15（原是 1.3）
+- **前置**: 1.1（IPA 承诺方案）+ 1.3（清理后可用原生电路）
+- **动作**:
+   1. `AccumulatorIPA` struct: `Q: Ep`, `transcript: [u8; 32]`
+   2. `accumulate()` 函数: 验证单个 proof → Poseidon challenge → Q_new = Q + challenge · π_commitment
+   3. `CircuitAccumulate`: Halo2 电路验证累积关系（递归验证）
+   4. 适配 `ZkProverSystem::aggregate_proofs` 用 IPA accumulator 替代 Merkle 哈希
 - **验证**: 递归积累 3+ 层端到端测试
 
-### 1.4 集成 IPA 积累到区块生产
-- **来源**: B-3
-- **动作**: 替换区块生产中的 Merkle 哈希 aggregate 为 `ZKProofSystem::aggregate_proofs`
+### 1.5 集成 IPA 到区块生产
+- **来源**: B-3（原是 1.4）
+- **前置**: 1.4
+- **动作**: 替换区块生产中的 Merkle 哈希 aggregate 为 IPA accumulator
 - **文件**: `aetheris-node/src/state.rs`、`aetheris-node/src/main.rs`
 - **验证**: 多区块递归链验证通过
 
-### 1.5 实现真实 VDF prove/verify
-- **来源**: B-3
+### 1.6 实现真实 VDF prove/verify
+- **来源**: B-3（原是 1.5）
 - **动作**: 实现 Wesolowski VDF 证明生成和验证（非 blake3 hash）
 - **文件**: `aetheris-zkp/src/halo2_pasta.rs`
 - **验证**: 新增 VDF 证明验证测试
 
-### 1.6 恢复所有调用方
-- **来源**: B-4, B-5, B-6
+### 1.7 恢复所有调用方
+- **来源**: B-4, B-5, B-6（原是 1.6）
 - **动作**: 修复 `ZKProofSystem` API 变更影响的所有调用点（FFI、wallet、node）
-- **验证**: `cargo build --workspace` 无警告
+- **验证**: `cargo check --workspace` 无警告
 
 ---
 
@@ -241,13 +376,24 @@ Phase 0 (Node 救命，不碰 ZK 代码)
           │  Phase 0 全部完成
           ▼
 Phase 1 (一次性 ZK 重写)
-  1.0 ────┐
-  1.1 ────┤
-  1.2 ────┤ (依赖 1.1)
-  1.3 ◄──┤ (依赖 1.2)
-  1.4 ◄──┤ (依赖 1.3 + 0.1-0.3)
-  1.5 ────┤
-  1.6 ────┘
+  1.0 ────┐  (ZK trait — 已完成)
+  1.1 ────┤  (IPA 承诺方案 — 新底层)
+   ├─1.1.0  (ParamsIPA + MSMIPA + GuardIPA)
+   ├─1.1.1  (CommitmentSchemeIPA + ProverIPA + VerifierIPA)
+   ├─1.1.2  (验证策略)
+   └─1.1.3  (集成 + 基本测试)
+  1.2 ────┤  (Pasta 电路 — 依赖 1.1)
+   ├─1.2.0  (ValueConservationCircuit 移植)
+   ├─1.2.1  (修复 A-1 running-sum)
+   ├─1.2.2  (实现 C-2 membership + nullifier)
+   ├─1.2.3  (Generator 哈希安全派生)
+   ├─1.2.4  (Halo2PastaBackend + 全套测试)
+   └─1.2.5  (lib.rs 导出 + ZKProofSystem 切换)
+  1.3 ────┤  (清理 aetheris-recursive)
+  1.4 ◄──┤  (IPA 递归积累 — 依赖 1.1 + 1.3)
+  1.5 ◄──┤  (集成 IPA 到区块 — 依赖 1.4 + 0.1-0.3)
+  1.6 ────┤  (VDF 真实实现)
+  1.7 ────┘  (恢复调用方)
           │  Phase 1 全部完成 = MVP
           ▼
 Phase 2 ──→ Phase 3 ──→ Phase 4
@@ -271,11 +417,14 @@ Phase 2 ──→ Phase 3 ──→ Phase 4
 ## 时间估算
 
 ```
-Week 1-2:   Phase 0  (8 commits, Node 层修复，不碰 ZK)
-Week 3-8:   Phase 1  (6 commits, 最大工作量——Pasta 迁移 + IPA 实现 + 所有电路重写)
-Week 9-12:  Phase 2  (7 commits, 钱包隐私)
-Week 13-15: Phase 3  (5 commits, 网络)
-Week 16-17: Phase 4  (6 commits, 文档/清理)
+Week 1-2:   Phase 0        (Node 层修复，不碰 ZK)                                                     ✅已完
+Week 3-4:   Phase 1.0-1.1  (ZK trait + IPA 承诺方案底层 — 最大新代码量，从零实现 IPA)
+Week 5-6:   Phase 1.2      (Pasta 电路移植 + 全套测试)
+Week 7:     Phase 1.3-1.4  (清理 aetheris-recursive + IPA 递归积累)
+Week 8:     Phase 1.5-1.7  (集成区块/VDF/恢复调用方)
+Week 9-12:  Phase 2        (钱包隐私)
+Week 13-15: Phase 3        (网络)
+Week 16-17: Phase 4        (文档/清理)
 
 MVP (Phase 0+1) ≈ 8 周
 Full Mainnet (Phase 0-4) ≈ 17 周
