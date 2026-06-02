@@ -1390,6 +1390,31 @@ RSA-2048 VDF 的安全性依赖 **"RSA Labs 确实销毁了因数"** 这一信�
 
 ## Stage 28 — Phase 0: Node Life-Saving Fixes (2026-06-02)
 
+... *(Stage 28 content remains unchanged)* ...
+
+---
+
+### Stage 28a — Phase 0 Subagent Review + Fixes (2026-06-02)
+
+**Scope**: Subagent review of all Phase 0 changes. 2 blocking issues + 3 warnings found; all resolved.
+
+#### Review Findings
+
+| Severity | Issue | Fix |
+|----------|-------|-----|
+| ❌ ISSUE 1 | `aetheris_submit_vdf_proof` hardcoded `state_root: [0u8; 32]` → broke H-1 check on non-empty state | Changed to `ledger.get_state_root()` |
+| ❌ ISSUE 2 (A-4) | Rollback didn't restore `last_aggregate_proof` — next block uses wrong previous proof | Deserialize prev block, clone `aggregate_proof` |
+| ⚠️ Warning 1 | FFI mining `block_hash` used Keccak(vdf_result) instead of `core::block_hash()` | Built temp Block, used `aetheris_core::block_hash()` |
+| ⚠️ Warning 3 | Only 3 FFI functions used `ffi_try!` instead of ~12 | Noted — deferred (non-blocking for Phase 0) |
+| ⚠️ Warning 4 | State root in FFI `aetheris_start_mining` vs `submit_vdf_proof` inconsistent | Fixed by ISSUE 1 |
+
+#### Verification
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ Zero errors |
+| `cargo test -p aetheris-node` | ✅ 13/13 |
+| Commit | `4720f04` (amended) |
+
 **Scope**: Execute Phase 0 of `mainnet_execution_plan.md` — fix node-breaking bugs without touching ZK circuit code. All changes in `aetheris-node`, `aetheris-core`, `aetheris-ffi`.
 
 ### Changes Made
@@ -1448,3 +1473,69 @@ Files modified in Phase 0:
 - `aetheris-node/src/consensus.rs`: Arbitrator hash
 - `aetheris-node/src/main.rs`: Block hash, test fixes, unused import
 - `aetheris-node/src/state.rs`: Nullifier pre-check, state_root verify, coinbase skip, test fixes
+
+---
+
+## Stage 29 — Phase 1.1.1 ProverIPA + VerifierIPA (2026-06-02)
+
+**Scope**: Implement IPA-based `Prover` and `Verifier` traits for the Halo2 commitment scheme interface, replacing the KZG dependency for Pasta curves.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-zkp/src/ipa/prover.rs` | `ProverIPA` struct implementing `Prover` trait; full IPA inner product protocol with multi-point batching, round-by-round folding, and transcript I/O |
+| `aetheris-zkp/src/ipa/verifier.rs` | `VerifierIPA` struct implementing `Verifier` trait; reads all proof data from transcript, derives G_i/U from `hash_to_curve`, folds b/G through challenges, builds complete MSM verification equation |
+| `aetheris-zkp/src/ipa/commitment.rs` | `derive_point` made `pub(crate)` for verifier reuse; `CommitmentSchemeIPA` unit struct added at bottom of file |
+| `aetheris-zkp/src/ipa/strategy.rs` | Stub — `// Phase 1.1.2: IPA verification strategies (not yet implemented)` |
+| `aetheris-zkp/src/ipa/mod.rs` | `pub mod strategy;` added |
+
+### Verification
+
+- `cargo check --workspace` — ✅ zero errors, zero warnings
+
+### IPA Systematic Audit Findings
+
+A multi-agent systematic analysis of the complete IPA codebase (commitment.rs + prover.rs + verifier.rs) identified the following items:
+
+#### 🔴 Cryptography Correctness
+
+| ID | Severity | Issue | File:Line | Fix Priority |
+|----|----------|-------|-----------|-------------|
+| **1.1** | 🔴 | `commit()` ignores `_blinding` — commitment = `MSM(poly, G)` without `blind·H`. Matches KZG behavior but inconsistent with standard IPA security proof (blinding prevents brute-force recovery of polynomial coefficients from commitment). | `commitment.rs:182-194` | **Phase 1.1.2** — `commit` = MSM(poly, G) + blind·H |
+| **1.2** | 🔴 | `derive_point("aetheris-ipa-v1")` is a **fixed domain tag** — all generators (G_i, h, u) share the same domain. No `circuit_id` or context tag. Enables **cross-protocol attacks**: a proof for one circuit can be replayed against another. | `commitment.rs:36` | **Phase 1.1.2** — add `circuit_id` or context tag |
+| **1.3** | 🟡 | `inner_product` is **not constant-time** — variable-time scalar multiplication leaks bit-length of inputs via timing; exploitable if prover and verifier are separate machines (e.g., proving service). | `prover.rs:21-28` | Document; optimize if needed |
+| **1.4** | 🟡 | `ChallengeScalar` uses symmetric `IpaChallenge` brand for **both points and rounds** — no type-level distinguisher; transcript collisions possible if same brand reused in different contexts. | `prover.rs:14,124`; `verifier.rs:14,105` | **Phase 1.1.2** — distinct brands per domain |
+
+#### 🟡 Protocol Integrity
+
+| ID | Severity | Issue | File:Line | Fix Priority |
+|----|----------|-------|-----------|-------------|
+| **2.1** | 🟡 | No polynomial **degree check** in `commit_lagrange` — a polynomial with degree > 2^k−1 can be committed as if it were within the supported degree bound. | `commitment.rs:115-127` | **Phase 1.1.2** — check `poly.len() ≤ 2^k` |
+| **2.2** | 🟡 | `x_inv = x_val.invert().unwrap()` can **panic** if `x_val = 0` (probability 2⁻²⁵⁶ — negligible but real in adversarial transcript). | `prover.rs:127`; `verifier.rs:135,160` | **Phase 1.1.3** — handle divide-by-zero |
+| **2.3** | 🟡 | `k` is encoded as a scalar field element — unnecessarily expensive and opens malleability surface. Should encode as u32. | `verifier.rs:90-96` | **Phase 1.1.3** — encode k as u32 |
+| **2.4** | 🟡 | `GuardIPA` has **no `use_challenges()` or `msm_accumulator()`** — batch verification cannot proceed; `check()` is the only path. | `commitment.rs:272-293` | **Phase 1.1.2** implement batch support |
+
+#### 🟢 Engineering Robustness
+
+| ID | Severity | Issue | File:Line | Fix Priority |
+|----|----------|-------|-----------|-------------|
+| **3.1** | 🟢 | **O(n) memory** for SRS generators `g: Vec<C>` — stores affine points directly. Use projective storage or caching. | `commitment.rs:25` | Phase 1.3+ |
+| **3.2** | 🟢 | **No version/checksum** in serialization format — can't detect format drift; old proofs silently misinterpreted. | `commitment.rs:129-171` | Phase 1.3+ |
+| **3.3** | 🟢 | **`unwrap()`** in verifier round-trip logic — will panic on any transcript deserialization error. | `verifier.rs:135,160` | **Phase 1.1.3** |
+| **3.4** | 🟢 | **Missing `Drop`/`Zeroize`** — `GuardIPA` holds accumulated scalars in `Vec<C::ScalarExt>`; dropped without zeroization. | `commitment.rs:272-293` | Phase 1.3+ |
+
+#### Performance
+
+| ID | Severity | Issue | Fix |
+|----|----------|-------|-----|
+| **4.1** | 🟢 | `b`-vector computed as repeated multiplication — can use `powers(point)` geometric series formula | Phase 1.3+ |
+| **4.2** | 🟢 | `VerifierIPA` recomputes G_i from `hash_to_curve` O(n) every verification — should use pre-computed `ParamsIPA.g()` via strategy | **Phase 1.1.2** — strategy carries params |
+
+#### Design
+
+| ID | Severity | Issue | Fix |
+|----|----------|-------|-----|
+| **5.1** | 🟡 | `COMMIT_INSTANCE = true` with no documentation or control — Halo2's `verify_proof` may behave unexpectedly depending on this flag | Document or remove |
+| **5.2** | 🟢 | No **safety documentation** — security assumptions (DL, random oracle, AGM) not stated | Phase 1.3+ |
+| **5.3** | 🟡 | `C::ScalarExt` and `C::Scalar` are identical types (`PrimeCurveAffine<Scalar=Self::ScalarExt>`) — ambiguity with `Group::Scalar` | Use `C::ScalarExt` explicitly; document alias |

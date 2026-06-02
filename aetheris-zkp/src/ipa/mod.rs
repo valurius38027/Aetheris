@@ -4,3 +4,4 @@ pub mod verifier;
 pub mod strategy;
 
 pub use commitment::{ParamsIPA, MSMIPA};
+pub use strategy::{SingleStrategyIPA, AccumulatorStrategyIPA};

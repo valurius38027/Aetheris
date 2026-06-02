@@ -9,9 +9,7 @@ use halo2_proofs::halo2curves::group::Curve as GroupCurve;
 use halo2_proofs::halo2curves::CurveAffine;
 use rand_core::RngCore;
 
-use crate::ipa::commitment::ParamsIPA;
-
-struct IpaChallenge;
+use crate::ipa::commitment::{ParamsIPA, ThetaChallenge, RoundChallenge};
 
 #[derive(Debug)]
 pub struct ProverIPA<'params, C: CurveAffine> {
@@ -69,7 +67,7 @@ where
                 .filter(|q| q.point == point)
                 .collect();
 
-            let theta: ChallengeScalar<C, IpaChallenge> =
+            let theta: ChallengeScalar<C, ThetaChallenge> =
                 transcript.squeeze_challenge_scalar();
             let theta_val = *theta;
 
@@ -121,10 +119,12 @@ where
                 let r_proj = r_msm + u_proj * c_r;
                 transcript.write_point(r_proj.to_affine())?;
 
-                let x: ChallengeScalar<C, IpaChallenge> =
+                let x: ChallengeScalar<C, RoundChallenge> =
                     transcript.squeeze_challenge_scalar();
                 let x_val = *x;
-                let x_inv = x_val.invert().unwrap();
+                let x_inv: C::ScalarExt = Option::from(x_val.invert()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Other, "IPA prover: zero challenge in round")
+                })?;
 
                 let mut a_new = Vec::with_capacity(half);
                 let mut b_new = Vec::with_capacity(half);
