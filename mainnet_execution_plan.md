@@ -149,9 +149,7 @@ Phase 4   生产就绪     ─→  文档/清理
 
 #### 1.1.1b 🔴 Blind Commitment Fix (pre-1.1.2)
 - **来源**: Systematic audit 1.1
-- **动作**:
-    1. `commit()` = `MSM(poly, G) + blind·H`
-    2. 对 `commit_lagrange()` 同样处理
+- **决策**: **不实现** blind·H — 遵循 halo2 KZG 架构约定，零知识由上层 multi-open 协议（随机多项式承诺）保证。`h` generator 已预留在 `ParamsIPA` 中，未来如需改回只需加一行 `engine.msm(&[blind], &[self.h])`，向前兼容。
 - **文件**: `aetheris-zkp/src/ipa/commitment.rs:182-194, 115-127`
 
 #### 1.1.1c 🟡 Transcript Brand Separation (pre-1.1.2)
@@ -179,11 +177,11 @@ Phase 4   生产就绪     ─→  文档/清理
 - **动作**:
     1. IPA roundtrip 测试：`test_ipa_single_proof_roundtrip`, `test_ipa_multi_proof_roundtrip`, `test_ipa_tampered_proof_rejected`
     2. 🔴 修复 **2.2**: `x_inv = x_val.invert()` — 处理 `x=0` 边界（使用 `Option` 而非 `unwrap()`）
-    3. 🟡 修复 **2.3**: `k` 编码为 u32 而非 scalar 域元素
+    3. 🟡 修复 **2.3**: `k` 编码 — 接受 scalar (32B) 而非 u32 (4B)，因 Transcript API 无原生 u32 支持。相对 proof 大小（2k·32B + 32B）增加~28B 可忽略。若未来需移出 proof bytes，延迟到 Phase 1.4（IPA 递归积累）时通过 `common_scalar` + VerifierIPA 存储 k 实现。
     4. 🟢 修复 **3.3**: verifier 中所有 `unwrap()` 替换为正确 error 传播
     5. 🟡 修复 **2.1**: `commit_lagrange` / `commit` 加 degree 检查 `poly.len() ≤ 2^k`
     6. 🟡 修复 **5.1**: `COMMIT_INSTANCE` 加文档说明或移除
-- **验证**: 所有 IPA 基础测试通过
+- **验证**: 所有 IPA 基础测试通过（20/20）；`cargo check -p aetheris-zkp` 零警告
 
 ### 1.2 Pasta 电路 + Halo2PastaBackend
 

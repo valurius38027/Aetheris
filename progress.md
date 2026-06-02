@@ -284,6 +284,34 @@ Each stage of work should be logged here. Template:
 
 ---
 
+### Stage 30 — Phase 1.1.3: Fiat-Shamir Binding Fixes + Degree Assertions + COMMIT_INSTANCE Doc (2026-06-02)
+
+**Scope**: Cryptographic correctness improvements for IPA commitment scheme. Reorder k before theta for Fiat-Shamir binding, add commitment as common_point in tests, add degree assertions, enhance documentation. Resolve plan-vs-code discrepancies.
+
+#### Changes Made:
+- `aetheris-zkp/src/ipa/prover.rs`: Moved `write_scalar(k)` before `squeeze_challenge_scalar(theta)` (k now bound into challenge derivation)
+- `aetheris-zkp/src/ipa/verifier.rs`: Moved `read_scalar(k)` before `squeeze_challenge_scalar(theta)` (mirror prover order)
+- `aetheris-zkp/src/ipa/strategy.rs`: Tests write commitment as `common_point` before prover/verifier (simulates real Halo2 multi-open transcript state)
+- `aetheris-zkp/src/ipa/commitment.rs`: Added `debug_assert!(size <= self.n)` in `commit()`; enhanced `COMMIT_INSTANCE = true` documentation
+- `mainnet_execution_plan.md`: Updated 1.1.1b (blind intentionally ignored per KZG pattern) and 1.1.3 item 3 (k scalar encoding accepted — Transcript API limitation)
+
+#### Design Decisions:
+- **1.1.1b Blind**: NOT implemented — follows halo2 KZG architecture convention. Zero-knowledge achieved at multi-open protocol layer via random polynomial commitments. `h` generator reserved for future use.
+- **1.1.3 k encoding**: Scalar (32B) accepted over u32 (4B). Transcript API lacks native u32. Relative overhead ~28B per proof is negligible. Deferred to Phase 1.4 if removal from proof bytes is needed.
+
+#### Verification:
+- `cargo test -p aetheris-zkp`: ✅ 20/20
+- `cargo check -p aetheris-zkp`: ✅ zero warnings
+- Multi-agent review: ✅ both reviewers approved (zero blocking issues)
+
+#### Issues Resolved:
+- 1.1.3 Fiat-Shamir binding (k before theta) ✅
+- 1.1.3 Degree assertion in commit() ✅
+- 1.1.3 COMMIT_INSTANCE documentation ✅
+- Plan-vs-code discrepancies documented ✅
+
+---
+
 ## Stage Log — Future Entries
 
 **Date**: 2026-06-01
