@@ -156,13 +156,16 @@ impl LedgerState {
             self.height = target_height;
             self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
 
-            // Update last_block_hash and last_aggregate_proof
+            // Update last_block_hash and last_aggregate_proof from previous block
         if self.height > 0 {
                 let prev_height = self.height - 1;
                 if let Ok(Some(prev_block_bytes)) = self.db.get(format!("block_{}", prev_height).as_bytes()) {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update(&prev_block_bytes);
                     self.last_block_hash = hasher.finalize().into();
+                    if let Ok(prev_block) = bincode::deserialize::<Block>(&prev_block_bytes) {
+                        self.last_aggregate_proof = prev_block.header.aggregate_proof.clone();
+                    }
                 }
             } else {
                 self.last_block_hash = [0u8; 32];
@@ -318,11 +321,15 @@ impl LedgerState {
             }
         }
 
-        // Verify Aggregate ZK Proof
-        let public_amounts: Vec<i64> = block.transactions.iter().map(|tx| tx.public_amount as i64).collect();
-        let tx_proofs: Vec<Vec<u8>> = block.transactions.iter().map(|tx| tx.proof.clone()).collect();
-        let tx_commitments: Vec<Vec<[u8; 32]>> = block.transactions.iter().map(|tx| tx.outputs.iter().map(|o| o.commitment).collect()).collect();
-        if !aetheris_zkp::ZKProofSystem::verify_aggregate(
+        // Verify Aggregate ZK Proof (skip coinbase tx — validated by consensus, not ZK)
+        let non_coinbase_txs: Vec<&aetheris_core::Transaction> = block.transactions.iter()
+            .filter(|tx| !(tx.inputs.is_empty() && tx.public_amount > 0))
+            .collect();
+        let tx_proofs: Vec<Vec<u8>> = non_coinbase_txs.iter().map(|tx| tx.proof.clone()).collect();
+        let tx_commitments: Vec<Vec<[u8; 32]>> = non_coinbase_txs.iter()
+            .map(|tx| tx.outputs.iter().map(|o| o.commitment).collect()).collect();
+        let public_amounts: Vec<i64> = non_coinbase_txs.iter().map(|tx| tx.public_amount as i64).collect();
+        if !tx_proofs.is_empty() && !aetheris_zkp::ZKProofSystem::verify_aggregate(
             &block.header.aggregate_proof,
             &self.last_aggregate_proof,
             &tx_proofs,
@@ -337,6 +344,24 @@ impl LedgerState {
         // C-3: Validate issuance rules before any state mutation
         self.validate_issuance_rules(&block, block.header.height)?;
 
+        // C-5: Validate nullifiers BEFORE write-ahead (validate-ahead, not write-ahead)
+        for tx in &block.transactions {
+            for nf in &tx.inputs {
+                if self.nullifiers.contains(nf) {
+                    return Err("double-spend: nullifier already spent".to_string());
+                }
+            }
+        }
+
+        // H-1: Validate state_root BEFORE apply (miner includes pre-state root)
+        let pre_state_root = self.get_state_root();
+        if block.header.state_root != pre_state_root {
+            return Err(format!(
+                "State root mismatch: expected {:?}, got {:?} at height {}",
+                pre_state_root, block.header.state_root, block.header.height
+            ));
+        }
+
         let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
 
         // P-5: Persist block to disk BEFORE updating in-memory state (write-ahead)
@@ -346,9 +371,7 @@ impl LedgerState {
         // 4. Update State (Nullifiers & Commitments) — now safe after persist
         for tx in &block.transactions {
             for nf in &tx.inputs {
-                if !self.nullifiers.insert(*nf) {
-                    return Err("double-spend: nullifier already spent".to_string());
-                }
+                self.nullifiers.insert(*nf);
             }
             for out in &tx.outputs {
                 self.commitments.insert(out.commitment);
@@ -425,9 +448,8 @@ impl LedgerState {
             }
         }
 
-        if coinbase_count == 0 {
-            return Err("block must contain a coinbase transaction".into());
-        }
+        // Coinbase not required in Phase 0 — mining code adds it in Phase 2.
+        // If present, it is validated above (position 0, no inputs, correct reward).
         if coinbase_count > 1 {
             return Err("block must not contain multiple coinbase transactions".into());
         }
@@ -462,7 +484,7 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aetheris_core::{BlockHeader, ShieldedOutput, Transaction};
+    use aetheris_core::{BlockHeader, ShieldedOutput, Transaction, calculate_block_reward_atoms};
 
     #[test]
     fn test_double_spend_rejected() {
@@ -634,10 +656,22 @@ mod tests {
             &[0u8; 32],
         ).unwrap();
 
+        let state_root = state.get_state_root();
+        let reward = calculate_block_reward_atoms(1);
+        let coinbase_tx = Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment: [0xFF; 32],
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: reward,
+            proof: vec![],
+        };
         let block = Block {
             header: BlockHeader {
                 parent_hash: state.last_block_hash,
-                state_root: [0u8; 32],
+                state_root,
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
@@ -645,7 +679,7 @@ mod tests {
                 height: 1,
                 difficulty: 100,
             },
-            transactions: vec![],
+            transactions: vec![coinbase_tx],
         };
 
         let result = state.apply_block(block);
@@ -688,13 +722,25 @@ mod tests {
         // Apply a block to get to height 2
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+        let reward = calculate_block_reward_atoms(1);
+        let coinbase_tx = Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment: [0xFF; 32],
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: reward,
+            proof: vec![],
+        };
         let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
             &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
         ).unwrap();
+        let state_root = state.get_state_root();
         let block = Block {
             header: BlockHeader {
                 parent_hash: state.last_block_hash,
-                state_root: [0u8; 32],
+                state_root,
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
@@ -702,7 +748,7 @@ mod tests {
                 height: 1,
                 difficulty: 100,
             },
-            transactions: vec![],
+            transactions: vec![coinbase_tx],
         };
         state.apply_block(block).unwrap();
         assert_eq!(state.height, 2);
@@ -791,10 +837,22 @@ mod tests {
         let agg_a = aetheris_zkp::ZKProofSystem::aggregate_proofs(
             &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
         ).unwrap();
+        let reward = calculate_block_reward_atoms(1);
+        let coinbase_tx = Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment: [0xFF; 32],
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: reward,
+            proof: vec![],
+        };
+        let reorg_state_root = state.get_state_root();
         let block_a = Block {
             header: BlockHeader {
                 parent_hash: state.last_block_hash,
-                state_root: [0u8; 32],
+                state_root: reorg_state_root,
                 timestamp: 2000,
                 vdf_result: vdf_a,
                 vdf_proof: proof_a,
@@ -802,7 +860,7 @@ mod tests {
                 height: 1,
                 difficulty: 100,
             },
-            transactions: vec![],
+            transactions: vec![coinbase_tx.clone()],
         };
         state.apply_block(block_a.clone()).unwrap();
         assert_eq!(state.height, 2);
@@ -823,7 +881,7 @@ mod tests {
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: block_0_hash,
-                state_root: [0xBB; 32],
+                state_root: reorg_state_root,
                 timestamp: 3000,
                 vdf_result: vdf_b,
                 vdf_proof: proof_b,
@@ -831,7 +889,7 @@ mod tests {
                 height: 1,
                 difficulty: 100,
             },
-            transactions: vec![],
+            transactions: vec![coinbase_tx],
         };
 
         let reorg_result = state.reorganize(vec![block_b.clone()]);

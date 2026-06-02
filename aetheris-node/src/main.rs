@@ -2,7 +2,6 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use tiny_keccak::Hasher as _;
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -109,14 +108,15 @@ mod tests {
             height: 1,
             last_block_hash: [0u8; 32],
             last_aggregate_proof: b"aetheris_aggregate_v1_genesis".to_vec(),
-            current_difficulty: 1.0,
+            current_difficulty: 10,
             timestamps: Vec::new(),
         };
+        let test_state_root = state.get_state_root();
 
         let block = Block {
             header: BlockHeader {
                 parent_hash: [0u8; 32],
-                state_root: [0u8; 32],
+                state_root: test_state_root,
                 timestamp: 100,
                 vdf_result: vec![],
                 vdf_proof: vec![],
@@ -129,13 +129,14 @@ mod tests {
 
         println!("🚀 Starting State Persistence Stress (10 atomic updates)...initial");
         let start = Instant::now();
-        let vdf = VDF::new(10);
         for i in 1..=10 {
             let mut b = block.clone();
             b.header.height = i as u64;
             b.header.parent_hash = state.last_block_hash;
             b.header.timestamp = 100 + i as u64;
-            
+            b.header.difficulty = state.current_difficulty;
+            b.header.state_root = state.get_state_root();
+            let vdf = VDF::new(b.header.difficulty);
             let (res, proof, _) = vdf.solve(&b.header.parent_hash);
             b.header.vdf_result = res;
             b.header.vdf_proof = proof;
@@ -435,10 +436,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      if let Err(e) = ledger_lock.apply_block(block.clone()) {
                                          println!("❌ Failed to apply block #{}: {}", winner.height, e);
                                      } else {
-                                         println!("✅ Ledger updated to height {} via Mathematical Arbitration (Txs: {})", ledger_lock.height, block.transactions.len());
-                                         last_block_proof = block.header.aggregate_proof.clone();
-                                         parent_hash = winner.block_hash;
-                                         arbitrator.set_prev_hash(parent_hash); // Update entropy for next round
+                                          println!("✅ Ledger updated to height {} via Mathematical Arbitration (Txs: {})", ledger_lock.height, block.transactions.len());
+                                          last_block_proof = block.header.aggregate_proof.clone();
+                                          parent_hash = ledger_lock.last_block_hash;
+                                          arbitrator.set_prev_hash(parent_hash); // Update entropy for next round
                                          current_height = ledger_lock.height;
                                          
                                          // Update difficulty if needed
@@ -566,11 +567,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_commitments, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
                     last_block_proof = aggregate_proof.clone();
 
-                    // 3. Propose Block
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(&parent_hash);
-                    hasher.update(&vdf_result);
-                    let block_hash: [u8; 32] = hasher.finalize().into();
+                    // 3. Propose Block — hash computed from serialized block (matches state.rs)
+                    let block_for_hash = Block {
+                        header: BlockHeader {
+                            parent_hash,
+                            state_root,
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                            vdf_result: vdf_result.clone(),
+                            vdf_proof: vdf_proof.clone(),
+                            aggregate_proof: aggregate_proof.clone(),
+                            height: current_height,
+                            difficulty: current_difficulty,
+                        },
+                        transactions: txs.clone(),
+                    };
+                    let block_hash = aetheris_core::block_hash(&block_for_hash);
 
                     let proposal = BlockProposal {
                         height: current_height,

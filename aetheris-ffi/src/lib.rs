@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use futures_util::StreamExt as _; 
 use libp2p::{Multiaddr, swarm::SwarmEvent, gossipsub, kad};
 use std::sync::RwLock;
-use rand::Rng;
+
 
 use aetheris_node::state::LedgerState;
 use zeroize::Zeroizing;
@@ -145,16 +145,8 @@ struct OwnedUTXO {
     ephemeral_key: [u8; 32],
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct WalletTransaction {
-    tx_type: String,
-    from: String,
-    to: String,
-    amount_atoms: u64,
-    timestamp: String,
-    proof: Vec<u8>,
-    confirmed_height: Option<u64>,
-}
+// MEMPOOL now stores aetheris_core::Transaction directly (Phase 0.4).
+// WalletTransaction was removed — it dropped nullifiers/outputs on conversion.
 
 use aetheris_core::{EXPECTED_GENESIS_HASH, ATOMS_PER_AET, calculate_block_reward_atoms};
 
@@ -558,17 +550,8 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                                     }
                                                     aetheris_core::P2PMessage::Transaction(tx) => {
                                                         println!("[P2P] Received Transaction from {}", peer_id);
-                                                        let wallet_tx = WalletTransaction {
-                                                            tx_type: "Shielded".to_string(),
-                                                            from: "Remote Peer".to_string(),
-                                                            to: "Self/Other".to_string(),
-                                                            amount_atoms: tx.public_amount,
-                                                            timestamp: chrono::Utc::now().to_rfc3339(),
-                                                            proof: tx.proof.clone(),
-                                                            confirmed_height: None,
-                                                        };
                                                         let mut mp = MEMPOOL.lock().unwrap();
-                                                        mp.push(wallet_tx);
+                                                        mp.push(tx);
                                                     }
                                                 }
                                             } else if let Ok(proposal) = serde_json::from_slice::<BlockProposal>(&message.data) {
@@ -710,7 +693,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 static MINING_STOP_FLAG: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
-static MEMPOOL: Lazy<Mutex<Vec<WalletTransaction>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static MEMPOOL: Lazy<Mutex<Vec<aetheris_core::Transaction>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 struct AppState {
     ledger: Option<LedgerState>,
@@ -1101,18 +1084,14 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     combined.extend_from_slice(&ciphertext);
     db.insert(b"mnemonic_enc", combined).unwrap();
 
-    // Derive viewing key (Keccak256(mnemonic))
+    // Derive viewing key (blake3, Phase 0.6)
     let mut viewing_key = [0u8; 32];
-    let mut hasher = Keccak::v256();
-    hasher.update(phrase.as_bytes());
-    hasher.finalize(&mut viewing_key);
+    let vk = blake3::hash(&[phrase.as_bytes(), b"aetheris-viewing-key"].concat());
+    viewing_key.copy_from_slice(vk.as_bytes());
 
     // 1. First Pass: Derive the address properly before scanning transactions
-    let mut hasher = Keccak::v256();
-    hasher.update(phrase.as_bytes());
-    let mut res = [0u8; 32];
-    hasher.finalize(&mut res);
-    let address = format!("aet1{}", &hex::encode(res)[..24]);
+    let addr_hash = blake3::hash(phrase.as_bytes());
+    let address = format!("aet1{}", hex::encode(&addr_hash.as_bytes()[..24]));
     
     #[cfg(debug_assertions)]
     println!("[FFI] IMPORT: Address: {}", address);
@@ -1367,9 +1346,8 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
         let ciphertext = &m_enc[12..];
         if let Ok(decrypted) = cipher.decrypt(nonce, ciphertext) {
             let decrypted = Zeroizing::new(decrypted);
-            let mut hasher = Keccak::v256();
-            hasher.update(&decrypted);
-            hasher.finalize(&mut viewing_key);
+            let vk = blake3::hash(&[decrypted.as_slice(), b"aetheris-viewing-key"].concat());
+            viewing_key.copy_from_slice(vk.as_bytes());
         }
     } else {
         return;
@@ -1573,9 +1551,8 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             let ciphertext = &m_enc[12..];
             if let Ok(decrypted) = state.cipher.decrypt(nonce, ciphertext) {
                 let decrypted = Zeroizing::new(decrypted);
-                let mut hasher = Keccak::v256();
-                hasher.update(&decrypted);
-                hasher.finalize(&mut viewing_key);
+                let vk = blake3::hash(&[decrypted.as_slice(), b"aetheris-viewing-key"].concat());
+                viewing_key.copy_from_slice(vk.as_bytes());
             }
         }
     } else {
@@ -1629,7 +1606,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
     let block = aetheris_core::Block {
         header: aetheris_core::BlockHeader {
             parent_hash: ledger.last_block_hash,
-            state_root: [0u8; 32],
+            state_root: ledger.get_state_root(),
             timestamp: chrono::Utc::now().timestamp() as u64,
             vdf_result: result_bytes.clone(),
             vdf_proof: proof_bytes,
@@ -1694,7 +1671,6 @@ pub extern "C" fn aetheris_start_mining() -> bool {
 
     MINING_STOP_FLAG.store(false, Ordering::SeqCst);
 
-    let my_address = state.address.clone();
     let db_handle = state.ledger.as_ref().map(|l| l.db.clone());
 
     let handle = thread::spawn(move || {
@@ -1721,31 +1697,20 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             
             if MINING_STOP_FLAG.load(Ordering::SeqCst) { break; }
 
-            // 3. Gather and Verify transactions from Mempool
-            let txs_to_apply;
-            let mut core_txs = Vec::new();
+            // 3. Gather transactions from MEMPOOL (core::Transaction, Phase 0.4)
             let mut tx_proofs = Vec::new();
             let mut tx_public_amounts = Vec::new();
+            let mut tx_commitments: Vec<Vec<[u8; 32]>> = Vec::new();
+            let mut core_txs: Vec<aetheris_core::Transaction> = Vec::new();
 
             {
                 let mut mempool = MEMPOOL.lock().unwrap();
-                let mut valid_txs = Vec::new();
                 for tx in mempool.drain(..) {
-                    // Use the real proof from the transaction
-                    let tx_proof = tx.proof.clone();
-                    
-                    valid_txs.push(tx.clone());
-                    
-                    core_txs.push(aetheris_core::Transaction {
-                        inputs: vec![],
-                        outputs: vec![],
-                        public_amount: tx.amount_atoms,
-                        proof: tx_proof.clone(),
-                    });
-                    tx_proofs.push(tx_proof);
-                    tx_public_amounts.push(tx.amount_atoms as i64);
+                    tx_proofs.push(tx.proof.clone());
+                    tx_public_amounts.push(tx.public_amount as i64);
+                    tx_commitments.push(tx.outputs.iter().map(|o| o.commitment).collect());
+                    core_txs.push(tx);
                 }
-                txs_to_apply = valid_txs;
             }
 
             // 4. Create Block Proposal for Arbitration
@@ -1753,7 +1718,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             let aggregate_proof = match ZKProofSystem::aggregate_proofs(
                 &ledger.last_aggregate_proof, 
                 &tx_proofs,
-                &vec![vec![]; tx_proofs.len()],
+                &tx_commitments,
                 &tx_public_amounts,
                 ledger.height,
                 &state_root
@@ -1765,11 +1730,21 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 }
             };
             
-            let mut hasher = Keccak::v256();
-            hasher.update(&result);
-            let mut block_hash_res = [0u8; 32];
-            hasher.finalize(&mut block_hash_res);
-            let block_hash = block_hash_res;
+            // Compute block_hash from serialized block (matching state.rs canonical hash)
+            let temp_block = aetheris_core::Block {
+                header: aetheris_core::BlockHeader {
+                    parent_hash: ledger.last_block_hash,
+                    state_root,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    vdf_result: result.clone(),
+                    vdf_proof: vdf_proof.clone(),
+                    aggregate_proof: aggregate_proof.clone(),
+                    height: current_height,
+                    difficulty: current_difficulty,
+                },
+                transactions: core_txs.clone(),
+            };
+            let block_hash = aetheris_core::block_hash(&temp_block);
 
             let proposal = BlockProposal {
                 height: current_height,
@@ -1835,31 +1810,10 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 .map(|b| String::from_utf8(b.to_vec()).unwrap().parse().unwrap_or(0))
                 .unwrap_or(0);
             
-            let mut total_balance_change: i128 = reward as i128;
+            let total_balance_change: i128 = reward as i128;
             let mut history_updates = Vec::new();
-            for tx in &txs_to_apply {
-                if tx.from == my_address {
-                    total_balance_change -= tx.amount_atoms as i128;
-                    history_updates.push(json!({
-                        "type": "Transfer (Out)",
-                        "amount_atoms": -(tx.amount_atoms as i64),
-                        "address": tx.to,
-                        "timestamp": tx.timestamp,
-                        "status": "Confirmed",
-                        "height": ledger.height
-                    }));
-                } else if tx.to == my_address {
-                    total_balance_change += tx.amount_atoms as i128;
-                    history_updates.push(json!({
-                        "type": "Transfer (In)",
-                        "amount_atoms": tx.amount_atoms as i64,
-                        "address": tx.from,
-                        "timestamp": tx.timestamp,
-                        "status": "Confirmed",
-                        "height": ledger.height
-                    }));
-                }
-            }
+            // Wallet history tracking uses trial-decrypt instead of WalletTransaction.from/to
+            // (shielded protocol does not reveal sender/recipient on-chain)
             history_updates.push(json!({
                 "type": "Coinbase Reward",
                 "amount_atoms": reward as i64,
@@ -1944,19 +1898,10 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
 
     let send_amount_atoms = (amount_aet * ATOMS_PER_AET as f64) as u64;
     
-    // Check pending mempool transactions to avoid over-spending
-    let mut pending_out = 0;
-    {
-        let mempool = MEMPOOL.lock().unwrap();
-        for tx in mempool.iter() {
-            if tx.from == state.address {
-                pending_out += tx.amount_atoms;
-            }
-        }
-    }
-
-    if current_balance_atoms < (send_amount_atoms + pending_out) { 
-        let err_msg = format!("ERROR: Insufficient balance (including pending). Required: {}, Available: {}", send_amount_atoms + pending_out, current_balance_atoms);
+    // Pending balance check removed in Phase 0.4 — WalletTransaction no longer exists.
+    // Shielded protocol does not expose sender/recipient; balance check requires trial-decrypt scan.
+    if current_balance_atoms < send_amount_atoms { 
+        let err_msg = format!("ERROR: Insufficient balance. Required: {}, Available: {}", send_amount_atoms, current_balance_atoms);
         println!("[FFI] {}", err_msg);
         set_error(&err_msg);
         return false; 
@@ -2000,8 +1945,8 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         let nonce = Nonce::from_slice(&m_enc[..12]);
         let ciphertext = &m_enc[12..];
         if let Ok(decrypted) = state.cipher.decrypt(nonce, ciphertext) {
-            let hs = blake3::hash(&[decrypted.as_slice(), b"viewing_key"].concat());
-            viewing_key.copy_from_slice(hs.as_bytes());
+            let vk = blake3::hash(&[decrypted.as_slice(), b"aetheris-viewing-key"].concat());
+            viewing_key.copy_from_slice(vk.as_bytes());
         } else {
             set_error("ERROR: Failed to decrypt mnemonic for transaction signing.");
             return false;
@@ -2027,12 +1972,12 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         input_commitments.push(utxo.commitment);
     }
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::OsRng;
     let mut out_blinding = [0u8; 32];
-    rng.fill(&mut out_blinding);
+    rng.fill_bytes(&mut out_blinding);
     let change_amount = input_sum - send_amount_atoms;
     let mut change_blinding = [0u8; 32];
-    rng.fill(&mut change_blinding);
+    rng.fill_bytes(&mut change_blinding);
 
     let mut out_amounts = vec![send_amount_atoms];
     let mut out_blindings = vec![out_blinding];
@@ -2078,8 +2023,8 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
     // Encrypt note for recipient (trial decryption support)
     // TODO(PHASE-3): Derive target_viewing_key from recipient's public key instead of address
     let mut target_viewing_key = [0u8; 32];
-    let hs = blake3::hash(&[target_address.as_bytes(), b"viewing_key"].concat());
-    target_viewing_key.copy_from_slice(hs.as_bytes());
+    let vk = blake3::hash(&[target_address.as_bytes(), b"aetheris-viewing-key"].concat());
+    target_viewing_key.copy_from_slice(vk.as_bytes());
 
     let (ephemeral_pk, ciphertext) = aetheris_zkp::ZKProofSystem::encrypt_output(
         &target_viewing_key,
@@ -2098,63 +2043,45 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         ([0u8; 32], vec![])
     };
 
-    let tx = WalletTransaction {
-        tx_type: "Transfer".to_string(),
-        from: state.address.clone(), // Keep track of sender for local wallet history
-        to: one_time_address.clone(),
-        amount_atoms: send_amount_atoms,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    let core_tx = aetheris_core::Transaction {
+        inputs: nullifiers.clone(),
+        outputs: output_commitments.iter().enumerate().map(|(i, comm)| {
+            if i == 0 {
+                aetheris_core::ShieldedOutput {
+                    commitment: *comm,
+                    ephemeral_key: ephemeral_pk,
+                    ciphertext: ciphertext.clone(),
+                }
+            } else {
+                aetheris_core::ShieldedOutput {
+                    commitment: *comm,
+                    ephemeral_key: change_epk,
+                    ciphertext: change_ciphertext.clone(),
+                }
+            }
+        }).collect(),
+        public_amount: 0,
         proof: proof.clone(),
-        confirmed_height: None,
     };
 
-    let tx_payload = bincode::serialize(&tx).unwrap();
+    let tx_payload = bincode::serialize(&core_tx).unwrap();
     
     match LoopixMixer::wrap(tx_payload, path) {
         Ok(mix_msg) => {
             println!("[MIXNET] Transaction onion-wrapped. Delaying for {}ms...", mix_msg.delay);
             
-            // Simulation: In production, this goes to the network. 
-            let tx_clone = tx.clone();
-            let proof_clone = proof.clone();
-            let nullifiers_clone = nullifiers;
-            let output_commitments_clone = output_commitments.clone();
-            let ciphertext_clone = ciphertext;
-            let change_epk_clone = change_epk;
-            let change_ciphertext_clone = change_ciphertext;
-            let epk_clone = ephemeral_pk;
+            let broadcast_tx = core_tx.clone();
 
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_millis(mix_msg.delay));
                 
                 // Real Broadcast via P2P
-                let core_tx = aetheris_core::Transaction {
-                    inputs: nullifiers_clone, 
-                    outputs: output_commitments_clone.into_iter().enumerate().map(|(i, comm)| {
-                        if i == 0 {
-                            aetheris_core::ShieldedOutput {
-                                commitment: comm,
-                                ephemeral_key: epk_clone,
-                                ciphertext: ciphertext_clone.clone(),
-                            }
-                        } else {
-                            aetheris_core::ShieldedOutput {
-                                commitment: comm,
-                                ephemeral_key: change_epk_clone,
-                                ciphertext: change_ciphertext_clone.clone(),
-                            }
-                        }
-                    }).collect(),
-                    public_amount: 0,
-                    proof: proof_clone, 
-                };
-
                 if let Some(sender) = P2P_COMMAND_SENDER.lock().unwrap().as_ref() {
-                    let _ = sender.send(NetworkCommand::BroadcastTransaction(core_tx));
+                    let _ = sender.send(NetworkCommand::BroadcastTransaction(broadcast_tx));
                 }
 
                 let mut mempool = MEMPOOL.lock().unwrap();
-                mempool.push(tx_clone);
+                mempool.push(core_tx);
                 println!("[MEMPOOL] Transaction received via Mixnet and broadcasted to P2P.");
             });
         },

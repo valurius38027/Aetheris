@@ -56,16 +56,12 @@ impl MathematicalArbitrator {
     }
 
     /// The core of Aetheris's Mathematical Arbitration:
-    /// In case of concurrent block proposals, we rank them by the Blake3 hash of their VDF result
-    /// combined with the previous block hash to prevent grinding attacks.
-    /// The proposal with the smallest hash is the objectively correct winner.
+    /// Ranks proposals by the full serialized block hash (blake3 of serialized Block).
+    /// This binds entropy to the entire block content (transactions, state_root, VDF result, timestamp),
+    /// preventing grinding attacks on a subset of fields.
     pub fn get_winner(&self, height: u64) -> Option<BlockProposal> {
         self.proposals.get(&height)?.iter().min_by_key(|p| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&self.prev_block_hash); // Mix in previous block entropy
-            hasher.update(&p.vdf_result);
-            let h: [u8; 32] = hasher.finalize().into();
-            h
+            p.block_hash
         }).cloned()
     }
 
