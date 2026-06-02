@@ -108,14 +108,14 @@ pub struct ValueConfig {
 
 /// A circuit for verifying value conservation and range proofs.
 /// sum(inputs) == sum(outputs) AND all amounts are in [0, 2^64)
+/// C-1: Exposes each output commitment as a public instance so the verifier
+/// can check that on-chain commitments match the circuit's internal values.
 #[derive(Default)]
 pub struct ValueConservationCircuit {
     input_amounts: Vec<u64>,
     output_amounts: Vec<u64>,
     input_blindings: Vec<[u8; 32]>,
     output_blindings: Vec<[u8; 32]>,
-    public_amount: i64,
-    commitment_hash: Fr,
 }
 
 impl ValueConservationCircuit {
@@ -125,8 +125,6 @@ impl ValueConservationCircuit {
             output_amounts: vec![0; MAX_OUTPUTS],
             input_blindings: vec![[0u8; 32]; MAX_INPUTS],
             output_blindings: vec![[0u8; 32]; MAX_OUTPUTS],
-            public_amount: 0,
-            commitment_hash: Fr::zero(),
         }
     }
 }
@@ -213,12 +211,13 @@ impl Circuit<Fr> for ValueConservationCircuit {
         let total_amounts = MAX_INPUTS + MAX_OUTPUTS;
         let two_inv = Fr::from(2).invert().unwrap();
 
-        let (last_sum_cell, range_final_cells): (_, Vec<_>) = layouter.assign_region(
+        let (last_sum_cell, out_comm_cells, range_final_cells): (_, Vec<_>, Vec<_>) = layouter.assign_region(
             || "value conservation + range proofs",
             |mut region| {
                 let mut row: usize = 0;
                 let mut running_sum = Fr::zero();
                 let mut last_sum = None;
+                let mut out_comm_cells = Vec::with_capacity(MAX_OUTPUTS);
                 let mut final_cells = Vec::with_capacity(total_amounts);
 
                 for i in 0..MAX_INPUTS {
@@ -296,7 +295,8 @@ impl Circuit<Fr> for ValueConservationCircuit {
 
                     let amt_cell = region.assign_advice(|| "output amount", config.advice[0], row, || Value::known(amt_fr))?;
                     region.assign_advice(|| "output blinding", config.advice[1], row, || Value::known(blind_fr))?;
-                    region.assign_advice(|| "output commitment", config.advice[2], row, || Value::known(amt_fr + blind_fr))?;
+                    let comm_cell = region.assign_advice(|| "output commitment", config.advice[2], row, || Value::known(amt_fr + blind_fr))?;
+                    out_comm_cells.push(comm_cell);
                     last_sum = Some(region.assign_advice(|| "running sum", config.advice[3], row, || Value::known(running_sum))?);
                     region.assign_advice(|| "indicator", config.advice[4], row, || Value::known(-Fr::one()))?;
                     let z0_cell = region.assign_advice(|| "range_z start", config.range_z, row, || Value::known(amt_fr))?;
@@ -324,7 +324,7 @@ impl Circuit<Fr> for ValueConservationCircuit {
                     row += 1;
                 }
 
-                Ok((last_sum, final_cells))
+                Ok((last_sum, out_comm_cells, final_cells))
             },
         )?;
 
@@ -332,18 +332,16 @@ impl Circuit<Fr> for ValueConservationCircuit {
             layouter.constrain_instance(cell.cell(), config.instance, 0)?;
         }
 
-        let comm_cell = layouter.assign_region(|| "commitment hash", |mut region| {
-            region.assign_advice(
-                || "comm_hash",
-                config.advice[0],
-                0,
-                || Value::known(self.commitment_hash),
-            )
-        })?;
-        layouter.constrain_instance(comm_cell.cell(), config.instance, 1)?;
+        // C-1: Expose each output commitment as a public instance so the verifier
+        // can check that on-chain tx.outputs[i].commitment matches the circuit value.
+        // Instances: [1..1+MAX_OUTPUTS) = output commitments in Fr form
+        for (i, cell) in out_comm_cells.into_iter().enumerate() {
+            layouter.constrain_instance(cell.cell(), config.instance, 1 + i)?;
+        }
 
+        // Range check final values: instances [1+MAX_OUTPUTS..1+MAX_OUTPUTS+total_amounts)
         for (i, cell) in range_final_cells.into_iter().enumerate() {
-            layouter.constrain_instance(cell.cell(), config.instance, 2 + i)?;
+            layouter.constrain_instance(cell.cell(), config.instance, 1 + MAX_OUTPUTS + i)?;
         }
 
         Ok(())
@@ -374,18 +372,6 @@ pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 
 pub struct ZKProofSystem;
 
-/// Hash output commitments into a Fr public instance to bind them to the proof.
-fn hash_commitments(commitments: &[[u8; 32]]) -> Fr {
-    let mut hasher = blake3::Hasher::new();
-    for comm in commitments.iter() {
-        hasher.update(comm);
-    }
-    let h = hasher.finalize();
-    let mut bytes = *h.as_bytes();
-    bytes[31] &= 0x2F;
-    Fr::from_bytes(&bytes).expect("masked blake3 output always a valid Fr")
-}
-
 impl ZKProofSystem {
     /// Set up KZG parameters (Common Reference String)
     /// In production, this would be generated via a MPC ceremony.
@@ -395,7 +381,9 @@ impl ZKProofSystem {
     }
 
     /// Generates a production-grade KZG proof using globally cached CRS & keys.
-    /// Binds output commitments as public instance via `commitment_hash`.
+    /// C-1: Output commitments are exposed as individual public instances so the
+    /// verifier can check that on-chain tx.outputs[i].commitment matches the
+    /// circuit-internal amount + blinding constraint.
     pub fn prove_conservation(
         in_amounts: &[u64], 
         out_amounts: &[u64],
@@ -404,15 +392,34 @@ impl ZKProofSystem {
         commitments: &[[u8; 32]],
     public_amount: i64,
     ) -> Vec<u8> {
-        let comm_hash_fr = hash_commitments(&commitments);
+        // Pad inputs/outputs to MAX_INPUTS/MAX_OUTPUTS so dummy slots
+        // match the circuit's padding behavior (unwrap_or(0) / default [0u8;32]).
+        let padded_ins = {
+            let mut v = in_amounts.to_vec();
+            v.resize(MAX_INPUTS, 0u64);
+            v
+        };
+        let padded_outs = {
+            let mut v = out_amounts.to_vec();
+            v.resize(MAX_OUTPUTS, 0u64);
+            v
+        };
+        let padded_in_blind = {
+            let mut v = in_blindings.to_vec();
+            v.resize(MAX_INPUTS, [0u8; 32]);
+            v
+        };
+        let padded_out_blind = {
+            let mut v = out_blindings.to_vec();
+            v.resize(MAX_OUTPUTS, [0u8; 32]);
+            v
+        };
 
         let circuit = ValueConservationCircuit {
-            input_amounts: in_amounts.to_vec(),
-            output_amounts: out_amounts.to_vec(),
-            input_blindings: in_blindings.to_vec(),
-            output_blindings: out_blindings.to_vec(),
-            public_amount,
-            commitment_hash: comm_hash_fr,
+            input_amounts: padded_ins,
+            output_amounts: padded_outs,
+            input_blindings: padded_in_blind,
+            output_blindings: padded_out_blind,
         };
 
         let params = ensure_params();
@@ -424,8 +431,17 @@ impl ZKProofSystem {
             -Fr::from(public_amount.unsigned_abs())
         };
 
-        let mut instance_values = vec![-pub_amt_fr, comm_hash_fr];
-        instance_values.resize(2 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
+        // Instances: [0] = running_sum, [1..1+MO] = output commitments, [1+MO..] = range z_final (0s)
+        let mut instance_values = vec![-pub_amt_fr];
+        // Pad commitments to MAX_OUTPUTS to match circuit's dummy outputs
+        let mut all_commitments = commitments.to_vec();
+        while all_commitments.len() < MAX_OUTPUTS {
+            all_commitments.push(create_commitment(0, &[0u8; 32]));
+        }
+        for c in all_commitments.iter() {
+            instance_values.push(Fr::from_bytes(c).unwrap_or(Fr::zero()));
+        }
+        instance_values.resize(1 + MAX_OUTPUTS + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
         let instances = vec![instance_values];
 
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
@@ -448,13 +464,12 @@ impl ZKProofSystem {
     }
 
     /// Verifies a production-grade KZG proof using globally cached CRS & keys.
-    /// The proof is bound to the output commitments via `commitments` public instance.
+    /// C-1: Each output commitment is checked as an individual public instance,
+    /// binding the proof to the transaction's on-chain output commitments.
     pub fn verify_conservation(proof_bytes: &[u8], commitments: &[[u8; 32]], public_amount: i64) -> bool {
         if !proof_bytes.starts_with(b"halo2_kzg_v1_") {
             return false;
         }
-
-        let comm_hash_fr = hash_commitments(&commitments);
 
         let params = ensure_params();
         let (vk, _) = ensure_keys();
@@ -465,8 +480,16 @@ impl ZKProofSystem {
             -Fr::from(public_amount.unsigned_abs())
         };
 
-        let mut instance_values = vec![-pub_amt_fr, comm_hash_fr];
-        instance_values.resize(2 + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
+        let mut instance_values = vec![-pub_amt_fr];
+        // Pad commitments to MAX_OUTPUTS to match circuit's dummy outputs
+        let mut all_commitments = commitments.to_vec();
+        while all_commitments.len() < MAX_OUTPUTS {
+            all_commitments.push(create_commitment(0, &[0u8; 32]));
+        }
+        for c in all_commitments.iter() {
+            instance_values.push(Fr::from_bytes(c).unwrap_or(Fr::zero()));
+        }
+        instance_values.resize(1 + MAX_OUTPUTS + MAX_INPUTS + MAX_OUTPUTS, Fr::zero());
         let instances = vec![instance_values];
 
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&proof_bytes[b"halo2_kzg_v1_".len()..]);
@@ -698,14 +721,17 @@ mod tests {
     use super::*;
     use rand::RngCore;
 
-    fn make_proof(in_amounts: &[u64], out_amounts: &[u64], public_amount: i64) -> Vec<u8> {
+    fn make_proof(in_amounts: &[u64], out_amounts: &[u64], public_amount: i64) -> (Vec<u8>, Vec<[u8; 32]>) {
         let in_blindings: Vec<[u8; 32]> = (0..in_amounts.len())
             .map(|i| [i as u8; 32]).collect();
         let out_blindings: Vec<[u8; 32]> = (0..out_amounts.len())
             .map(|i| [(in_amounts.len() + i) as u8; 32]).collect();
-        ZKProofSystem::prove_conservation(
-            in_amounts, out_amounts, &in_blindings, &out_blindings, &[], public_amount,
-        )
+        let commitments: Vec<[u8; 32]> = out_amounts.iter().zip(out_blindings.iter())
+            .map(|(a, b)| create_commitment(*a, b)).collect();
+        let proof = ZKProofSystem::prove_conservation(
+            in_amounts, out_amounts, &in_blindings, &out_blindings, &commitments, public_amount,
+        );
+        (proof, commitments)
     }
 
     fn random_key() -> [u8; 32] {
@@ -717,29 +743,29 @@ mod tests {
 
     #[test]
     fn test_kzg_prove_verify_roundtrip() {
-        let proof = make_proof(&[100, 50], &[150], 0);
-        assert!(ZKProofSystem::verify_conservation(&proof, &[], 0));
+        let (proof, commitments) = make_proof(&[100, 50], &[150], 0);
+        assert!(ZKProofSystem::verify_conservation(&proof, &commitments, 0));
         println!("[TEST 1] KZG prove + verify round-trip: OK");
     }
 
     #[test]
     fn test_invalid_proof_rejection() {
-        let proof = make_proof(&[100], &[100], 0);
-        assert!(!ZKProofSystem::verify_conservation(&proof, &[], 1));
+        let (proof, commitments) = make_proof(&[100], &[100], 0);
+        assert!(!ZKProofSystem::verify_conservation(&proof, &commitments, 1));
         println!("[TEST 2] Invalid proof rejection: OK");
     }
 
     #[test]
     fn test_empty_value() {
-        let proof = make_proof(&[], &[], 0);
-        assert!(ZKProofSystem::verify_conservation(&proof, &[], 0));
+        let (proof, commitments) = make_proof(&[], &[], 0);
+        assert!(ZKProofSystem::verify_conservation(&proof, &commitments, 0));
         println!("[TEST 3] Empty value proof: OK");
     }
 
     #[test]
     fn test_large_value() {
-        let proof = make_proof(&[u64::MAX, 1], &[u64::MAX], -1);
-        assert!(ZKProofSystem::verify_conservation(&proof, &[], -1));
+        let (proof, commitments) = make_proof(&[u64::MAX, 1], &[u64::MAX], -1);
+        assert!(ZKProofSystem::verify_conservation(&proof, &commitments, -1));
         println!("[TEST 4] Large value (u64::MAX) proof: OK");
     }
 
@@ -787,8 +813,8 @@ mod tests {
         hasher.update("🚀🌕💰你好 αβγ".as_bytes());
         let hash = hasher.finalize();
         let amount = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
-        let proof = make_proof(&[amount], &[amount], 0);
-        assert!(ZKProofSystem::verify_conservation(&proof, &[], 0));
+        let (proof, commitments) = make_proof(&[amount], &[amount], 0);
+        assert!(ZKProofSystem::verify_conservation(&proof, &commitments, 0));
 
         let vk = random_key();
         let epk = random_key();
@@ -823,9 +849,9 @@ mod tests {
             (&[5, 5, 5], &[10, 5], 0),
         ];
         for (i, (ins, outs, pub_amt)) in cases.iter().enumerate() {
-            let proof = make_proof(ins, outs, *pub_amt);
+            let (proof, commitments) = make_proof(ins, outs, *pub_amt);
             assert!(
-                ZKProofSystem::verify_conservation(&proof, &[], *pub_amt),
+                ZKProofSystem::verify_conservation(&proof, &commitments, *pub_amt),
                 "proof {} should verify", i
             );
             println!("[TEST 10] Proof {} verified", i);

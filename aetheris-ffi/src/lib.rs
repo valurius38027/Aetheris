@@ -276,7 +276,7 @@ fn create_genesis_block() -> aetheris_core::Block {
         &[transfer_amount, change_amount],
         &[mint_blinding],
         &[dev_blinding, change_blinding],
-        &[mint_commitment, dev_commitment, change_commitment],
+        &[dev_commitment, change_commitment],  // C-1: output commitments only
         0,
     );
 
@@ -2047,11 +2047,8 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         output_commitments.push(aetheris_zkp::create_commitment(change_amount, &change_blinding));
     }
 
-    // Combined commitments for proof: inputs then outputs
-    let mut all_commitments = input_commitments.clone();
-    all_commitments.extend_from_slice(&output_commitments);
-
-    let proof = ZKProofSystem::prove_conservation(&in_amounts, &out_amounts, &in_blindings, &out_blindings, &all_commitments, 0);
+    // C-1: Only output commitments are bound as public instances
+    let proof = ZKProofSystem::prove_conservation(&in_amounts, &out_amounts, &in_blindings, &out_blindings, &output_commitments, 0);
     println!("[FFI] ZK_PROOF_GENERATED: size={} bytes, inputs={}, outputs={}", 
              proof.len(), in_amounts.len(), out_amounts.len());
 

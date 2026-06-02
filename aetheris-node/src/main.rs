@@ -109,6 +109,8 @@ mod tests {
             height: 1,
             last_block_hash: [0u8; 32],
             last_aggregate_proof: b"aetheris_aggregate_v1_genesis".to_vec(),
+            current_difficulty: 1.0,
+            timestamps: Vec::new(),
         };
 
         let block = Block {
