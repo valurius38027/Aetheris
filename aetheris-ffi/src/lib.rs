@@ -156,17 +156,7 @@ struct WalletTransaction {
     confirmed_height: Option<u64>,
 }
 
-const ATOMS_PER_AET: u64 = 100_000_000;
-use aetheris_core::EXPECTED_GENESIS_HASH;
-
-fn calculate_block_reward_atoms(height: u64) -> u64 {
-    let initial_reward = 50 * ATOMS_PER_AET;
-    let halvings = height / 210_000;
-    if halvings >= 64 {
-        return 0;
-    }
-    initial_reward >> halvings
-}
+use aetheris_core::{EXPECTED_GENESIS_HASH, calculate_block_reward_atoms};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct GenesisAllocation {
@@ -1403,6 +1393,13 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
             &output.ciphertext
         ) {
             println!("[FFI] Found owned output! Amount: {} atoms", amount);
+
+            // H-3: Verify ciphertext-derived commitment matches on-chain commitment
+            if aetheris_zkp::create_commitment(amount, &blinding) != output.commitment {
+                println!("[FFI] Commitment mismatch — skipping forged output");
+                continue;
+            }
+
             // Found an output belonging to us!
             // Check if it's spent by calculating its nullifier
             // In this prototype, we use commitment as index for simplicity in nullifier derivation
