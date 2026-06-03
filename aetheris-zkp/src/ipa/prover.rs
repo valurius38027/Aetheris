@@ -1,6 +1,6 @@
 use std::io;
 
-use halo2_backend::poly::commitment::Prover as ProverTrait;
+use halo2_backend::poly::commitment::{Params, Prover as ProverTrait};
 use halo2_backend::poly::query::ProverQuery;
 use halo2_backend::transcript::{ChallengeScalar, EncodedChallenge, TranscriptWrite};
 use halo2_middleware::zal::traits::MsmAccel;
@@ -67,16 +67,13 @@ where
                 .filter(|q| q.point == point)
                 .collect();
 
-            let n = point_queries[0].poly.values.len();
-            for q in &point_queries {
-                assert_eq!(
-                    q.poly.values.len(),
-                    n,
-                    "all queries at the same point must have the same polynomial length"
-                );
-            }
+            // Use the full params domain size for IPA rounds, not the query
+            // polynomial length. The commitment uses all params.n() generators,
+            // so the IPA proof must be over the same generator set.
+            let n = self.params.n() as usize;
 
-            transcript.write_scalar(C::ScalarExt::from(n.trailing_zeros() as u64))?;
+            let k = self.params.k();
+            transcript.write_scalar(C::ScalarExt::from(k as u64))?;
 
             let theta: ChallengeScalar<C, ThetaChallenge> =
                 transcript.squeeze_challenge_scalar();
@@ -84,7 +81,7 @@ where
 
             let mut combined = vec![C::ScalarExt::ZERO; n];
             let mut pow = C::ScalarExt::ONE;
-            for q in &point_queries {
+            for q in point_queries.iter() {
                 for (c, pv) in combined.iter_mut().zip(q.poly.values.iter()) {
                     *c += pow * *pv;
                 }

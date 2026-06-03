@@ -4,9 +4,11 @@ use std::marker::PhantomData;
 
 use halo2_proofs::halo2curves::CurveAffine;
 use halo2_proofs::halo2curves::group::Group;
+use halo2_proofs::halo2curves::group::GroupEncoding;
 use halo2_proofs::arithmetic::CurveExt;
-use halo2_backend::poly::{Coeff, Guard, LagrangeCoeff, Polynomial};
+use halo2_backend::poly::{Coeff, Guard, LagrangeCoeff, EvaluationDomain, Polynomial};
 use halo2_backend::poly::commitment::{Blind, CommitmentScheme, MSM as MSMTrait, Params, ParamsProver, ParamsVerifier};
+use halo2_middleware::ff::WithSmallOrderMulGroup;
 use halo2_middleware::zal::traits::MsmAccel;
 use rand_core::RngCore;
 use rand_chacha::ChaCha20Rng;
@@ -99,6 +101,7 @@ where
 impl<C: CurveAffine> Params<C> for ParamsIPA<C>
 where
     C::CurveExt: CurveExt,
+    C::ScalarExt: WithSmallOrderMulGroup<3>,
 {
     fn k(&self) -> u32 {
         self.k
@@ -126,12 +129,17 @@ where
         // at a higher level (random polynomial commitments) rather than per-commitment
         // blinding factors. The h generator is reserved for future use if blinding
         // is needed at this layer.
-        let mut scalars = Vec::with_capacity(poly.len());
-        scalars.extend(poly.iter());
-        let bases = &self.g;
+        // Convert Lagrange (evaluation) form to coefficient form, then commit
+        // using coefficient-basis generators. IPA generators are not structured
+        // (no s-powers), so the polynomial must be in coefficient form for the
+        // inner-product argument to produce a correct opening proof.
+        let domain = EvaluationDomain::new(1, self.k());
+        let coeff = domain.lagrange_to_coeff(poly.clone());
+        let scalars = coeff.values;
         let size = scalars.len();
-        assert!(bases.len() >= size, "commit_lagrange: bases len {} < poly len {}", bases.len(), size);
-        engine.msm(&scalars, &bases[..size])
+        assert!(self.g.len() >= size, "commit_lagrange: bases len {} < poly len {}", self.g.len(), size);
+        let result = engine.msm(&scalars, &self.g[..size]);
+        result
     }
 
     fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -272,7 +280,8 @@ impl<C: CurveAffine> MSMTrait<C> for MSMIPA<C> {
     }
 
     fn check(&self, engine: &impl MsmAccel<C>) -> bool {
-        bool::from(self.eval(engine).is_identity())
+        let result = self.eval(engine);
+        bool::from(result.is_identity())
     }
 
     fn eval(&self, engine: &impl MsmAccel<C>) -> C::CurveExt {
@@ -461,9 +470,12 @@ mod tests {
         // polynomial commitments, not per-commitment blindings.
         let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
         let engine = halo2_middleware::zal::impls::H2cEngine;
-        let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(
-            vec![Fq::from(5u64), Fq::from(7u64), Fq::from(9u64)]
-        );
+        let n = params.n() as usize;
+        let mut values = vec![Fq::ZERO; n];
+        values[0] = Fq::from(5u64);
+        values[1] = Fq::from(7u64);
+        values[2] = Fq::from(9u64);
+        let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(values);
         let c1 = params.commit_lagrange(&engine, &poly, Blind(Fq::ONE));
         let c2 = params.commit_lagrange(&engine, &poly, Blind(Fq::from(999u64)));
         // Blinding is intentionally deferred — different blinds produce same commitment
@@ -474,9 +486,13 @@ mod tests {
     fn test_params_ipa_commit_lagrange_consistent() {
         let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
         let engine = halo2_middleware::zal::impls::H2cEngine;
+        let n = params.n() as usize;
 
         // Create two identical polynomials
-        let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(vec![Fq::from(1u64), Fq::from(2u64)]);
+        let mut values = vec![Fq::ZERO; n];
+        values[0] = Fq::from(1u64);
+        values[1] = Fq::from(2u64);
+        let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(values);
         let poly2 = poly.clone();
 
         let c1 = params.commit_lagrange(&engine, &poly, Blind(Fq::ONE));

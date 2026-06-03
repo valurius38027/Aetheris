@@ -76,7 +76,6 @@ where
                 return Err(Error::OpeningError);
             }
             let n = 1 << k;
-
             let theta: ChallengeScalar<C, ThetaChallenge> =
                 transcript.squeeze_challenge_scalar();
             let theta_val = *theta;
@@ -85,7 +84,7 @@ where
             let mut combined_msm = MSMIPA::new();
             let mut combined_eval = C::ScalarExt::ZERO;
             let mut pow = C::ScalarExt::ONE;
-            for q in &point_queries {
+            for q in point_queries.iter() {
                 match q.commitment {
                     CommitmentReference::Commitment(c) => {
                         combined_msm.append_term(pow, (*c).to_curve());
