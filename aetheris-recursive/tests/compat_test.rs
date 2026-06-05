@@ -10,6 +10,10 @@ mod tests {
 
     #[test]
     fn test_field_compatibility() {
+        // Phase 1.4 clarification: in halo2curves/pasta,
+        //   * `EpAffine` = Pallas affine (base Fp, scalar Fq)
+        //   * `EqAffine` = Vesta affine (base Fq, scalar Fp)
+        // The alias `EqAffine as VestaAffine` is correct (Eq = E(Q) = curve over Fq = Vesta).
         use halo2curves::pasta::EqAffine as VestaAffine;
         // Pallas Scalar Field == Vesta Base Field
         // We verify that a random Vesta Base Field element can be interpreted as a Pallas Scalar.

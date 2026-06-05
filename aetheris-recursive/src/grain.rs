@@ -150,7 +150,11 @@ impl GrainLFSR {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2curves::bn256::Fr as Fp;
+    // Phase 1.4: the production `PoseidonChip` runs over the Vesta scalar field
+    // (`Fp` = Pallas base = Pasta 2-cycle). The Grain LFSR test must use the
+    // same field, otherwise the round constants derived here will not match
+    // the circuit's round constants.
+    use halo2curves::pasta::Fp;
 
     #[test]
     fn grain_generates_field_elements() {
