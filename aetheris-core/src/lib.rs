@@ -28,6 +28,30 @@ pub struct Transaction {
     pub proof: Vec<u8>,
 }
 
+impl Transaction {
+    /// Returns true if this is a coinbase-style transaction (mint or block reward):
+    /// no input nullifiers and a positive public_amount.
+    pub fn is_coinbase(&self) -> bool {
+        self.inputs.is_empty() && self.public_amount > 0
+    }
+
+    /// Returns the public_amount as the ZK circuit expects it.
+    ///
+    /// The `aetheris-zkp` conservation circuit enforces:
+    ///   net_value = total_in - total_out - public_amount = 0
+    ///
+    /// For a coinbase tx, `total_in = 0` and `total_out = public_amount`, so
+    /// to satisfy the constraint we must pass `public_amount = -self.public_amount`.
+    /// For a regular transfer, `public_amount` is unchanged.
+    pub fn circuit_public_amount(&self) -> i64 {
+        if self.is_coinbase() {
+            -(self.public_amount as i64)
+        } else {
+            self.public_amount as i64
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
@@ -266,5 +290,59 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+    }
+
+    fn mk_tx(inputs: Vec<[u8; 32]>, public_amount: u64) -> Transaction {
+        Transaction {
+            inputs,
+            outputs: vec![],
+            public_amount,
+            proof: vec![],
+        }
+    }
+
+    #[test]
+    fn test_is_coinbase_mint() {
+        assert!(mk_tx(vec![], 1000).is_coinbase());
+    }
+
+    #[test]
+    fn test_is_coinbase_block_reward() {
+        assert!(mk_tx(vec![], 50 * 100_000_000).is_coinbase());
+    }
+
+    #[test]
+    fn test_is_not_coinbase_transfer() {
+        assert!(!mk_tx(vec![[0u8; 32]], 0).is_coinbase());
+    }
+
+    #[test]
+    fn test_is_not_coinbase_topup_with_inputs() {
+        assert!(!mk_tx(vec![[0u8; 32]], 1000).is_coinbase());
+    }
+
+    #[test]
+    fn test_circuit_public_amount_negates_coinbase() {
+        assert_eq!(mk_tx(vec![], 1000).circuit_public_amount(), -1000);
+    }
+
+    #[test]
+    fn test_circuit_public_amount_preserves_transfer() {
+        assert_eq!(mk_tx(vec![[0u8; 32]], 0).circuit_public_amount(), 0);
+    }
+
+    #[test]
+    fn test_circuit_public_amount_preserves_topup() {
+        assert_eq!(mk_tx(vec![[0u8; 32]], 1000).circuit_public_amount(), 1000);
+    }
+
+    /// Edge case: empty inputs + public_amount = 0 is a true no-op.
+    /// is_coinbase() must be false (no value is being created), so circuit_public_amount()
+    /// returns 0. The ZK circuit net_value = 0 - 0 - 0 = 0 trivially holds.
+    #[test]
+    fn test_noop_tx_is_not_coinbase() {
+        let tx = mk_tx(vec![], 0);
+        assert!(!tx.is_coinbase());
+        assert_eq!(tx.circuit_public_amount(), 0);
     }
 }

@@ -228,11 +228,11 @@ fn create_genesis_block() -> aetheris_core::Block {
     
     let mint_proof = ZKProofSystem::prove_conservation(
         &[], // No inputs
-        &[mint_amount], 
-        &[], 
-        &[mint_blinding], 
+        &[mint_amount],
+        &[],
+        &[mint_blinding],
         &[mint_commitment],
-        mint_amount as i64,
+        -(mint_amount as i64),
     );
 
     let (epk_mint, ciphertext_mint) = aetheris_zkp::ZKProofSystem::encrypt_output(
@@ -303,7 +303,8 @@ fn create_genesis_block() -> aetheris_core::Block {
     };
 
     let txs = vec![mint_tx, transfer_tx];
-    
+    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
+
     aetheris_core::Block {
         header: aetheris_core::BlockHeader {
             parent_hash: [0u8; 32],
@@ -315,7 +316,7 @@ fn create_genesis_block() -> aetheris_core::Block {
                 &[0u8; 32],
                 &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
                 &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                &txs.iter().map(|t| t.public_amount as i64).collect::<Vec<_>>(),
+                &tx_public_amounts,
                 0,
                 &[0u8; 32]
             ).unwrap_or_else(|e| {
@@ -1587,7 +1588,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
         &[],
         &[reward_blinding],
         &[reward_commitment],
-        reward_atoms as i64,
+        -(reward_atoms as i64),
     );
 
     let reward_tx = aetheris_core::Transaction {
@@ -1602,6 +1603,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
     };
 
     let txs = vec![reward_tx];
+    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
 
     let block = aetheris_core::Block {
         header: aetheris_core::BlockHeader {
@@ -1611,10 +1613,10 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             vdf_result: result_bytes.clone(),
             vdf_proof: proof_bytes,
             aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(
-                &ledger.last_aggregate_proof, 
+                &ledger.last_aggregate_proof,
                 &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
                 &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                &txs.iter().map(|t| t.public_amount as i64).collect::<Vec<_>>(),
+                &tx_public_amounts,
                 ledger.height,
                 &[0u8; 32]
             ).unwrap_or_else(|_| b"aetheris_aggregate_v1_error".to_vec()),
@@ -1707,7 +1709,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 let mut mempool = MEMPOOL.lock().unwrap();
                 for tx in mempool.drain(..) {
                     tx_proofs.push(tx.proof.clone());
-                    tx_public_amounts.push(tx.public_amount as i64);
+                    tx_public_amounts.push(tx.circuit_public_amount());
                     tx_commitments.push(tx.outputs.iter().map(|o| o.commitment).collect());
                     core_txs.push(tx);
                 }

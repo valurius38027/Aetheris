@@ -322,13 +322,14 @@ impl LedgerState {
         }
 
         // Verify Aggregate ZK Proof (skip coinbase tx — validated by consensus, not ZK)
-        let non_coinbase_txs: Vec<&aetheris_core::Transaction> = block.transactions.iter()
-            .filter(|tx| !(tx.inputs.is_empty() && tx.public_amount > 0))
-            .collect();
-        let tx_proofs: Vec<Vec<u8>> = non_coinbase_txs.iter().map(|tx| tx.proof.clone()).collect();
-        let tx_commitments: Vec<Vec<[u8; 32]>> = non_coinbase_txs.iter()
+        // All txs (including coinbase) are aggregated into a single ZK proof at the prover
+        // side (aetheris-ffi/src/lib.rs aggregate_proofs). The merkle root is computed over
+        // every proof, so the verifier MUST see the same set. Coinbase issuance is enforced
+        // separately by `validate_issuance_rules` below.
+        let tx_proofs: Vec<Vec<u8>> = block.transactions.iter().map(|tx| tx.proof.clone()).collect();
+        let tx_commitments: Vec<Vec<[u8; 32]>> = block.transactions.iter()
             .map(|tx| tx.outputs.iter().map(|o| o.commitment).collect()).collect();
-        let public_amounts: Vec<i64> = non_coinbase_txs.iter().map(|tx| tx.public_amount as i64).collect();
+        let public_amounts: Vec<i64> = block.transactions.iter().map(|tx| tx.circuit_public_amount()).collect();
         if !tx_proofs.is_empty() && !aetheris_zkp::ZKProofSystem::verify_aggregate(
             &block.header.aggregate_proof,
             &self.last_aggregate_proof,

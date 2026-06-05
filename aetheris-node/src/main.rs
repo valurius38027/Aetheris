@@ -25,7 +25,7 @@ impl Mempool {
     fn add_tx(&mut self, tx: Transaction) -> Result<(), String> {
         // Fix: DoS Prevention - Verify ZK-Proof BEFORE adding to mempool
         let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
-        if !aetheris_zkp::ZKProofSystem::verify_conservation(&tx.proof, &commitments, tx.public_amount as i64) {
+        if !aetheris_zkp::ZKProofSystem::verify_conservation(&tx.proof, &commitments, tx.circuit_public_amount()) {
             return Err("Invalid ZK-Proof: Value conservation or range proof failed".into());
         }
 
@@ -563,7 +563,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Generate a real block proof (In production, this is the recursive link)
                     let tx_proofs: Vec<Vec<u8>> = txs.iter().map(|t| t.proof.clone()).collect();
                     let tx_commitments: Vec<Vec<[u8; 32]>> = txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect()).collect();
-                    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.public_amount as i64).collect();
+                    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
                     let state_root = ledger.lock().unwrap().get_state_root();
                     let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_commitments, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
                     last_block_proof = aggregate_proof.clone();

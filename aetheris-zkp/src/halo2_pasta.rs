@@ -609,6 +609,33 @@ mod tests {
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -20));
     }
 
+    /// Regression: (0 in, X out, public = -X) coinbase/mint shape used by FFI genesis/reward.
+    /// Before sign fix, this shape panic'd at synthesis (net_value = -2*X != 0).
+    #[test]
+    fn test_mint_shape_proof_verifies() {
+        let commitments = vec![[0u8; 32]; 1];
+        let proof = make_proof(&[], &[1000], &commitments, -1000);
+        assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -1000));
+    }
+
+    /// Multi-output mint: 2 outs, sum equals -public_amount.
+    #[test]
+    fn test_mint_shape_multi_out_proof_verifies() {
+        let commitments = vec![[0u8; 32]; 2];
+        let proof = make_proof(&[], &[500, 500], &commitments, -1000);
+        assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -1000));
+    }
+
+    /// Regression: prove with WRONG sign (+amount) for a mint must panic at synthesis
+    /// (net_value = -2*amount != 0). The FFI uses `-(amount as i64)`; this locks the
+    /// sign convention so a future refactor that flips it will be caught here.
+    #[test]
+    #[should_panic]
+    fn test_mint_shape_wrong_sign_panics_at_synthesis() {
+        let commitments = vec![[0u8; 32]; 1];
+        let _ = make_proof(&[], &[1000], &commitments, 1000);
+    }
+
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let vk = [0xABu8; 32];

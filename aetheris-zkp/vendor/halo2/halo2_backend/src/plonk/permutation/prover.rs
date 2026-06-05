@@ -1,0 +1,368 @@
+use group::{
+    ff::{BatchInvert, Field},
+    Curve,
+};
+use halo2_middleware::{ff::PrimeField, zal::impls::PlonkEngine};
+use halo2_middleware::{permutation::ArgumentMid, zal::traits::MsmAccel};
+use rand_core::RngCore;
+use std::iter::{self, ExactSizeIterator};
+
+use crate::{
+    arithmetic::{eval_polynomial, parallelize, CurveAffine},
+    plonk::{self, permutation::ProvingKey, ChallengeBeta, ChallengeGamma, ChallengeX, Error},
+    poly::{
+        commitment::{Blind, Params},
+        Coeff, LagrangeCoeff, Polynomial, ProverQuery,
+    },
+    transcript::{EncodedChallenge, TranscriptWrite},
+};
+use halo2_middleware::circuit::Any;
+use halo2_middleware::poly::Rotation;
+
+/// Single permutation product polynomial, which has been **committed**.
+///
+/// This struct contains two fields:
+/// - `permutation_product_poly`: A (coefficient-form) polynomial representing the permutation grand product.
+/// - `permutation_product_blind`: A scalar value used for blinding, in the commitment of the `permutation_product_poly`.
+///
+/// It stores a single `Z_P` in [permutation argument specification](https://zcash.github.io/halo2/design/proving-system/permutation.html#argument-specification).  
+pub(crate) struct CommittedSet<C: CurveAffine> {
+    pub(crate) permutation_product_poly: Polynomial<C::Scalar, Coeff>,
+    pub(crate) permutation_product_blind: Blind<C::Scalar>,
+}
+
+/// Set of permutation product polynomials, which have been **committed**.
+///
+/// This struct is to contain all of the permutation product polynomials([`CommittedSet`]), from a single circuit.
+///
+/// It stores multiple `Z_P` in [permutation argument specification](https://zcash.github.io/halo2/design/proving-system/permutation.html#spanning-a-large-number-of-columns).
+pub(crate) struct Committed<C: CurveAffine> {
+    pub(crate) sets: Vec<CommittedSet<C>>,
+}
+
+/// Set of permutation product polynomials, which have been **evaluated**.
+///
+/// This struct is, in essence, the same as [`Committed`].  
+///
+/// It indicates that the permutation product polynomials([`Committed`]) have been evaluated in the evaluation domain, and converted to [`Evaluated`](see [`Committed::evaluate`]).  
+///
+/// It also indicates that the permuted product polynomials([`Evaluated`]) can be **opened** (see [`Evaluated::open`]).  
+pub(crate) struct Evaluated<C: CurveAffine> {
+    constructed: Committed<C>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::plonk) fn permutation_commit<
+    C: CurveAffine,
+    P: Params<C>,
+    E: EncodedChallenge<C>,
+    R: RngCore,
+    T: TranscriptWrite<C, E>,
+    M: MsmAccel<C>,
+>(
+    engine: &PlonkEngine<C, M>,
+    arg: &ArgumentMid,
+    params: &P,
+    pk: &plonk::ProvingKey<C>,
+    pkey: &ProvingKey<C>,
+    advice: &[Polynomial<C::Scalar, LagrangeCoeff>],
+    fixed: &[Polynomial<C::Scalar, LagrangeCoeff>],
+    instance: &[Polynomial<C::Scalar, LagrangeCoeff>],
+    beta: ChallengeBeta<C>,
+    gamma: ChallengeGamma<C>,
+    mut rng: R,
+    transcript: &mut T,
+) -> Result<Committed<C>, Error> {
+    let domain = &pk.vk.domain;
+
+    // How many columns can be included in a single permutation polynomial?
+    // We need to multiply by z(X) and (1 - (l_last(X) + l_blind(X))). This
+    // will never underflow because of the requirement of at least a degree
+    // 3 circuit for the permutation argument.
+    assert!(pk.vk.cs_degree >= 3);
+    let chunk_len = pk.vk.cs_degree - 2;
+    let blinding_factors = pk.vk.cs.blinding_factors();
+    if crate::diagnostics::dbg_enabled() {
+        eprintln!("[PERM-META] cs_degree={} chunk_len={} arg.columns.len()={} pkey.permutations.len()={}", pk.vk.cs_degree, chunk_len, arg.columns.len(), pkey.permutations.len());
+        for (i, c) in arg.columns.iter().enumerate() {
+            eprintln!("[PERM-META] column[{}]: type={:?} index={}", i, c.column_type, c.index);
+        }
+    }
+
+    // Each column gets its own delta power.
+    let mut deltaomega = C::Scalar::ONE;
+
+    // Track the "last" value from the previous column set
+    let mut last_z = C::Scalar::ONE;
+
+    let mut sets = vec![];
+
+    for (columns, permutations) in arg
+        .columns
+        .chunks(chunk_len)
+        .zip(pkey.permutations.chunks(chunk_len))
+    {
+        // Goal is to compute the products of fractions
+        //
+        // (p_j(\omega^i) + \delta^j \omega^i \beta + \gamma) /
+        // (p_j(\omega^i) + \beta s_j(\omega^i) + \gamma)
+        //
+        // where p_j(X) is the jth column in this permutation,
+        // and i is the ith row of the column.
+
+        let mut modified_values = vec![C::Scalar::ONE; params.n() as usize];
+
+        // Iterate over each column of the permutation
+        for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
+            let values = match column.column_type {
+                Any::Advice => advice,
+                Any::Fixed => fixed,
+                Any::Instance => instance,
+            };
+            if crate::diagnostics::dbg_enabled() {
+                let perm_vals: Vec<C::Scalar> = (0..5).map(|i| permuted_column_values[i]).collect();
+                let perm_vals_130: Vec<C::Scalar> = (130..135.min(permuted_column_values.len())).map(|i| permuted_column_values[i]).collect();
+                let omega = domain.get_omega();
+                let omega_pow: Vec<C::Scalar> = (0..5).map(|i| omega.pow_vartime([i as u64, 0, 0, 0])).collect();
+                eprintln!("[PERM-SIGMA] col_type={:?} col_index={} perm[0..5]={:?}", column.column_type, column.index, perm_vals);
+                eprintln!("[PERM-SIGMA]   perm[130..135]={:?}", perm_vals_130);
+                eprintln!("[PERM-SIGMA]   omega^0..5={:?}", omega_pow);
+                // Per-row check: is perm[i] == omega^i (identity)?
+                let identity_check: Vec<bool> = (0..5).map(|i| permuted_column_values[i] == omega_pow[i]).collect();
+                eprintln!("[PERM-SIGMA]   perm[i]==omega^i for i=0..5: {:?}", identity_check);
+            }
+            parallelize(&mut modified_values, |modified_values, start| {
+                for ((modified_values, value), permuted_value) in modified_values
+                    .iter_mut()
+                    .zip(values[column.index][start..].iter())
+                    .zip(permuted_column_values[start..].iter())
+                {
+                    *modified_values *= *beta * permuted_value + *gamma + value;
+                }
+            });
+        }
+
+        // Invert to obtain the denominator for the permutation product polynomial
+        if crate::diagnostics::dbg_enabled() {
+            // Check the first 3 modified_values to see if multiset equality holds per-row
+            eprintln!("[PERM-MV] modified_values[0..3]={:?}", &modified_values[0..3]);
+            let product: C::Scalar = modified_values.iter().product();
+            eprintln!("[PERM-MV] product of all modified_values = {:?}", product);
+        }
+        modified_values.batch_invert();
+
+        // Iterate over each column again, this time finishing the computation
+        // of the entire fraction by computing the numerators
+        for &column in columns.iter() {
+            let omega = domain.get_omega();
+            let values = match column.column_type {
+                Any::Advice => advice,
+                Any::Fixed => fixed,
+                Any::Instance => instance,
+            };
+            parallelize(&mut modified_values, |modified_values, start| {
+                let mut deltaomega = deltaomega * omega.pow_vartime([start as u64, 0, 0, 0]);
+                for (modified_values, value) in modified_values
+                    .iter_mut()
+                    .zip(values[column.index][start..].iter())
+                {
+                    // Multiply by p_j(\omega^i) + \delta^j \omega^i \beta
+                    *modified_values *= deltaomega * *beta + *gamma + value;
+                    deltaomega *= &omega;
+                }
+            });
+            deltaomega *= &<C::Scalar as PrimeField>::DELTA;
+        }
+
+        // The modified_values vector is a vector of products of fractions
+        // of the form
+        //
+        // (p_j(\omega^i) + \delta^j \omega^i \beta + \gamma) /
+        // (p_j(\omega^i) + \beta s_j(\omega^i) + \gamma)
+        //
+        // where i is the index into modified_values, for the jth column in
+        // the permutation
+
+        // Compute the evaluations of the permutation product polynomial
+        // over our domain, starting with z[0] = 1
+        let mut z = vec![last_z];
+        for row in 1..(params.n() as usize) {
+            let mut tmp = z[row - 1];
+
+            tmp *= &modified_values[row - 1];
+            z.push(tmp);
+        }
+        let mut z = domain.lagrange_from_vec(z);
+        // Set blinding factors
+        if crate::diagnostics::dbg_enabled() {
+            let n = params.n() as usize;
+            let last_active = n - blinding_factors - 1;
+            eprintln!("[PERM-Z] set_idx={} z[0]={:?}", sets.len(), z[0]);
+            eprintln!("[PERM-Z] set_idx={} z[1]={:?}", sets.len(), z[1]);
+            eprintln!("[PERM-Z] set_idx={} z[last_active={}]={:?}", sets.len(), last_active, z[last_active]);
+            eprintln!("[PERM-Z] set_idx={} z[last_active] - 1 = {:?}", sets.len(), z[last_active] - C::Scalar::ONE);
+            let z_at_last = z[last_active];
+            eprintln!("[PERM-Z] set_idx={} z^2 - z at last_active = {:?}", sets.len(), z_at_last * z_at_last - z_at_last);
+
+            // Find which row makes z[1]/z[0] != 1
+            eprintln!("[PERM-Z] set_idx={} z[0..15]:", sets.len());
+            for i in 0..15.min(z.len()) {
+                eprintln!("[PERM-Z]   z[{}] = {:?}", i, z[i]);
+            }
+            // Also check rows 130-135 (near the active region end)
+            if z.len() > 135 {
+                eprintln!("[PERM-Z] set_idx={} z[128..140]:", sets.len());
+                for i in 128..140.min(z.len()) {
+                    eprintln!("[PERM-Z]   z[{}] = {:?}", i, z[i]);
+                }
+            }
+        }
+        for z in &mut z[params.n() as usize - blinding_factors..] {
+            *z = C::Scalar::random(&mut rng);
+        }
+        // Set new last_z
+        last_z = z[params.n() as usize - (blinding_factors + 1)];
+
+        let blind = Blind(C::Scalar::random(&mut rng));
+
+        let permutation_product_commitment = params
+            .commit_lagrange(&engine.msm_backend, &z, blind)
+            .to_affine();
+        let permutation_product_poly = domain.lagrange_to_coeff(z);
+
+        // Hash the permutation product commitment
+        transcript.write_point(permutation_product_commitment)?;
+
+        sets.push(CommittedSet {
+            permutation_product_poly,
+            permutation_product_blind: blind,
+        });
+    }
+
+    Ok(Committed { sets })
+}
+
+impl<C: CurveAffine> super::ProvingKey<C> {
+    pub(in crate::plonk) fn open(
+        &self,
+        x: ChallengeX<C>,
+    ) -> impl Iterator<Item = ProverQuery<'_, C>> + Clone {
+        // ProvingKey polys are keygen-committed with `Blind::default()` (= Blind(F::ONE)).
+        // The ProverQuery blind must match the keygen blind so the IPA equation balances.
+        self.polys
+            .iter()
+            .map(move |poly| ProverQuery {
+                point: *x,
+                poly,
+                blind: Blind::default(),
+            })
+    }
+
+    pub(in crate::plonk) fn evaluate<E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+        &self,
+        x: ChallengeX<C>,
+        transcript: &mut T,
+    ) -> Result<(), Error> {
+        // Hash permutation evals
+        for eval in self.polys.iter().map(|poly| eval_polynomial(poly, *x)) {
+            transcript.write_scalar(eval)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<C: CurveAffine> Committed<C> {
+    pub(in crate::plonk) fn evaluate<E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
+        self,
+        pk: &plonk::ProvingKey<C>,
+        x: ChallengeX<C>,
+        transcript: &mut T,
+    ) -> Result<Evaluated<C>, Error> {
+        let domain = &pk.vk.domain;
+        let blinding_factors = pk.vk.cs.blinding_factors();
+
+        {
+            let mut sets = self.sets.iter();
+
+            while let Some(set) = sets.next() {
+                let permutation_product_eval = eval_polynomial(&set.permutation_product_poly, *x);
+
+                let permutation_product_next_eval = eval_polynomial(
+                    &set.permutation_product_poly,
+                    domain.rotate_omega(*x, Rotation::next()),
+                );
+
+                // Hash permutation product evals
+                for eval in iter::empty()
+                    .chain(Some(&permutation_product_eval))
+                    .chain(Some(&permutation_product_next_eval))
+                {
+                    transcript.write_scalar(*eval)?;
+                }
+
+                // If we have any remaining sets to process, evaluate this set at omega^u
+                // so we can constrain the last value of its running product to equal the
+                // first value of the next set's running product, chaining them together.
+                if sets.len() > 0 {
+                    let permutation_product_last_eval = eval_polynomial(
+                        &set.permutation_product_poly,
+                        domain.rotate_omega(*x, Rotation(-((blinding_factors + 1) as i32))),
+                    );
+
+                    transcript.write_scalar(permutation_product_last_eval)?;
+                }
+            }
+        }
+
+        Ok(Evaluated { constructed: self })
+    }
+}
+
+impl<C: CurveAffine> Evaluated<C> {
+    pub(in crate::plonk) fn open<'a>(
+        &'a self,
+        pk: &'a plonk::ProvingKey<C>,
+        x: ChallengeX<C>,
+    ) -> impl Iterator<Item = ProverQuery<'a, C>> + Clone {
+        let blinding_factors = pk.vk.cs.blinding_factors();
+        let x_next = pk.vk.domain.rotate_omega(*x, Rotation::next());
+        let x_last = pk
+            .vk
+            .domain
+            .rotate_omega(*x, Rotation(-((blinding_factors + 1) as i32)));
+
+        iter::empty()
+            .chain(self.constructed.sets.iter().flat_map(move |set| {
+                iter::empty()
+                    // Open permutation product commitments at x and \omega x
+                    .chain(Some(ProverQuery {
+                        point: *x,
+                        poly: &set.permutation_product_poly,
+                        blind: set.permutation_product_blind,
+                    }))
+                    .chain(Some(ProverQuery {
+                        point: x_next,
+                        poly: &set.permutation_product_poly,
+                        blind: set.permutation_product_blind,
+                    }))
+            }))
+            // Open it at \omega^{last} x for all but the last set. This rotation is only
+            // sensical for the first row, but we only use this rotation in a constraint
+            // that is gated on l_0.
+            .chain(
+                self.constructed
+                    .sets
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .flat_map(move |set| {
+                        Some(ProverQuery {
+                            point: x_last,
+                            poly: &set.permutation_product_poly,
+                            blind: set.permutation_product_blind,
+                        })
+                    }),
+            )
+    }
+}
