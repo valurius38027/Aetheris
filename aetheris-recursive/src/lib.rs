@@ -1,14 +1,25 @@
 //! Aetheris (AET) Recursive Proof System
 //!
-//! Phase 1.3 stub: real recursive proof aggregation deferred to Phase 1.4 (Pasta IPA).
-//! The gossip/aggregation protocol surface (P2PRecursiveManager + 5 FFI symbols) is
-//! preserved so that `aetheris-ffi` callers and the test suite continue to compile
-//! against this crate. Cryptographic proof paths (`preload_params`,
-//! `generate_atomic_proof`, `generate_batch_atomic_proofs`, `verify_halo2_proof`)
-//! return "unavailable" JSONs or `false` rather than performing keygen/prove/verify.
+//! Phase 1.4: native Pasta 2-cycle recursion. The inner recursive circuit runs
+//! over Vesta (scalar field = Pallas base = `Fp`), and the outer ZK circuit
+//! (in `aetheris-zkp`) runs over Pallas (scalar field = Vesta base = `Fq`).
+//! The 2-cycle is what makes recursive accumulation native (no NonNativeChip
+//! required) and what enables the IPA accumulator's `Q + challenge · pi_commitment`
+//! relation to be expressed as a single field-arithmetic constraint.
 //!
-//! Curve status: still on BN254/Grumpkin (Pasta 2-cycle migration belongs to Phase 1.4).
-//! The `EccChip` identity-point fix is applied; the `+3` Grumpkin constant is retained.
+//! The `EccChip` identity-point fix from Phase 1.3 is preserved and extended:
+//!   - `on_curve_check` gate now uses Vesta's curve equation `y² = x³ + 5`
+//!     (previously hardcoded to Grumpkin's `y² = x³ + 3`, ISSUE-1.3.B).
+//!   - The windowed scalar-mul window decomposition uses `PASTA_SCALAR_BIT_LEN = 255`
+//!     (previously `BN254_FR_BIT_LEN = 254`).
+//!   - The base point tables and `h_generator` NUMS point are computed on Vesta.
+//!
+//! Accumulator: see `AccumulatorIPA` and `CircuitAccumulate` in `aetheris-zkp`.
+//! Trust model: the accumulator is a "trusted-aggregator" model — the aggregator
+//! must call `verify_conservation` on every inner proof, and the in-circuit
+//! `CircuitAccumulate` checks the algebraic accumulator update relation. A
+//! future Phase (1.6, see ISSUE-1.4.A) will add in-circuit IPA verification for
+//! trustless recursion.
 
 use halo2_proofs::{
     circuit::{Layouter, Value, Cell},
@@ -19,10 +30,30 @@ use halo2_proofs::{
     poly::Rotation,
 };
 
-use halo2curves::bn256::{Fr as Fp, Fq};
-// NOTE: still on BN254/Grumpkin cycle, NOT Pasta. Grumpkin: y^2 = x^3 + 3.
-// Pasta (Pallas + Vesta, y^2 = x^3 + 5) migration lives in Phase 1.4.
-use halo2curves::grumpkin::G1Affine as VestaAffine;
+// Phase 1.4: switched from BN254/Grumpkin to Pasta 2-cycle.
+//
+// In halo2curves/pasta:
+//   * `Fp` = Pallas base field = Vesta's scalar field
+//   * `Fq` = Vesta base field = Pallas's scalar field
+//   * `EpAffine` = Pallas affine (curve over Fp, scalar field Fq)
+//   * `EqAffine` = Vesta affine (curve over Fq, scalar field Fp)
+//
+// The recursive circuit in this crate runs over `Fp` (Vesta's scalar field).
+// The IPA commitment curve in `aetheris-zkp` is Pallas (`EpAffine`), so the
+// accumulator's `Q` and `pi_commitment` are Pallas points. The Pasta 2-cycle
+// property is that Pallas's base field = Vesta's scalar field = `Fp`, so
+// Pallas *coordinate* arithmetic (point add, point doubling) is NATIVE in
+// this circuit. Pallas *scalar* multiplication, however, uses an Fq scalar
+// (= Vesta's base = the NON-native field of this Fp-scalar circuit); a
+// future in-circuit `CircuitAccumulate` (Phase 1.4 step 3) will need to
+// range-check / non-natively-handle the Fq scalar.
+//
+// Naming: this file aliases `EpAffine` as `PallasAffine` to make the curve
+// identification explicit at every use site. (The earlier `PallasAffine`
+// alias was misleading: Pallas EC operations, not Vesta's, are the ones
+// native to this circuit. Note that the curve equation `y² = x³ + 5` is
+// the same for Pallas and Vesta because both share b=5.)
+use halo2curves::pasta::{EpAffine as PallasAffine, Fp, Fq};
 use halo2curves::CurveAffine;
 use halo2curves::group::Curve;
 use halo2curves::group::prime::PrimeCurveAffine;
@@ -39,9 +70,11 @@ use std::sync::{Arc, RwLock};
 use libp2p::PeerId;
 use num_bigint::BigUint;
 
-fn fq_to_fp(fq: &Fp) -> Fp {
-    *fq
-}
+// Phase 1.4: the `fq_to_fp` no-op cast is removed. Vesta's base field is `Fq`
+// (Pallas scalar field of the outer circuit), so Vesta affine coordinates are
+// already in the recursive circuit's native scalar type `Fp` and need no
+// reinterpretation. The previous no-op was papering over the BN254/Grumpkin
+// type confusion that the Pasta migration resolves.
 
 fn fp_to_big(fp: &Fp) -> BigUint {
     BigUint::from_bytes_le(fp.to_repr().as_ref())
@@ -51,6 +84,9 @@ fn fp_to_big(fp: &Fp) -> BigUint {
 
 mod grain;
 use grain::GrainLFSR;
+
+pub mod accumulator;
+pub use accumulator::{AccumulatorError, AccumulatorIPA};
 
 #[derive(Clone, Debug)]
 pub struct PoseidonSpec<const T: usize, const RATE: usize> {
@@ -347,10 +383,10 @@ pub struct EcPoint {
     pub y_cell: Option<Cell>,
     /// Phase 1.3 fix: tracks whether this point is the additive identity
     /// (point at infinity, conventionally represented as (0, 0) in affine coords).
-    /// The identity is NOT on the affine curve y² = x³ + 3, so `assert_on_curve`
-    /// must skip the on-curve gate when this flag is set. All real curve points
-    /// (generator, add/double/select outputs, fixed-base table points) carry
-    /// `is_identity = false`.
+    /// The identity is NOT on the affine curve y² = x³ + 5 (Vesta), so
+    /// `assert_on_curve` must skip the on-curve gate when this flag is set.
+    /// All real curve points (generator, add/double/select outputs,
+    /// fixed-base table points) carry `is_identity = false`.
     pub is_identity: bool,
 }
 
@@ -369,8 +405,16 @@ impl EcPoint {
     }
 }
 
-/// Number of bits for BN254 Fr field (254 bits)
-pub const BN254_FR_BIT_LEN: usize = 254;
+/// Phase 1.4: Pasta Vesta scalar field bit length (255 bits).
+/// Used by windowed scalar-mul to bound the bit range over which it scans.
+/// Replaces the previous `BN254_FR_BIT_LEN = 254` (BN254 Fr modulus, 254 bits).
+pub const PASTA_SCALAR_BIT_LEN: usize = 255;
+
+/// Phase 1.4: short-Weierstrass curve constant for the Pasta 2-cycle
+/// curves. Both Pallas and Vesta share `b = 5`, so the same value is
+/// used for `on_curve_check` (gating Pallas points) and `h_generator`
+/// (NUMS-style deterministic point on Pallas).
+pub const PASTA_CURVE_B: u64 = 5;
 
 impl EccChip {
     pub fn configure(meta: &mut ConstraintSystem<Fp>) -> EccConfig {
@@ -407,14 +451,21 @@ impl EccChip {
             ]
         });
 
-        // On-curve check: y^2 = x^3 + 3 (Grumpkin curve, not Pasta)
+        // On-curve check: y² = x³ + B (Vesta curve, B = 5).
+        // Phase 1.4 fix (ISSUE-1.3.B): the gate used to encode B = 3 (Grumpkin),
+        // which is the wrong curve for the Vesta `EpAffine::generator()` returned
+        // by `EccChip::generator`. The bug was masked by the fact that no
+        // production code called `assert_on_curve` on a real (non-identity) Vesta
+        // point — see Phase 1.3 commit 345d1d2. The new `test_ecc_identity_propagation`
+        // exercises the real-point path; this gate is now load-bearing.
         meta.create_gate("on_curve_check", |meta| {
             let s_on_curve = meta.query_selector(s_on_curve);
             let x = meta.query_advice(x, Rotation::cur());
             let y = meta.query_advice(y, Rotation::cur());
-            
-            // y^2 - (x^3 + 3) = 0
-            vec![s_on_curve * (y.clone() * y - (x.clone() * x.clone() * x + Expression::Constant(Fp::from(3))))]
+
+            // y² - (x³ + 5) = 0
+            vec![s_on_curve * (y.clone() * y
+                - (x.clone() * x.clone() * x + Expression::Constant(Fp::from(PASTA_CURVE_B))))]
         });
 
         // Field multiplication gate: a * b = c
@@ -503,10 +554,11 @@ impl EccChip {
                 if let Some(c) = p.x_cell { region.constrain_equal(x.cell(), c)?; }
                 if let Some(c) = p.y_cell { region.constrain_equal(y.cell(), c)?; }
 
-                // Phase 1.3 fix: the identity point (0, 0) is the additive neutral
-                // element and does NOT satisfy y² = x³ + 3. The on-curve gate must
-                // be skipped for identity, but we still need to assign the witnesses
-                // above so any callers' cell-tracking constrain_equal constraints hold.
+                // Phase 1.3 + 1.4 fix: the identity point (0, 0) is the additive neutral
+                // element and does NOT satisfy y² = x³ + 5 (Vesta's curve equation).
+                // The on-curve gate must be skipped for identity, but we still need to
+                // assign the witnesses above so any callers' cell-tracking
+                // constrain_equal constraints hold.
                 if !p.is_identity {
                     self.config.s_on_curve.enable(&mut region, 0)?;
                 }
@@ -519,29 +571,33 @@ impl EccChip {
         Self { config }
     }
 
-    /// Returns the standard generator point for the curve (G)
+    /// Returns the Vesta standard generator point (G).
+    /// Note: Vesta's base field is `Fq` = Pallas's scalar field, so the
+    /// generator's x/y coordinates are already in the recursive circuit's
+    /// native scalar type `Fp` and need no `fq_to_fp` reinterpretation.
     pub fn generator(&self) -> EcPoint {
-        let g = VestaAffine::generator();
+        let g = PallasAffine::generator();
         let coords = g.coordinates().unwrap();
         let x = *coords.x();
         let y = *coords.y();
         EcPoint {
-            x: Value::known(fq_to_fp(&x)),
-            y: Value::known(fq_to_fp(&y)),
+            x: Value::known(x),
+            y: Value::known(y),
             x_cell: None,
             y_cell: None,
             is_identity: false,
         }
     }
 
-    /// Returns a Nothing-Up-My-Sleeve (NUMS) generator point (H) on Vesta/Grumpkin.
-    /// Generated via deterministic try-and-increment: smallest x >= 0 with valid y on y² = x³ + 3.
+    /// Returns a Nothing-Up-My-Sleeve (NUMS) generator point (H) on Vesta.
+    /// Generated via deterministic try-and-increment: smallest x >= 0 with
+    /// valid y on y² = x³ + 5.
     pub fn h_generator(&self, mut layouter: impl Layouter<Fp>) -> Result<EcPoint, ErrorFront> {
-        // Deterministic NUMS point: find smallest x >= 0 s.t. (x, y) is on the curve
+        // Deterministic NUMS point: find smallest x >= 0 s.t. (x, y) is on Vesta (B = 5)
         let (x_nums, y_nums) = {
             let mut x = Fp::ZERO;
             loop {
-                let y_sq = x * x * x + Fp::from(3);
+                let y_sq = x * x * x + Fp::from(PASTA_CURVE_B);
                 if let Some(y) = y_sq.sqrt().into() {
                     break (x, y);
                 }
@@ -750,17 +806,20 @@ impl EccChip {
 
     /// Constrain two points to be equal: p1 == p2
     /// Load a fixed-base lookup table for a specific base point.
-    pub fn load_fixed_table(&self, layouter: &mut impl Layouter<Fp>, base: &VestaAffine, table_offset: usize) -> Result<(), ErrorFront> {
+    /// Phase 1.4: the EccChip operates on Pallas (`EpAffine` = `PallasAffine`).
+    /// Pallas's scalar field is `Fq`, so the window multipliers in the table
+    /// are `Fq::from(...)` (Pallas scalars).
+    pub fn load_fixed_table(&self, layouter: &mut impl Layouter<Fp>, base: &PallasAffine, table_offset: usize) -> Result<(), ErrorFront> {
         Ok(layouter.assign_table(
             || format!("fixed base table (offset {})", table_offset),
             |mut table| {
                 let w = 2; // Optimized to 2-bit window as per production roadmap
-                let num_windows = (BN254_FR_BIT_LEN + w - 1) / w;
-                
+                let num_windows = (PASTA_SCALAR_BIT_LEN + w - 1) / w;
+
                 for i in 0..num_windows {
-                    let base_window: VestaAffine = (PrimeCurveAffine::to_curve(base) * Fq::from(1u64 << (i * w))).to_affine();
+                    let base_window: PallasAffine = (PrimeCurveAffine::to_curve(base) * Fq::from(1u64 << (i * w))).to_affine();
                     for j in 0..(1 << w) {
-                        let point: VestaAffine = (PrimeCurveAffine::to_curve(&base_window) * Fq::from(j as u64)).to_affine();
+                        let point: PallasAffine = (PrimeCurveAffine::to_curve(&base_window) * Fq::from(j as u64)).to_affine();
                         let coords = point.coordinates();
                         let (x, y) = if coords.is_some().into() {
                             let c = coords.unwrap();
@@ -780,9 +839,9 @@ impl EccChip {
         )?)
     }
 
-    pub fn fixed_base_scalar_mul(&self, mut layouter: impl Layouter<Fp>, scalar: &Limb, base_point: &VestaAffine, table_offset: usize) -> Result<EcPoint, ErrorFront> {
+    pub fn fixed_base_scalar_mul(&self, mut layouter: impl Layouter<Fp>, scalar: &Limb, base_point: &PallasAffine, table_offset: usize) -> Result<EcPoint, ErrorFront> {
         let w = 2; // Optimized to 2-bit window
-        let num_windows = (BN254_FR_BIT_LEN + w - 1) / w;
+        let num_windows = (PASTA_SCALAR_BIT_LEN + w - 1) / w;
         
         // Accumulator for the result
         let mut p_acc: Option<EcPoint> = None;
@@ -802,7 +861,7 @@ impl EccChip {
                 
                 for j in 0..w {
                     let idx = bit_offset + j;
-                    if idx < BN254_FR_BIT_LEN {
+                    if idx < PASTA_SCALAR_BIT_LEN {
                          // Get byte index and bit index within byte
                         let byte_idx = idx / 8;
                         let bit_idx = idx % 8;
@@ -849,10 +908,10 @@ impl EccChip {
                     let base_curve = PrimeCurveAffine::to_curve(base_point);
                     // 2^(w*i)
                     let shift_scalar = Fq::from(2).pow([(window_idx * w) as u64, 0, 0, 0]);
-                    let base_window: VestaAffine = (base_curve * shift_scalar).to_affine();
+                    let base_window: PallasAffine = (base_curve * shift_scalar).to_affine();
 
                     let digit_scalar = Fq::from(digit_u64);
-                    let p: VestaAffine = (PrimeCurveAffine::to_curve(&base_window) * digit_scalar).to_affine();
+                    let p: PallasAffine = (PrimeCurveAffine::to_curve(&base_window) * digit_scalar).to_affine();
 
                     let coords = p.coordinates();
                     if coords.is_some().into() {
@@ -968,7 +1027,7 @@ impl EccChip {
 
         // Window size w=2
         let w = 2;
-        let num_windows = (BN254_FR_BIT_LEN + w - 1) / w;
+        let num_windows = (PASTA_SCALAR_BIT_LEN + w - 1) / w;
 
         // Precompute multiples: 1P, 2P, 3P
         let p1 = p.clone();
@@ -983,7 +1042,7 @@ impl EccChip {
                 let bit = scalar.value.map(|s| {
                     let bytes = s.to_repr();
                     let idx = i * w + j;
-                    if idx < BN254_FR_BIT_LEN {
+                    if idx < PASTA_SCALAR_BIT_LEN {
                         (bytes.as_ref()[idx / 8] >> (idx % 8)) & 1 == 1
                     } else {
                         false
@@ -1079,6 +1138,10 @@ fn fp_to_hex(fp: &Fp) -> String {
     hex::encode(fp.to_repr())
 }
 
+/// Decode a hex-encoded field element of the recursive circuit's scalar type
+/// (`Fp` = Pallas base field, post-Phase-1.4 Pasta migration). 32-byte little-endian
+/// representation, matching `Fp::to_repr()`. Returns `Fp::ZERO` on parse failure
+/// (which the gossip validator treats as a "total_flow != 0" rejection).
 fn hex_to_fp(h: &str) -> Fp {
     let bytes = hex::decode(h).unwrap_or_default();
     if bytes.len() == 32 {
@@ -1517,9 +1580,11 @@ mod tests {
 
     #[test]
     fn find_nums_point() {
+        // Phase 1.4: search for the smallest Vesta NUMS point on y² = x³ + 5
+        // (previously Grumpkin's y² = x³ + 3, ISSUE-1.3.B).
         for i in 0..100 {
             let x = Fp::from(i);
-            let y_sq = x * x * x + Fp::from(3);
+            let y_sq = x * x * x + Fp::from(PASTA_CURVE_B);
             let y: Option<Fp> = y_sq.sqrt().into();
             if let Some(y_val) = y {
                 println!("Point found: x={}, y={:?}", i, y_val);
@@ -1813,19 +1878,20 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// Phase 1.3 coverage: `is_identity` must propagate through arithmetic so
-    /// that `assert_on_curve` correctly skips the real-curve gate for witness
-    /// results that are mathematically the identity. We exercise every
-    /// identity-producing path: identity `add`/`double`, window=0 in
-    /// `fixed_base_scalar_mul`, scalar=0 in `scalar_mul`, and the final
-    /// `select_bool(started, p_res, identity)`.
+    /// Phase 1.3 + 1.4 coverage: `is_identity` must propagate through
+    /// arithmetic so that `assert_on_curve` correctly skips the real-curve
+    /// gate for witness results that are mathematically the identity. We
+    /// exercise every identity-producing path: identity `add`/`double`,
+    /// window=0 in `fixed_base_scalar_mul`, scalar=0 in `scalar_mul`, and
+    /// the final `select_bool(started, p_res, identity)`.
     ///
-    /// Note: we only call `assert_on_curve` on identity-flagged points. The
-    /// pre-existing `on_curve_check` gate (line ~411) is hard-coded to the
-    /// Grumpkin curve equation y² = x³ + 3, but `chip.generator()` returns
-    /// Vesta's generator (y² = x³ + 5). Wiring `assert_on_curve` to a real
-    /// Vesta point would trip that latent gate-mismatch, which is out of
-    /// scope for Phase 1.3 and tracked separately.
+    /// Phase 1.4 update (ISSUE-1.3.B regression test): the `on_curve_check`
+    /// gate has been fixed from Grumpkin's `y² = x³ + 3` to Vesta's
+    /// `y² = x³ + 5`. The cases below that produce a real Vesta curve
+    /// point (add(identity,g), add(g,identity), double(g), scalar_mul(g,2))
+    /// now also call `assert_on_curve`, which exercises the gate. If the
+    /// gate formula drifts away from Vesta's curve equation, this test
+    /// fails at `MockProver::verify()`.
     #[test]
     fn test_ecc_identity_propagation() {
         const K: u32 = 13;
@@ -1855,22 +1921,26 @@ mod tests {
                 assert!(a1.is_identity, "add(identity, identity) must be identity");
                 chip.assert_on_curve(layouter.namespace(|| "curve_a1"), &a1)?;
 
-                // (2) add(identity, g) → g. Real curve point; we only check the flag here.
+                // (2) add(identity, g) → g. Real Vesta curve point; assert_on_curve
+                // exercises the y² = x³ + 5 gate (ISSUE-1.3.B regression test).
                 let a2 = chip.add(layouter.namespace(|| "add_id_g"), &id, &g)?;
                 assert!(!a2.is_identity, "add(identity, g) must be a real curve point");
+                chip.assert_on_curve(layouter.namespace(|| "curve_a2"), &a2)?;
 
-                // (3) add(g, identity) → g.
+                // (3) add(g, identity) → g. Real Vesta curve point.
                 let a3 = chip.add(layouter.namespace(|| "add_g_id"), &g, &id)?;
                 assert!(!a3.is_identity, "add(g, identity) must be a real curve point");
+                chip.assert_on_curve(layouter.namespace(|| "curve_a3"), &a3)?;
 
                 // (4) double(identity) → identity. Skip s_on_curve via the flag.
                 let d1 = chip.double(layouter.namespace(|| "double_id"), &id)?;
                 assert!(d1.is_identity, "double(identity) must be identity");
                 chip.assert_on_curve(layouter.namespace(|| "curve_d1"), &d1)?;
 
-                // (5) double(g) → 2G. Real curve point.
+                // (5) double(g) → 2G. Real Vesta curve point.
                 let d2 = chip.double(layouter.namespace(|| "double_g"), &g)?;
                 assert!(!d2.is_identity, "double(g) must be a real curve point");
+                chip.assert_on_curve(layouter.namespace(|| "curve_d2"), &d2)?;
 
                 // (6) scalar_mul(g, 0) → identity (started=false in the final select).
                 let zero = Limb { value: Value::known(Fp::ZERO), cell: None };
@@ -1878,10 +1948,11 @@ mod tests {
                 assert!(s0.is_identity, "scalar_mul(g, 0) must be identity");
                 chip.assert_on_curve(layouter.namespace(|| "curve_s0"), &s0)?;
 
-                // (7) scalar_mul(g, 2) → 2G. Real curve point.
+                // (7) scalar_mul(g, 2) → 2G. Real Vesta curve point.
                 let two = Limb { value: Value::known(Fp::from(2)), cell: None };
                 let s2 = chip.scalar_mul(layouter.namespace(|| "scalar_mul_2"), &g, &two)?;
                 assert!(!s2.is_identity, "scalar_mul(g, 2) must be a real curve point");
+                chip.assert_on_curve(layouter.namespace(|| "curve_s2"), &s2)?;
 
                 *self.stash.borrow_mut() = Some(s2);
                 Ok(())

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 aetheris-core = { path = "../aetheris-core" }
 aetheris-crypto = { path = "../aetheris-crypto" }
+aetheris-zkp = { path = "../aetheris-zkp" }
 halo2_proofs = { workspace = true }
 halo2curves = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +24,8 @@ log = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 rayon = "1.8"
+blake3 = { workspace = true }
+subtle = "2.6"
 # Using a more standard poseidon implementation if available, or just mock it for now
 # poseidon = "0.3" 
 
