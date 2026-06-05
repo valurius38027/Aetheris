@@ -1924,3 +1924,162 @@ EccChip 算术(add/double/select/fixed_base window)无条件发 `is_identity: fa
 - 新增 test function `test_ecc_identity_propagation` (~90 LoC)
 
 **Phase 1.3 范围严格 bounded 到 `aetheris-recursive/`,未触及任何其他 crate。**
+
+---
+
+## Phase 1.4 — IPA Accumulator + Pasta 2-cycle Migration (2026-06-05, COMPLETED, commit `323b81b`)
+
+### 完成的动作(per `mainnet_execution_plan.md` §1.4)
+
+| # | 动作 | 状态 | 证据 |
+|---|------|------|------|
+| 1 | Pasta 2-cycle 迁移 (aetheris-recursive 全栈) | ✅ | `lib.rs` import `pasta::{EpAffine as PallasAffine, Fp, Fq}`;`fq_to_fp` no-op 删除;`on_curve_check` gate `+3`→`+5` (ISSUE-1.3.B 修复);`PASTA_SCALAR_BIT_LEN=255` 替 `BN254_FR_BIT_LEN=254`;`PASTA_CURVE_B=5` 替 `VESTA_CURVE_B=5`;`generator()` / `h_generator()` 返回 Pallas 点;`load_fixed_table` / `fixed_base_scalar_mul` / `scalar_mul` 5 处 `Fq::from(...)` 改 Pallas scalar (Fq = Ep::Scalar);`grain.rs` test 改 `pasta::Fp`;`compat_test.rs` 改 `EqAffine as VestaAffine` (实指 Vesta);`PallasAffine` 别名替换 `VestaAffine` (7 use sites) 修 W-1 MAJOR 命名误导 |
+| 2 | `AccumulatorIPA` struct + accumulate + verify + wire format | ✅ | 新文件 `aetheris-recursive/src/accumulator.rs` (~600 LoC):struct `Q: EpAffine (Pallas), transcript: [u8;32], depth: u32`;9-step `accumulate()` (prefix → depth → shape ≤30 cells → verify_conservation → blake3 → NUMS hash_to_curve → challenge reduce → Q update → transcript_new);`validate_proof_chain()` (renamed from `verify` for honest contract);`to_bytes()` / `from_bytes()` (28B prefix + 32B Q identity=all-zeros + 32B transcript + 4B depth);domain separators `ACCUMULATOR_TRANSCRIPT_DOMAIN` / `PI_COMMITMENT_DOMAIN` / `INNER_PROOF_PREFIX` / `ACCUMULATOR_WIRE_PREFIX` 全 distinct,全 `\x00` 终止;`MAX_ACCUMULATOR_DEPTH = 1_000_000`;11 unit tests |
+| 3 | `CircuitAccumulate` Halo2 电路 | ⏸ 推 1.5+ (ISSUE-1.4.A 同范围) | 1.4 完成 trusted-aggregator accumulator + out-of-circuit IPA verify;in-circuit IPA verifier 是 Option A,需 NonNativeChip 处理 Fq scalar,推迟到 1.5+ |
+| 4 | 适配 `aggregate_proofs` (aetheris-zkp) | ⏸ 推 1.5+ (ISSUE-1.4.A) | 1.4 保留 `aggregate_proofs` 现有 Merkle 接口,IPA 切换是 1.5 工作 |
+
+### 关键发现 + Fixes (per Multi-Agent Review 2-pass)
+
+#### Fix I-1 (BLOCKER — math safety): `fp_from_blake3` 75% zero bug
+
+`fp_from_blake3` 初版用 `Fp::from_repr(...).unwrap_or(Fp::ZERO)` 减少 32-byte blake3 输出到 Fp。`Fp::from_repr` 只接受 canonical (>= p_Fp) 的 32-byte LE repr,~75% 的均匀随机 32-byte 字符串被拒,触发 `unwrap_or(Fp::ZERO)` 静默回退到加法单位元。
+
+后果:在 `accumulate()` step 7 的 Fiat-Shamir challenge `c = fp_from_blake3(...)`,有 75% 概率 `c = 0`;代入 step 8 `Q_new = Q + c * pi_commitment = Q` —— IPA chain binding 链在 3/4 的 accumulation 中**完全失效**。攻击者能 grind proof nonce 选 blake3 输出 >= p_Fp 的"幸运 proof"。
+
+修复:改用 `Fp::from_uniform_bytes(&buf)` (mod-p reduction of 512-bit value,where `buf = [hash(32), 0u8; 32]`),`from_u512` 总输出一个 uniform random Fp,never silently zero。
+
+#### Fix I-2 (BLOCKER — DoS): 23-byte payload 触发 keygen_vk panic
+
+`verify_conservation` (aetheris-zkp/src/halo2_pasta.rs:386) 解析 untrusted `in_len`/`out_len` (u16 LE),然后 `ensure_keys(in_len, out_len)` 在 `in_len+out_len > 31` 时 keygen_vk 失败 → `expect("keygen_vk failed")` **panic**。23-byte `b"halo2_ipa_pasta_v1_"\xff\xff\xff\xff` 足以崩溃 aggregator,no auth needed。
+
+修复:`accumulate()` step 3 加 shape check,bound `in_len + out_len ≤ 30` (k=11 row budget:30 × 66 rows = 1980 ≤ 2048,留 ~68 rows 余地),超过返 `InnerProofInvalid` (with explanation) 在 `verify_conservation` 之前。**注**:`verify_conservation` 本身没 self-bound,直接 caller (aetheris-node tx 验证) 仍有此 vector,作为 ISSUE-1.4.D 推 1.5 修。
+
+#### Fix I-3 (BLOCKER — API honesty): `verify()` 没真 verify accumulator state
+
+`verify()` 初版"naive replay":从 `Self::new()` 重新累积每个 proof,return true on success。**但函数没有 `claimed_acc` 参数**,没有 final state 比较 — `validate_proof_chain(p1, p2)` 跟 `p1.iter().all(|p| verify_conservation(p, ...))` 等价,IPA Q-chain 贡献被丢弃。攻击者能替换 sub-chain with valid proofs,`verify` 仍返 true。
+
+修复:重命名 `verify` → `validate_proof_chain`,doc 明确"replay only, does NOT compare against claimed_acc;caller MUST compare `transcript` hash externally"。Fidelity to honest contract。
+
+#### Fix I-4 (BLOCKER — DoS ordering): depth check 应该在 verify_conservation 之前
+
+初版顺序:prefix → verify_conservation → depth。攻击者在 `depth = MAX-1` 反复提交 valid proofs,burn CPU on `verify_proof_with_strategy` (tens of ms each) 每次,全部最后被 `DepthOverflow` 拒绝。
+
+修复:重排为 prefix → depth → shape → verify_conservation。Depth + shape 都是 cheap,在 expensive `verify_conservation` 之前 fail-fast。新 test `accumulator_rejects_depth_overflow_without_zk_verify` 用 `acc.depth = MAX` + garbage proof 验证 `DepthOverflow` (not `InnerProofInvalid`) 路径。
+
+#### Fix I-5 (BLOCKER — misleading doc): curve-placement comment 错描述 Fq scalar 为 "native"
+
+Top-of-file comment 初版说"`Q` 和 `pi_commitment` 是 Pallas 点,so the scalar-mul and EC-add arithmetic in this crate's Vesta circuit (`Fp` scalar field) is the Pasta 2-cycle 'native' arithmetic"。这**错**了:Pallas *coordinate* arithmetic 是在 Fp,native;但 Pallas *scalar* multiplication 用 Fq scalar (= Vesta.base = NON-native field of this Fp-scalar circuit)。
+
+后果:未来实现 `CircuitAccumulate` 的人读这 comment 会以为不需要 NonNativeChip range-check Fq scalar,实际需要。
+
+修复:doc 显式 split "Pallas coordinate arithmetic (point add/double) is native" vs "Pallas *scalar* mul is NOT native (uses Fq = Vesta.base, NON-native of Fp-scalar circuit);future in-circuit CircuitAccumulate will need NonNativeChip range-checks"。引用 `mainnet_execution_plan.md` §1.4 step 3。
+
+#### Fix W-1 (MAJOR — aliasing): `VestaAffine` 两 alias 冲突
+
+`lib.rs:52` alias `EpAffine as VestaAffine` (实指 Pallas) + `compat_test.rs:13` alias `EqAffine as VestaAffine` (实指 Vesta) — 同一 identifier 在不同文件代表不同 curve,readers 必中招。
+
+修复:lib.rs 改 `EpAffine as PallasAffine` (语义清晰:Pallas ops native in this Vesta-scalar circuit),7 use sites 同步更新;`VESTA_CURVE_B` 同步 rename `PASTA_CURVE_B` (因为该 constant 实际用在 Pallas 算术);`compat_test.rs` 保持 `EqAffine as VestaAffine` (该 alias 名实相符,无冲突)。
+
+#### Fix W-2 (MINOR — math precision): `fp_to_fq` comment 说 "Fp and Fq have same prime"
+
+实际:Pallas prime 和 Vesta prime **不同** (Vesta > Pallas by `0x47aefc33bba0634 << 192`)。2-cycle property 是 "Pallas.base = Vesta.scalar = Fp *type*" (field types 相等),**不是** "modular primes 相等"。
+
+修复:doc 改为:"For any Fp value `v < p_Pallas < p_Vesta`, the 32-byte LE repr is also a canonical Fq repr (`v mod p_Vesta = v`, no reduction). Fp→Fq is no-op;Fq→Fp is NOT a no-op and would need explicit reduction."
+
+#### Fix W-3 (MINOR — naming): `VESTA_CURVE_B` 改 `PASTA_CURVE_B`
+
+constant 名说"是 Vesta 曲线 constant"但用在 Pallas gate (因为 alias 错位 + Pasta 共享 b=5)。重命名 + doc 解释"both Pallas and Vesta share b=5, so the same value is used for Pallas on-curve gate and Pallas NUMS h_generator"。
+
+#### Fix W-1 (B) (MINOR — test coverage): `accumulator_serialize_rejects_bad_prefix` test 用 92 bytes
+
+`vec![0u8; 24 + 32 + 32 + 4]` = 92 bytes,但 `EXPECTED_LEN` = `ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 4` = **96 bytes**。92-byte input 在 line 245 length check 失败,从不触发 prefix-rejection branch (line 252)。Test 是绿色 by accident,prefix path 实际未测。
+
+修复:test 改用 `vec![0u8; ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 4]` = 96 bytes,prefix-rejection 真正被执行。
+
+#### Fix W-2 (B) (MINOR — cosmetic): `to_bytes` doc + with_capacity 24 → 28
+
+`ACCUMULATOR_WIRE_PREFIX` 是 28 bytes,不是 24 bytes (user agent A 错算了 string length)。`with_capacity(24 + ...)` under-allocates,doc 错描述 24 bytes。
+
+修复:全改 derive from `ACCUMULATOR_WIRE_PREFIX.len()` (32+32+4+28 = 96,= EXPECTED_LEN)。
+
+#### Fix W-4 (B) (MINOR — doc): `output_commitments` 不被 chain 绑定
+
+`verify_conservation` (aetheris-zkp trait) 的 instance column 只 bind `public_amount`,**不** bind `output_commitments` (`_output_commitments: &[[u8; 32]]` 在 fn body 内 unused)。意味着 chain 只 cryptographically bind `proof + public_amount`,不 bind output commitments。
+
+修复:`accumulate()` step 4 加显式 warning comment:"verify_conservation ignores output_commitments in the current aetheris-zkp implementation. The chain therefore binds proof bytes + public_amount, but NOT the output commitments themselves. Callers MUST verify commitments out-of-band. Phase 1.5 will include commitment hash in the challenge domain." 计划 ISSUE-1.4.E:1.5 把 commitments 加进 challenge 域。
+
+#### Fix W-5 (B) (MINOR — test coverage): 缺 depth overflow + transcript binding tests
+
+8 个 unit tests 缺 happy-path / chaining / depth-overflow / transcript binding 验证。
+
+修复:加 2 个 tests:
+- `accumulator_rejects_depth_overflow_without_zk_verify` (line ~567) 设 `acc.depth = MAX_ACCUMULATOR_DEPTH` + malformed proof,验 `DepthOverflow` (not `InnerProofInvalid`) 返回 — 证明 depth check 在 verify_conservation 之前
+- `hash_to_curve_nums_binds_to_input` (line ~593) 1-byte diff input → different `hash_to_curve_nums` output + different `fp_from_blake3` output,验 binding property
+
+Happy-path test 留 Phase 1.5 (需要暴露 `make_proof` helper)。
+
+### Trust model (Phase 1.4 范围)
+
+**trusted-aggregator**:Aggregator 是 trusted party:
+1. 调用 `verify_conservation(proof, ...)` (out-of-circuit,ZK soundness 取决于 IPA+PLONK 修复 — 见 `ISSUE_IPA_PLONK_INTEGRATION.md`)
+2. 调用 `accumulate(...)` 更新 accumulator state
+3. Commit 公开 `transcript` hash (e.g. 进 block header)
+4. Verifiers replay + 比较 `transcript` hash (他们不需要 trust aggregator,只要 transcript 匹配)
+
+**out-of-scope for 1.4 (推 1.5+ / ISSUE-1.4.A)**:
+- In-circuit `CircuitAccumulate` Halo2 电路 (Vesta 电路, Pallas EC ops native, Fq scalar 需 NonNativeChip)
+- In-circuit IPA verifier (Option A — 完整 trustless recursion)
+- Hash-to-curve SSWU2 (ISSUE-1.4.B — 替 NUMS try-and-increment 为 constant-time)
+- `verify_conservation` self-bound I/O shape (ISSUE-1.4.D — close 23-byte DoS vector 在所有 callers)
+- Output commitments 在 chain 绑定 (ISSUE-1.4.E — challenge domain 加 commitment hash)
+
+### Test counts (Phase 1.4 final)
+
+| Crate | Tests | Pass | Fail |
+|-------|-------|------|------|
+| `aetheris-recursive --lib` | 23 (+11 accumulator) | 23 | 0 |
+| `aetheris-recursive --tests` (integration) | 4 | 4 | 0 |
+| `aetheris-zkp --lib` | 56 | 56 | 0 |
+| `aetheris-core --lib` | 21 | 21 | 0 |
+| `aetheris-crypto --lib` | 38 | 38 | 0 |
+| `aetheris-node --lib` | (pre-existing IPA+PLONK 失败 3 个,baseline 一致) | — | 3 (pre-existing) |
+| `cargo check --workspace` | n/a | n/a | 0 errors, 0 new warnings |
+| **Total** | **142+** | **142+** | **3 (pre-existing)** |
+
+`aetheris-zkp` 有 3 个 pre-existing warnings (Phase 1.1.5 之前就在,非 1.4 引入)。
+
+### 11 个 AccumulatorIPA unit tests (Phase 1.4 新增)
+
+1. `accumulator_initial_state_is_deterministic` — genesis uniqueness
+2. `accumulator_rejects_bad_prefix` — prefix check fail-fast
+3. `accumulator_rejects_valid_prefix_but_invalid_proof` — verify_conservation path with valid prefix + shape (1,0) + garbage
+4. `accumulator_serialize_roundtrip` — to_bytes/from_bytes inverse (identity Q case)
+5. `accumulator_serialize_rejects_bad_length` — wire format length check
+6. `accumulator_serialize_rejects_bad_prefix` — wire format prefix check (96-byte input)
+7. `accumulator_domain_separators_are_unique` — no cross-protocol collision
+8. `accumulator_rejects_depth_overflow_without_zk_verify` — anti-DoS ordering
+9. `hash_to_curve_nums_is_deterministic` — NUMS stability
+10. `hash_to_curve_nums_differs_for_different_inputs` — NUMS uniqueness
+11. `hash_to_curve_nums_binds_to_input` — 1-byte input diff → different output (binding)
+
+### Diff 范围 (commit `323b81b`)
+
+`git show --stat 323b81b`:
+- `aetheris-recursive/Cargo.toml`: +3 lines (aetheris-zkp, blake3, subtle)
+- `aetheris-recursive/src/accumulator.rs`: +600 new
+- `aetheris-recursive/src/lib.rs`: +145/-69 net (Pasta 迁移 + alias rename + PASTA_CURVE_B rename)
+- `aetheris-recursive/src/grain.rs`: +3/-3 (test: bn256::Fr → pasta::Fp)
+- `aetheris-recursive/tests/compat_test.rs`: +2/-2 (EqAffine as VestaAffine + comment)
+- **Total**: 5 files, +757/-69
+
+### 跟踪到 plan / out-of-scope (Phase 1.4 新增)
+
+| ISSUE | 描述 | 推 |
+|-------|------|-----|
+| **ISSUE-1.4.A** | In-circuit `CircuitAccumulate` + in-circuit IPA verifier (Option A — 完整 trustless recursion);需 NonNativeChip 处理 Fq scalar | Phase 1.5+ |
+| **ISSUE-1.4.B** | Hash-to-curve NUMS try-and-increment 替 constant-time SSWU2 (1.4 NUMS 泄漏迭代计数) | Phase 1.5+ |
+| **ISSUE-1.4.C** | Accumulator 集成测试 (happy-path accumulate + chaining + multi-block 验证) | Phase 1.5+ (需 make_proof helper 暴露) |
+| **ISSUE-1.4.D** | `verify_conservation` self-bound I/O shape (close 23-byte DoS vector 在 aetheris-node tx validation 等 direct callers) | Phase 1.5+ |
+| **ISSUE-1.4.E** | Output commitments 在 chain 绑定 (challenge domain 加 commitments hash) | Phase 1.5+ |
+
+### Phase 1.4 范围严格 bounded 到 aetheris-recursive + 新 accumulator module,未触及 aetheris-zkp / aetheris-node / FFI / wallet 的 verification/aggregation 逻辑。
