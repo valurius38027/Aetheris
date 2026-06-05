@@ -1849,3 +1849,78 @@ Per AGENTS.md workflow, before implementing Phase 2:
 ---
 
 *Last updated: 2026-06-04* (Stage 32 revised: Phase 1 done, Phase 2 plan locked, awaiting multi-agent pre-investigation)
+
+---
+
+## Phase 1.3 — Cleanup `aetheris-recursive` (2026-06-05, COMPLETED)
+
+### 完成的动作(per `mainnet_execution_plan.md` §1.3)
+
+| # | 动作 | 状态 | 证据 |
+|---|------|------|------|
+| 1 | 删除 `NonNativeChip` / `KzgChip` / `AccumulatorChip` / `RecursiveAggregationCircuit` / `RangeCheckChip` | ✅ | `git diff HEAD --stat` 显示 lib.rs 净 -802 LoC (2380→1578);`RangeCheckChip` / `KzgChip` / `AccumulatorChip` / `NonNativeChip` 在 src 中 grep 0 命中 |
+| 2 | `P2PRecursiveManager` 桩化 | ✅ | `preload_params` no-op log; `verify_halo2_proof` 返回 false; `generate_atomic_proof` / `generate_batch_atomic_proofs` 返回 unavailable JSON 含 `Phase 1.4`;`GlobalVerifier`/`cached_params`/`cached_pk`/`do_verify_proof` 删除 |
+| 3 | `EcPoint` identity 修复 (扩展) | ✅ | `is_identity: bool` 字段 + `identity()` ctor + `assert_on_curve` 跳过 selector;**Phase 1.3 扩展**:`add`/`double`/`select_bool`/`fixed_base_scalar_mul` window 全部传播 `is_identity`;新 `test_ecc_identity_propagation` 覆盖 7 个 identity-producing 路径(identity add/double, identity+real, scalar_mul(P,0), scalar_mul(P,2) 等) |
+| 4 | Poseidon Grain LFSR | ✅ | 新文件 `aetheris-recursive/src/grain.rs` (~150 LOC,无 `bitvec` 依赖);80-bit LFSR 复现 PSE recurrence;`PoseidonSpec::new_real(8, 56, 123)` Orchard-canonical 参数;round constants + MDS 由 Grain 生成 |
+| 5 | 测试清理 | ✅ | 删 `test_batch_proof_generation` / `test_recursive_aggregation_circuit` / `test_nonnative_add` / `test_range_check_chip`;改 `test_poseidon_hash`/`test_poseidon_consistency` 到 (8, 56, 123);`test_manager_new` 改 assertion;`test_atomic_proof_generation` 检查 unavailable + Phase 1.4 |
+| 6 | FFI 表面兼容 | ✅ | `cargo check -p aetheris-ffi` 0 errors;4 个 C-ABI `aetheris_recursive_*` 函数都解析到保留的 `recursive_manager_*` 符号 |
+
+### 关键发现 + Fixes
+
+#### Fix A: Grain LFSR writeback bug (latent, 阻止 Phase 1.3 验收)
+
+`aetheris-recursive/src/grain.rs` `load_next_8_bits` 原始实现用 `set_bit` (OR) 写新 bits 到 state[72..80],**但 rotate 后这些位置已经被旧值填满**。OR 不清除旧值,导致 LFSR state 收敛到 all-1s,产出 254/255-bit 全 1 patterns,被 `from_repr_vartime` 100% 拒绝 → `next_field_element` 死循环。
+
+修复:post-rotation writeback 改用 explicit assignment (`|=` for set, `&= !mask` for clear)。`set_bit` 保留给 `new()` 初始 state (从 0) 和 rotate 输出 (新数组) 安全使用。
+
+#### Fix B: `is_identity` propagation 缺失 (Reviewer 标 ⚠️ WARNING 1)
+
+EccChip 算术(add/double/select/fixed_base window)无条件发 `is_identity: false`。如果 `scalar_mul(P, 0)` 走完,最终结果是 (0, 0) witness 但 `is_identity: false`,后续 `assert_on_curve` 会触发 real-curve gate。
+
+修复:所有 5 个算术函数都传播 `is_identity`:
+- `add(identity, identity)` → identity (short-circuit)
+- `add(identity, P)` → P (short-circuit, 避免 0/0 lambda inversion)
+- `add(P, identity)` → P
+- `double(identity)` → identity (short-circuit, 避免 0 inversion)
+- `select_bool(bit, p1, p2)` → 根据 bit 取 p1.is_identity / p2.is_identity
+- `fixed_base_scalar_mul` window: digit==0 → identity, else real
+
+新 test `test_ecc_identity_propagation` 7 个 case 全过,MockProver 0 errors。
+
+### 跟踪到 plan / out-of-scope
+
+#### ISSUE-1.3.A: `grain.rs` `set_bit` footgun
+
+`set_bit` 用 `|=` (OR) 是 footgun。下次 refactor 如果又有人把它用到 post-rotation writeback,LFSR 会再退化。
+
+**建议** (Phase 1.5+):删除 `set_bit`,把 `new()` 和 rotate 的 `|=` inline 写,或者改名为 `set_bit_into_zero_state` 让前置条件显式。1.3 不动。
+
+#### ISSUE-1.3.B: on-curve gate Grumpkin/Vesta 曲率不匹配 (pre-existing)
+
+`aetheris-recursive/src/lib.rs:411-418` `on_curve_check` gate 硬编码 `y² = x³ + 3` (Grumpkin, b=3),但 `EccChip::generator()` (`lib.rs:523-535`) 返回 `VestaAffine::generator()`,Vesta 曲线 `y² = x³ + 5` (b=5)。任何对 Vesta real 点的 `assert_on_curve` 会触发 gate 失败(已知在 A-14, B-21 列出)。
+
+**1.3 不动** — 这是 1.4 Pasta 迁移范围。`test_ecc_identity_propagation` 已显式只对 identity 调 `assert_on_curve`,real 点只检查 `is_identity` flag,避免触发这个 pre-existing bug。
+
+### Test counts
+
+| Crate | Tests | Pass | Fail |
+|-------|-------|------|------|
+| `aetheris-recursive --lib` | 12 | 12 | 0 |
+| `aetheris-recursive --tests` (integration) | 4 | 4 | 0 |
+| `aetheris-zkp --lib` | 56 | 56 | 0 |
+| `aetheris-core --lib` | 21 | 21 | 0 |
+| `aetheris-crypto --lib` | 38 | 38 | 0 |
+| `cargo check --workspace` | n/a | n/a | 0 errors, 0 new warnings |
+| **Total** | **131** | **131** | **0** |
+
+`aetheris-zkp` 有 3 个 pre-existing warnings (Phase 1.1.5 之前就在:`strategy.rs:369` unused `ParamsVerifier` import, `halo2_pasta.rs:947` unused `RngCore` import, `halo2_pasta.rs:993` unused `n` variable)。
+
+### Diff 范围
+
+`git diff --stat HEAD`:
+- `aetheris-recursive/src/lib.rs`: -802 net LoC
+- `aetheris-recursive/src/grain.rs`: +152 new
+- `aetheris-recursive/tests/compat_test.rs`: -8 LoC (test assertion 改)
+- 新增 test function `test_ecc_identity_propagation` (~90 LoC)
+
+**Phase 1.3 范围严格 bounded 到 `aetheris-recursive/`,未触及任何其他 crate。**

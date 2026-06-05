@@ -63,22 +63,15 @@ mod tests {
     #[test]
     fn test_manager_proof_generation() {
         println!("[Test] Starting test_manager_proof_generation");
-        // PeerId requires libp2p dependency, ensure it is in dev-dependencies or use mock
-        // Assuming libp2p is available as it is used in lib.rs
         let mut manager = P2PRecursiveManager::new(libp2p::PeerId::random(), 1);
-        // Preload params (mock) - Use smaller K for test if possible, but params usually require min K
-        // Using K=8 for speed in test if circuit allows, otherwise it will panic during keygen
-        // The circuit has lookup tables which might require higher K.
-        // RangeCheckChip<12> requires 2^12 rows, so K must be >= 12.
-        // Let's try K=13.
-        manager.preload_params(13); 
+        manager.preload_params(13);
         println!("[Test] Preload done");
-        
-        // Try generating an atomic proof
+
         let tx_id = [0u8; 32];
         let proof_json = manager.generate_atomic_proof(tx_id);
-        println!("[Test] Proof generated: {}", proof_json);
-        assert!(proof_json.contains("proof"));
+        println!("[Test] Proof response: {}", proof_json);
+        assert!(proof_json.contains("unavailable"));
+        assert!(proof_json.contains("Phase 1.4"));
     }
 
     #[test]

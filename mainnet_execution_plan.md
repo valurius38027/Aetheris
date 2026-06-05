@@ -243,9 +243,13 @@ Phase 4   生产就绪     ─→  文档/清理
    2. 删除 `KzgChip`（~200 行，无意义空操作）
    3. 删除 `AccumulatorChip`（~200 行，线性组合不是 accumulator）
    4. 删除旧的 `RecursiveAggregationCircuit`（~200 行，不是递归 SNARK）
-   5. 修复 `EccChip` identity 点 `(0,0)` 不在曲线上
-   6. Poseidon 用 Grain LFSR 生成标准参数
-- **验证**: `cargo check -p aetheris-recursive`
+   5. 修复 `EccChip` identity 点 `(0,0)` 不在曲线上 — 加 `is_identity: bool` 字段 + `EcPoint::identity()` ctor + `assert_on_curve` 跳过 selector + arithmetic (add/double/select_bool/fixed_base window) 传播 is_identity + 新 `test_ecc_identity_propagation` 覆盖 7 个 identity-producing 路径
+   6. Poseidon 用 Grain LFSR 生成标准参数 — 自写简化版 `aetheris-recursive/src/grain.rs`（无 `bitvec` 依赖,80-bit LFSR 复现 PSE recurrence,自包含自验证,200+ field elements 在 0.02s 内生成）
+- **验证**: `cargo check --workspace` 0 errors, `cargo test -p aetheris-recursive --tests` 16/16 pass
+- **已记录但不在 1.3 范围**:
+   - **ISSUE-1.3.A `grain.rs` `set_bit` footgun** — `set_bit` 用 `|=` (OR) 而非赋值,在 post-rotation writeback 上误用会导致 LFSR 退化到 all-1s。1.3 中已通过用 explicit assignment (`|=` for set, `&= !mask` for clear) 替代,保留 `set_bit` 仅在 `new()` 初始 state (从 0 开始) 和 rotate 计算 (输出新数组) 安全使用。**Phase 1.5+ 应考虑删除 `set_bit` 或改名为 `set_bit_into_zero_state` 让前置条件显式。**
+   - **ISSUE-1.3.B on-curve gate 曲率不匹配** — `EccConfig` 配置的 `on_curve_check` gate 硬编码 `y² = x³ + 3` (Grumpkin),但 `chip.generator()` 返回 Vesta 点 (Vesta 曲线 `y² = x³ + 5`)。任何对 Vesta real 点的 `assert_on_curve` 会触发 gate 失败。1.3 不动这个 (属于 1.4 Pasta 迁移范围),但 `test_ecc_identity_propagation` 已显式仅对 identity 调 `assert_on_curve`,对 Vesta real 点只检查 `is_identity` flag。
+- **当前 diff**: -802 net LoC in `aetheris-recursive/src/lib.rs` (2380→1578), +152 new `grain.rs`, +90 new test function. 范围 bounded 到 `aetheris-recursive/` only.
 
 ### 1.4 实现真实 IPA 积累（递归层）
 - **来源**: B-2, A-11 ~ A-15（原是 1.3）
