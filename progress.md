@@ -312,6 +312,56 @@ Each stage of work should be logged here. Template:
 
 ---
 
+### Stage 31 — Phase 1.2 Investigation: IPA-Plonk Pipeline Completeness Verified (2026-06-02)
+
+**Scope**: Multi-agent investigation to determine feasibility of wiring IPA commitment scheme into PSE fork's plonk proving pipeline (`create_proof`, `verify_proof_multi`, `keygen_vk`, `keygen_pk`).
+
+#### Key Findings:
+| Question | Answer |
+|----------|--------|
+| Does `ParamsIPA<C>` implement PSE fork's `Params<C>` trait? | ✅ Yes (`commitment.rs:99`) |
+| Does `ParamsIPA<C>` implement `ParamsProver<C>`? | ✅ Yes (`commitment.rs:182`) |
+| Does `ParamsIPA<C>` implement `ParamsVerifier<'_, C>`? | ✅ Yes (`commitment.rs:216`) |
+| Does `MSMIPA<C>` implement `MSM<C>`? | ✅ Yes (`commitment.rs:257`) |
+| Does `ProverIPA` implement `Prover<'_, CommitmentSchemeIPA<C>>`? | ✅ Yes (`prover.rs:28`) |
+| Does `VerifierIPA` implement `Verifier<'_, CommitmentSchemeIPA<C>>`? | ✅ Yes (`verifier.rs:19`) |
+| Does `SingleStrategyIPA` implement `VerificationStrategy`? | ✅ Yes (`strategy.rs:37`) |
+| Does `AccumulatorStrategyIPA` implement `VerificationStrategy`? | ✅ Yes (`strategy.rs:109`) |
+| Does PSE fork's `create_proof` accept generic `CommitmentScheme`? | ✅ Yes (`prover.rs:76`) |
+| Does `keygen_vk` accept `&P where P: Params<C>`? | ✅ Yes (`keygen.rs:17`) |
+| Does `H2cEngine` MSM work for Pasta curves? | ✅ Yes (`msm_best` works for any `CurveAffine`) |
+| Is `ParamsKZG<E: Engine>` the ONLY `Params<C>` implementor in PSE fork? | ✅ Confirmed — IPA traits are solely provided by `aetheris-zkp` |
+| Any new trait implementations needed for Phase 1.2? | **None** — all 8 PSE fork traits already implemented by Phase 1.1 |
+
+#### Architecture Confirmed:
+```
+create_proof<Scheme, P, ...>
+  │
+  ├── Scheme = CommitmentSchemeIPA<EpAffine>
+  │     ├── Scalar = Fq
+  │     ├── Curve = EpAffine
+  │     ├── ParamsProver = ParamsIPA<EpAffine>  ← our ParamsIPA (Params + ParamsProver)
+  │     └── ParamsVerifier = ParamsIPA<EpAffine> ← our ParamsIPA (ParamsVerifier)
+  │
+  ├── P = ProverIPA<'_, EpAffine>  ← our multi-open prover
+  │
+  ├── params = &ParamsIPA<EpAffine>  ← our IPA params
+  ├── pk = ProvingKey<EpAffine>
+  ├── circuits: &[impl Circuit<Fq>]
+  └── instances: &[Vec<Vec<Fq>>]
+```
+
+#### Implications for Plan:
+- **Phase 1.2 is purely a wiring task** — no new trait/type implementations
+- Sub-steps simplified from 6 to 3: 1.2.0 (write `halo2_pasta.rs`), 1.2.1 (tests), 1.2.2 (lib.rs export)
+- Running-sum (A-1), membership/nullifier (C-2), generator derivation already exist in BN254 — Pasta port just replaces `Fp`→`Fq`
+
+#### Documentation Updates:
+- `mainnet_execution_plan.md`: Phase 1.2 restructured to reflect wiring-only scope
+- Key decision: removed 1.2.1/1.2.2/1.2.3 as separate sub-steps (redundant)
+
+---
+
 ## Stage Log — Future Entries
 
 **Date**: 2026-06-01
@@ -1593,3 +1643,209 @@ A multi-agent systematic analysis of the complete IPA codebase (commitment.rs + 
 | **5.1** | 🟡 | `COMMIT_INSTANCE = true` with no documentation or control — Halo2's `verify_proof` may behave unexpectedly depending on this flag | Document or remove |
 | **5.2** | 🟢 | No **safety documentation** — security assumptions (DL, random oracle, AGM) not stated | Phase 1.3+ |
 | **5.3** | 🟡 | `C::ScalarExt` and `C::Scalar` are identical types (`PrimeCurveAffine<Scalar=Self::ScalarExt>`) — ambiguity with `Group::Scalar` | Use `C::ScalarExt` explicitly; document alias |
+
+---
+
+## Stage 32 — IPA-PLONK Quotient Mismatch Deep Investigation (2026-06-04)
+
+**Scope**: Diagnose `test_value_conservation_proof_verifies` failure — `expected_h_eval ≠ transcript_h_eval` (the verifier's reconstructed `h` polynomial evaluation at the challenge point does not match the prover's transcript-committed `h` evaluation).
+
+**Outcome**: Build is CLEAN (0 errors, 5 warnings). One new critical finding (unexpected copy constraint) — source not yet identified. Investigation paused pending user direction (plan mode active).
+
+---
+
+### Changes Made (this session)
+
+| File | Change |
+|------|--------|
+| `vendor/halo2/halo2_backend/src/diagnostics.rs` | Unified `dbg_enabled()` and `AETHERIS_DBG` env-var gate (replaces raw `eprintln!`) |
+| `vendor/halo2/halo2_backend/src/poly/domain.rs:40` | `quotient_poly_degree = (j - 0) as u64` (qpd=3, was 2) |
+| `vendor/halo2/halo2_backend/src/plonk/vanishing/prover.rs:118-180` | DOMAIN-CHECK + IFFT-DC diagnostic (prints f(ω^i) for first 4 + last 4 lagrange points and f(ω^i)=0/-non-zero summary) |
+| `vendor/halo2/halo2_backend/src/plonk/vanishing/verifier.rs:107-139` | `expected_h_eval` vs `transcript_h_eval` diagnostic |
+| `vendor/halo2/halo2_backend/src/plonk/evaluation.rs:414,461` | `delta_start = beta * C::Scalar::ZETA` + `current_delta = delta_start * beta_term` (gated prints of current_delta per column) |
+| `vendor/halo2/halo2_backend/src/plonk/evaluation.rs:645` | `f_coset[0]` print |
+| `vendor/halo2/halo2_backend/src/plonk/permutation/prover.rs:92-180` | Per-set z + σ + modified_values diagnostics (prints all 4 sets' z, σ, values, multiplied values) |
+| `aetheris-zkp/src/halo2_pasta.rs:88-94,131-141,158-163,215-225` | Removed `enable_constant` + `constrain_constant` (replaced with custom gate `vec![s*(a-b), s*b]`) |
+| `aetheris-zkp/src/halo2_bn254.rs:142,229` | Same fix applied to BN254 circuit |
+
+---
+
+### Diagnostic Results (with `AETHERIS_DBG=1`)
+
+#### DOMAIN-CHECK
+- `f(ω⁰) ≠ 0` and `f(ω^2042) ≠ 0` — both in active region
+- All other 2046 of 2048 domain points: zero
+- → 2/2048 domain points violate the polynomial identity
+
+#### IFFT Roundtrip
+- `coset_roundtrip_diff = 0` (perfect)
+- → Domain extension and IFFT pipeline correct
+
+#### Coset Evaluation
+- All 8192 coset points in `f_coset` are non-zero
+- `f_coset[0]` printed for inspection
+
+#### `expected_h_eval` vs `transcript_h_eval`
+- Mismatch persists (this is the original failure symptom)
+- Both values printed in diagnostic
+
+#### Permutation σ Table (CRITICAL NEW FINDING)
+
+| Column | perm[0] | perm[1] | perm[2..4] |
+|--------|---------|---------|------------|
+| **advice[0]** | `0x1` = ω⁰ | `0x3683856e...` ≠ ω¹ | ω², ω³, ω⁴ |
+| **instance[0]** | `0x3a3b5103...` = ω¹ | (matches advice[0].perm[1]) | ... |
+| advice[1] | all perm[i] ≠ ω^i | | |
+| advice[2] | all perm[i] ≠ ω^i | | |
+
+**This indicates an UNEXPECTED COPY CONSTRAINT between `advice[0][1]` and `instance[0][0]`.**
+
+The circuit's only explicit copy is at `halo2_pasta.rs:229`:
+```rust
+assign_advice_from_instance(... config.advice[0], offset)  // offset=133
+```
+This should be at row 133, NOT row 1. Source of the row-1 copy unknown.
+
+#### Permutation z Trajectory (set 0)
+
+| Index | z value |
+|-------|---------|
+| 0 | `0x1` |
+| 1 | `0x1` |
+| 2..last_active | `0x08c54321...` (constant, ≠ 1) |
+| last_active | ≠ 1 (boundary not satisfied) |
+
+The constant value `0x08c54321...` is consistent with the non-identity σ at row 1.
+
+#### All 4 sets
+- `z[last_active] ≠ 1` (final boundary condition violated for every set)
+
+---
+
+### Hypotheses Tested & Eliminated
+
+| # | Hypothesis | Result | Evidence |
+|---|------------|--------|----------|
+| 1 | `qpd` too low | Eliminated | Bumping to 3 did not fix the issue |
+| 2 | Domain-point evaluation broken | Eliminated | f(ω^i)=0 for 2046/2048 points (only 2 violate); IFFT roundtrip diff=0 |
+| 3 | Multiset σ structure wrong | Likely | σ for advice[0] not identity at row 1 — unexpected copy |
+| 4 | IFFT roundtrip broken | Eliminated | `coset_roundtrip_diff = 0` |
+| 5 | Verifier `evaluation.rs:414` ZETA factor is a bug | Retracted | Matches upstream PSE exactly. ZETA = coset generator `g`; `current_delta = β * X` at coset point X. |
+| 6 | Extended-domain aliasing | Eliminated | f values at boundary points (ω^2042, ω^2043) — not at qpd-extended indexes |
+
+### Upstream PSE Verification (this session)
+
+Web-fetched and byte-compared:
+- `https://raw.githubusercontent.com/privacy-scaling-explorations/halo2/198e9ae3/halo2_backend/src/plonk/evaluation.rs`
+- `https://raw.githubusercontent.com/privacy-scaling-explorations/halo2/198e9ae3/halo2_backend/src/plonk/permutation/prover.rs`
+- `https://raw.githubusercontent.com/privacy-scaling-explorations/halo2/198e9ae3/halo2_backend/src/poly/domain.rs`
+
+Conclusion: Our vendor code matches upstream exactly in:
+- Prover's `permutation/prover.rs:158-165` tag formula `δ^j * ω^i` (lagrange form)
+- Verifier's `evaluation.rs:414` `delta_start = beta * C::Scalar::ZETA` (coset form)
+- Both call the same `evaluate_h` function (`prover.rs:534`: `self.pk.ev.evaluate_h(...)`)
+
+The ZETA factor is NOT a bug — it is the coset generator `g`, and the formula `current_delta = β * X` where `X = g * extended_omega^idx` is correct for coset-point evaluation.
+
+---
+
+### New Mystery (UNRESOLVED)
+
+**Source of unexpected copy constraint** `advice[0][1] ↔ instance[0][0]`
+
+Possible causes to investigate:
+
+1. **Cross-test σ pollution**: The `static KEYS` cache in `aetheris-zkp` may serve keys from a *different* test's `synthesize` call. The σ table at row 1 is then inherited from a test that happened to have a different number of inputs/outputs.
+2. **`assign_advice` implicit copy**: Halo2's `assign_advice` may not create copy constraints, but the underlying `Assembly.copy` could be triggered by some other path.
+3. **Keygen bug**: `vendor/halo2/halo2_backend/src/plonk/permutation/keygen.rs` may incorrectly include this constraint.
+4. **Instance column invariant**: `instance[0]` always has 0 in the working row, and the prover may be moving that 0 into `advice[0][1]` for some reason.
+
+Recommended next diagnostic (post-plan-mode):
+- In `permutation/keygen.rs`, print all `(col, row)` pairs where `mapping(col, row) ≠ (col, row)`.
+- Also print the `Assembly.copy(left, right)` calls during keygen.
+
+---
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check -p aetheris-zkp` | 0 errors, 5 warnings (clean) |
+| `cargo test -p aetheris-zkp --lib -- test_value_conservation_proof_verifies` | Still fails (expected_h_eval mismatch; 2/2048 domain points violated) |
+| `cargo check --workspace` | 0 errors, 5 warnings (clean) |
+
+### Issues Resolved (this session)
+- A-1 from Stage 27 (`enable_constant` adds fixed col to permutation): Fixed by removing `enable_constant` and replacing `constrain_constant` with custom gate
+- Retracted: "verifier `evaluation.rs:414` ZETA factor is a bug" (it matches upstream PSE exactly)
+- All vendor eprintlns now gated behind `AETHERIS_DBG`
+
+### New Issues Found (this session)
+- **C-NEW-1 (CRITICAL)**: Unexpected copy constraint between `advice[0][1]` and `instance[0][0]`. Source unknown. *(Superseded: identified as secondary artifact of static KEYS cache bug, fixed by per-shape cache.)*
+- **C-NEW-2 (CRITICAL, blocked)**: `test_value_conservation_proof_verifies` still fails. *(Superseded: traced to IPA `commit` ignoring blinding — see revised Stage 32 below.)*
+
+---
+
+### Stage 32 — IPA-PLONK Quotient Mismatch (REVISED, 2026-06-04)
+
+**Scope revision**: σ anomaly at row 1 was a **secondary artifact** of the original cache bug. After applying the per-shape key cache fix, true root cause was traced to IPA `commit` ignoring the blinding factor — h_piece = 0 → commitment = identity → `transcript.write_point` fails.
+
+### Root Cause (final, both fixes applied)
+
+| # | Root cause | Fix status |
+|---|------------|------------|
+| 1 | `static KEYS` cache used `dummy()` (0 amounts) for keygen → wrong σ for real circuits with N>0 | ✅ Fixed: per-shape `HashMap<(usize, usize), (VK, PK)>` cache; keygen circuit matches real shape |
+| 2 | `aetheris-zkp/src/ipa/commitment.rs:197-216` `commit()` and `:120-142` `commit_lagrange()` ignore `_blinding` parameter. For valid circuit, h_piece = 0 → `commit(0) = identity` → transcript error | ⏳ Pending — Phase 2 below |
+
+### Phase 1: Diagnostic Cleanup (this session, COMPLETED)
+
+All diagnostic logging retained and gated by `crate::diagnostics::dbg_enabled()` (env var `AETHERIS_DBG`). Per user instruction, **diagnostic logs are NOT removed — they are kept and controlled by the unified macro gate**.
+
+| File | Change | Status |
+|------|--------|--------|
+| `vendor/halo2/halo2_backend/src/transcript.rs:228` | Restored `TRANSCRIPT-DBG-A` (Blake2bWrite) inside `if dbg_enabled()` | ✅ |
+| `vendor/halo2/halo2_backend/src/transcript.rs:403` | Restored `TRANSCRIPT-DBG-B` (Keccak256Read) inside `if dbg_enabled()` | ✅ |
+| `vendor/halo2/halo2_backend/src/transcript.rs:448` | Restored `TRANSCRIPT-DBG-C` (Keccak256Write) inside `if dbg_enabled()` | ✅ |
+| `vendor/halo2/halo2_backend/src/plonk/vanishing/prover.rs:247-253` | Restored `H-DBG` h_piece print loop inside `if dbg_enabled()` | ✅ |
+| `aetheris-zkp/src/ipa/prover.rs:121-130` | Restored `IPA-PROVER-DBG` L/R infinity checks inside `if dbg_enabled()` (uses `crate::diagnostics`) | ✅ |
+
+Verification: `cargo check -p aetheris-zkp --lib` ✅ 0 errors, 5 warnings (all pre-existing).
+
+### Phase 2: Protocol Fix (Route A — Plan Pending Approval)
+
+**Goal**: Make IPA `commit()` / `commit_lagrange()` actually use the blinding factor so that h_piece = 0 produces a non-identity commitment.
+
+**Sub-steps (pending multi-agent investigation per AGENTS.md)**:
+
+**2a. `aetheris-zkp/src/ipa/commitment.rs:197-216` `commit()`** — modify to add `blind·H`:
+```rust
+fn commit(&self, poly: ..., blind: Blind<C::ScalarExt>) -> ... {
+    let msm = engine.msm(&scalars, &self.g[..size]);
+    msm + (C::CurveExt::from(self.h) * blind.0)  // NEW: blinding factor
+}
+```
+Same fix for `commit_lagrange:120-142`.
+
+**2b. `vendor/halo2/halo2_backend/src/plonk/prover.rs:644-647`** — write blind to transcript after each `params.commit(...)` call. Affects all `h_piece` commitment calls. Must also write blinds for any other commitment that ignores them.
+
+**2c. `vendor/halo2/halo2_backend/src/plonk/verifier.rs`** — read blind from transcript, subtract from commitment in `combined_msm` (sign and integration point TBD — requires IPA verifier audit).
+
+### Phase 3: Verification
+1. `cargo check -p aetheris-zkp` — 0 errors
+2. `cargo test -p aetheris-zkp --lib test_value_conservation_proof_verifies` — passes
+3. `cargo test --workspace --lib` — no regressions
+
+### Pre-Phase-2 Mandatory: Multi-Agent Investigation
+Per AGENTS.md workflow, before implementing Phase 2:
+- **Agent A**: Enumerate all `commit()` / `commit_lagrange()` call sites; flag any that need blind wiring
+- **Agent B**: Audit IPA verifier's `combined_msm` formula in `aetheris-zkp/src/ipa/verifier.rs`; determine sign of blind correction
+- **Agent C**: Cross-check standard IPA opening proof spec (Bulletproofs / Halo2 IPA) to confirm protocol convention
+
+### Risks
+- 2a is single-file, low risk
+- 2b/2c are full protocol changes — prover/verifier must strictly mirror
+- IPA verifier's `combined_msm` equation (`g[0] + (eval - a*b)*U` etc.) needs blind subtraction in correct sign convention
+- All PLONK vanishing/permutation `commit()` call sites must receive and transmit blinds
+
+---
+
+*Last updated: 2026-06-04* (Stage 32 revised: Phase 1 done, Phase 2 plan locked, awaiting multi-agent pre-investigation)

@@ -11,6 +11,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aetheris_node::state::LedgerState;
+use aetheris_zkp::ZkProverSystem;
 use bincode;
 
 struct Mempool {

@@ -1,5 +1,5 @@
-/// Per-tx commitment set (one entry per output)
-pub type TxCommitments = Vec<Vec<[u8; 32]>>;
+/// Per-tx commitment set (flat list of output commitments)
+pub type TxCommitments = Vec<[u8; 32]>;
 
 /// Abstract ZK proving system interface.
 /// V1 uses Halo2Backend (Halo2 + Pasta curves).
@@ -10,20 +10,23 @@ pub trait ZkProverSystem: Sized {
     type VerifyingKey;
 
     fn ensure_params() -> &'static Self::Params;
-    fn ensure_keys() -> (&'static Self::VerifyingKey, &'static Self::ProvingKey);
+    fn ensure_keys(
+        amounts_in_len: usize,
+        amounts_out_len: usize,
+    ) -> (Self::VerifyingKey, Self::ProvingKey);
 
     fn prove_conservation(
         amounts_in: &[u64],
         amounts_out: &[u64],
-        in_blindings: &[&[u8; 32]],
-        out_blindings: &[&[u8; 32]],
-        output_commitments: &[Vec<[u8; 32]>],
+        in_blindings: &[[u8; 32]],
+        out_blindings: &[[u8; 32]],
+        output_commitments: &[[u8; 32]],
         public_amount: i64,
     ) -> Vec<u8>;
 
     fn verify_conservation(
         proof: &[u8],
-        output_commitments: &[Vec<[u8; 32]>],
+        output_commitments: &[[u8; 32]],
         public_amount: i64,
     ) -> bool;
 

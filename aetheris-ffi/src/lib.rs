@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
-use aetheris_zkp::ZKProofSystem;
+use aetheris_zkp::{ZKProofSystem, ZkProverSystem};
 use bip39::{Mnemonic};
 use tiny_keccak::{Hasher, Keccak};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore};

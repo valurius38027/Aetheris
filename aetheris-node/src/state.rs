@@ -1,6 +1,6 @@
 use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
-use aetheris_zkp::build_merkle_root;
+use aetheris_zkp::{build_merkle_root, ZkProverSystem};
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;

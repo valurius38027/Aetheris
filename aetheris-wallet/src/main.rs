@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use bip39::{Mnemonic, Language, MnemonicType, Seed};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use aetheris_core::{Transaction, ShieldedOutput};
-use aetheris_zkp::{ZKProofSystem, create_commitment, create_nullifier};
+use aetheris_zkp::{ZKProofSystem, ZkProverSystem, create_commitment, create_nullifier};
 use std::fs;
 use anyhow::{Result, anyhow};
 use zeroize::Zeroize;

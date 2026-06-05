@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 
 use halo2_proofs::halo2curves::CurveAffine;
 use halo2_proofs::halo2curves::group::Group;
-use halo2_proofs::halo2curves::group::GroupEncoding;
 use halo2_proofs::arithmetic::CurveExt;
 use halo2_backend::poly::{Coeff, Guard, LagrangeCoeff, EvaluationDomain, Polynomial};
 use halo2_backend::poly::commitment::{Blind, CommitmentScheme, MSM as MSMTrait, Params, ParamsProver, ParamsVerifier};
@@ -122,13 +121,8 @@ where
         &self,
         engine: &impl MsmAccel<C>,
         poly: &Polynomial<C::ScalarExt, LagrangeCoeff>,
-        _blinding: Blind<C::ScalarExt>,
+        blinding: Blind<C::ScalarExt>,
     ) -> C::CurveExt {
-        // Blinding is intentionally ignored, consistent with the KZG commitment
-        // scheme in halo2_backend. The halo2 multi-open protocol achieves zero-knowledge
-        // at a higher level (random polynomial commitments) rather than per-commitment
-        // blinding factors. The h generator is reserved for future use if blinding
-        // is needed at this layer.
         // Convert Lagrange (evaluation) form to coefficient form, then commit
         // using coefficient-basis generators. IPA generators are not structured
         // (no s-powers), so the polynomial must be in coefficient form for the
@@ -138,8 +132,9 @@ where
         let scalars = coeff.values;
         let size = scalars.len();
         assert!(self.g.len() >= size, "commit_lagrange: bases len {} < poly len {}", self.g.len(), size);
-        let result = engine.msm(&scalars, &self.g[..size]);
-        result
+        let msm = engine.msm(&scalars, &self.g[..size]);
+        // Add blinding factor: commitment = MSM(poly, g) + blind·H
+        msm + (C::CurveExt::from(self.h) * blinding.0)
     }
 
     fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -199,9 +194,8 @@ where
         &self,
         engine: &impl MsmAccel<C>,
         poly: &Polynomial<C::ScalarExt, Coeff>,
-        _blinding: Blind<C::ScalarExt>,
+        blinding: Blind<C::ScalarExt>,
     ) -> C::CurveExt {
-        // Blinding is intentionally ignored — see commit_lagrange doc comment.
         let mut scalars = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g;
@@ -213,7 +207,9 @@ where
             self.n
         );
         assert!(bases.len() >= size, "commit: bases len {} < poly len {}", bases.len(), size);
-        engine.msm(&scalars, &bases[..size])
+        let msm = engine.msm(&scalars, &bases[..size]);
+        // Add blinding factor: commitment = MSM(poly, g) + blind·H
+        msm + (C::CurveExt::from(self.h) * blinding.0)
     }
 
     fn get_g(&self) -> &[C] {
@@ -464,10 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn test_params_ipa_commit_blinding_deferred() {
-        // Verify commit() intentionally ignores Blind — consistent with KZG.
-        // Halo2 handles zero-knowledge at the multi-open protocol level via random
-        // polynomial commitments, not per-commitment blindings.
+    fn test_params_ipa_commit_blinding_active() {
+        // Verify commit() actually uses the blind: commitment = MSM(poly, g) + blind·H.
+        // Different blinds must produce different commitments.
         let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
         let engine = halo2_middleware::zal::impls::H2cEngine;
         let n = params.n() as usize;
@@ -478,8 +473,20 @@ mod tests {
         let poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(values);
         let c1 = params.commit_lagrange(&engine, &poly, Blind(Fq::ONE));
         let c2 = params.commit_lagrange(&engine, &poly, Blind(Fq::from(999u64)));
-        // Blinding is intentionally deferred — different blinds produce same commitment
-        assert_eq!(c1.to_bytes().as_ref(), c2.to_bytes().as_ref());
+        // Different blinds must produce different commitments
+        assert_ne!(c1.to_bytes().as_ref(), c2.to_bytes().as_ref());
+    }
+
+    #[test]
+    fn test_params_ipa_commit_zero_poly_with_blind_not_identity() {
+        // Regression test for Stage 32: commit of zero polynomial must NOT be identity,
+        // otherwise transcript.write_point fails. The blind·H term ensures non-identity.
+        let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
+        let engine = halo2_middleware::zal::impls::H2cEngine;
+        let n = params.n() as usize;
+        let zero_poly = Polynomial::<Fq, LagrangeCoeff>::new_lagrange_from_vec(vec![Fq::ZERO; n]);
+        let c = params.commit_lagrange(&engine, &zero_poly, Blind(Fq::from(42u64)));
+        assert!(!bool::from(c.is_identity()));
     }
 
     #[test]

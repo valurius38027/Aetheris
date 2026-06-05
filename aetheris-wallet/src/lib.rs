@@ -3,7 +3,7 @@ mod tests {
     use bip39::{Mnemonic, Language, MnemonicType, Seed};
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use aetheris_core::{Transaction, ShieldedOutput};
-    use aetheris_zkp::{create_commitment, create_nullifier, ZKProofSystem};
+    use aetheris_zkp::{create_commitment, create_nullifier, ZKProofSystem, ZkProverSystem};
 
     fn create_wallet_from_phrase(phrase: &str) -> (SigningKey, VerifyingKey) {
         let mnemonic = Mnemonic::from_phrase(phrase, Language::English).unwrap();

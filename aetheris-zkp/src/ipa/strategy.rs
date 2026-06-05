@@ -152,6 +152,7 @@ mod tests {
     use halo2_backend::poly::query::{ProverQuery, VerifierQuery};
     use halo2_backend::poly::Coeff;
     use halo2_backend::poly::Polynomial;
+    use halo2_middleware::zal::impls::H2cEngine;
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::halo2curves::group::Curve as GroupCurve;
     use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
@@ -361,5 +362,199 @@ mod tests {
         assert!(result.is_ok(), "accumulator process should succeed");
         let strategy = result.unwrap();
         assert!(strategy.finalize(), "accumulator should verify the proof");
+    }
+
+    #[test]
+    fn test_multi_point_ipa_roundtrip() {
+        use halo2_backend::poly::commitment::ParamsVerifier;
+
+        let engine = H2cEngine::new();
+        let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
+        let n = params.n() as usize;
+
+        // Two different evaluation points
+        let point_a = Fq::from(3u64);
+        let point_b = Fq::from(7u64);
+
+        // Create polynomials
+        let mut poly0 = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        let mut poly1 = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        let mut poly2 = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        for i in 0..n {
+            poly0[i] = Fq::from((i + 1) as u64);
+            poly1[i] = Fq::from((i + 100) as u64);
+            poly2[i] = Fq::from((i + 200) as u64);
+        }
+
+        // Commit each polynomial
+        let c0 = params.commit(&engine, &poly0, Blind(Fq::ZERO));
+        let c1 = params.commit(&engine, &poly1, Blind(Fq::ZERO));
+        let c2 = params.commit(&engine, &poly2, Blind(Fq::ZERO));
+
+        // Compute evals
+        fn eval_poly(poly: &Polynomial<Fq, Coeff>, at: Fq) -> Fq {
+            let mut e = Fq::ZERO;
+            let mut pow = Fq::ONE;
+            for &c in poly.values.iter() {
+                e += c * pow;
+                pow *= at;
+            }
+            e
+        }
+
+        // Point A: 2 queries (poly0 and poly1 at point_a)
+        // Point B: 1 query (poly2 at point_b)
+        let e0_a = eval_poly(&poly0, point_a);
+        let e1_a = eval_poly(&poly1, point_a);
+        let e2_b = eval_poly(&poly2, point_b);
+
+        // PROVER
+        let mut transcript =
+            Blake2bWrite::<Vec<u8>, EpAffine, Challenge255<EpAffine>>::init(Vec::new());
+        transcript.common_point(c0.to_affine()).expect("c0");
+        transcript.common_point(c1.to_affine()).expect("c1");
+        transcript.common_point(c2.to_affine()).expect("c2");
+
+        let prover = ProverIPA::new(&params);
+        let prover_queries = vec![
+            ProverQuery::new(point_a, &poly0, Blind(Fq::ZERO)),
+            ProverQuery::new(point_a, &poly1, Blind(Fq::ZERO)),
+            ProverQuery::new(point_b, &poly2, Blind(Fq::ZERO)),
+        ];
+        prover
+            .create_proof_with_engine(&engine, OsRng, &mut transcript, prover_queries)
+            .expect("prover ok");
+        let proof_bytes = transcript.finalize();
+
+        // VERIFIER
+        let mut transcript =
+            Blake2bRead::<&[u8], EpAffine, Challenge255<EpAffine>>::init(&proof_bytes[..]);
+        transcript.common_point(c0.to_affine()).expect("c0");
+        transcript.common_point(c1.to_affine()).expect("c1");
+        transcript.common_point(c2.to_affine()).expect("c2");
+
+        let c0_affine = c0.to_affine();
+        let c1_affine = c1.to_affine();
+        let c2_affine = c2.to_affine();
+
+        let verifier = VerifierIPA::<EpAffine>::new();
+        let strategy = SingleStrategyIPA::new(&params);
+
+        let verifier_queries = vec![
+            VerifierQuery::new_commitment(&c0_affine, point_a, e0_a),
+            VerifierQuery::new_commitment(&c1_affine, point_a, e1_a),
+            VerifierQuery::new_commitment(&c2_affine, point_b, e2_b),
+        ];
+
+        let result = strategy.process(|msm| {
+            verifier
+                .verify_proof(&mut transcript, verifier_queries, msm)
+                .map_err(|_| Error::Opening)
+        });
+        assert!(result.is_ok(), "multi-point IPA verify should succeed");
+        let strategy = result.unwrap();
+        assert!(strategy.finalize(), "multi-point IPA proof should verify");
+    }
+
+    #[test]
+    fn test_multi_query_ipa_roundtrip() {
+        use halo2_backend::poly::commitment::ParamsVerifier;
+
+        let engine = H2cEngine::new();
+        let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
+        let n = params.n() as usize;
+
+        // Simulate PLONK's multi-query scenario at one point:
+        // - h_poly is a COMBINED polynomial (like h0 + x^n * h1)
+        // - random_poly is a single polynomial
+        // Both opened at the same point x.
+
+        let xn = Fq::from(16u64);
+        let point = Fq::from(7u64);
+
+        let mut h0 = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        let mut h1 = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        for i in 0..n {
+            h0[i] = Fq::from((i + 1) as u64);
+            h1[i] = Fq::from((i + 100) as u64);
+        }
+
+        // Combined h_poly = h0 + xn * h1
+        let mut h_poly = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        for i in 0..n {
+            h_poly[i] = h0[i] + xn * h1[i];
+        }
+
+        // Commit pieces individually
+        let c0 = params.commit(&engine, &h0, Blind(Fq::ZERO));
+        let c1 = params.commit(&engine, &h1, Blind(Fq::ZERO));
+
+        // Build MSM commitment matching h_poly:
+        // commit(h_poly) = commit(h0 + xn*h1) = c0 + xn*c1
+        let mut h_msm = params.empty_msm();
+        h_msm.append_term(Fq::ONE, c0);
+        h_msm.append_term(xn, c1);
+
+        // Create random_poly and its commitment
+        let mut random_poly = Polynomial::<Fq, Coeff>::new_empty(n, Fq::ZERO);
+        for i in 0..n {
+            random_poly[i] = Fq::from((i + 200) as u64);
+        }
+        let random_commit = params.commit(&engine, &random_poly, Blind(Fq::ZERO));
+
+        // Eval helper
+        fn eval_poly(poly: &Polynomial<Fq, Coeff>, at: Fq) -> Fq {
+            let mut e = Fq::ZERO;
+            let mut pow = Fq::ONE;
+            for &c in poly.values.iter() {
+                e += c * pow;
+                pow *= at;
+            }
+            e
+        }
+
+        let h_eval = eval_poly(&h_poly, point);
+        let random_eval = eval_poly(&random_poly, point);
+
+        // PROVER
+        let mut transcript =
+            Blake2bWrite::<Vec<u8>, EpAffine, Challenge255<EpAffine>>::init(Vec::new());
+        transcript.common_point(c0.to_affine()).expect("c0 cp");
+        transcript.common_point(c1.to_affine()).expect("c1 cp");
+        transcript.common_point(random_commit.to_affine()).expect("random cp");
+
+        let prover = ProverIPA::new(&params);
+        let queries = vec![
+            ProverQuery::new(point, &h_poly, Blind(Fq::ZERO)),
+            ProverQuery::new(point, &random_poly, Blind(Fq::ZERO)),
+        ];
+        prover
+            .create_proof_with_engine(&engine, OsRng, &mut transcript, queries)
+            .expect("prover ok");
+        let proof_bytes = transcript.finalize();
+
+        // VERIFIER
+        let mut transcript =
+            Blake2bRead::<&[u8], EpAffine, Challenge255<EpAffine>>::init(&proof_bytes[..]);
+        transcript.common_point(c0.to_affine()).expect("c0 cp");
+        transcript.common_point(c1.to_affine()).expect("c1 cp");
+        transcript.common_point(random_commit.to_affine()).expect("random cp");
+
+        let verifier = VerifierIPA::<EpAffine>::new();
+        let strategy = SingleStrategyIPA::new(&params);
+
+        let random_commit_affine = random_commit.to_affine();
+        let query_h = VerifierQuery::new_msm(&h_msm, point, h_eval);
+        let query_random = VerifierQuery::new_commitment(&random_commit_affine, point, random_eval);
+        let queries = vec![query_h, query_random];
+
+        let result = strategy.process(|msm| {
+            verifier
+                .verify_proof(&mut transcript, queries, msm)
+                .map_err(|_| Error::Opening)
+        });
+        assert!(result.is_ok(), "multi-query IPA verify should succeed");
+        let strategy = result.unwrap();
+        assert!(strategy.finalize(), "multi-query IPA proof should verify");
     }
 }
