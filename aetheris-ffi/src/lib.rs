@@ -529,7 +529,12 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                             let _ = network.swarm.behaviour_mut().gossipsub.publish(network.sync_topic.clone(), data);
                                         }
                                     }
-                                    NetworkCommand::BroadcastMixnetPK(pk) => {
+                                    NetworkCommand::BroadcastAggregateGossip(gossip) => {
+                        let json = serde_json::to_string(&gossip).unwrap_or_default();
+                        // FFI: log the gossip; actual broadcast is handled by the P2P event loop
+                        println!("[FFI] BroadcastAggregateGossip: {} ({:.1}KB)", hex::encode(&gossip.aggregate_id[..4]), json.len() as f64 / 1024.0);
+                    }
+                    NetworkCommand::BroadcastMixnetPK(pk) => {
                                         let _ = network.broadcast_mixnet_pk(pk);
                                     }
                                 }

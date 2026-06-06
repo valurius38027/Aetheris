@@ -61,7 +61,6 @@ use halo2curves::group::prime::PrimeCurveAffine;
 use ff::{Field, PrimeField};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 use std::str::FromStr;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -1176,10 +1175,13 @@ pub struct AtomicProofGossip {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregateProofGossip {
     pub aggregate_id: [u8; 32],
-    pub statement: RecursiveStatement,
-    pub proof: Vec<u8>,
+    pub accumulator: Vec<u8>,
+    pub prev_accumulator: Vec<u8>,
+    pub proofs: Vec<Vec<u8>>,
+    pub commitments_list: Vec<Vec<[u8; 32]>>,
+    pub public_amounts: Vec<i64>,
     pub depth: u32,
-    pub leaf_txs: Vec<[u8; 32]>,
+    pub timestamp: u64,
 }
 
 // --- Manager and FFI ---
@@ -1194,15 +1196,13 @@ pub struct AggregateProofGossip {
 pub struct P2PRecursiveManager {
     peer_id: PeerId,
     shard_id: u32,
-    reward_pool: HashMap<String, u64>,
-    proof_cache: HashMap<String, String>, // tx_id -> proof_json
-    known_peers: Vec<PeerId>,
 
     // Protocol state
     seen_atomic: HashSet<[u8; 32]>,
     seen_aggregate: HashMap<[u8; 32], u32>, // aggregate_id -> depth
     pending_atomic: Vec<AtomicProofGossip>,
-    last_aggregation: Instant,
+    last_gossip_time: std::time::Instant,
+    gossip_count_in_window: u32,
 }
 
 pub struct RecursiveManagerHandle {
@@ -1214,18 +1214,16 @@ impl P2PRecursiveManager {
         Self {
             peer_id,
             shard_id,
-            reward_pool: HashMap::new(),
-            proof_cache: HashMap::new(),
-            known_peers: Vec::new(),
             seen_atomic: HashSet::new(),
             seen_aggregate: HashMap::new(),
             pending_atomic: Vec::new(),
-            last_aggregation: Instant::now(),
+            last_gossip_time: std::time::Instant::now(),
+            gossip_count_in_window: 0,
         }
     }
 
     /// Strictly follows gossip_aggregation_protocol.md for validation and forwarding.
-    pub fn handle_atomic_gossip(&mut self, sender: PeerId, gossip: AtomicProofGossip) -> bool {
+    pub fn handle_atomic_gossip(&mut self, _sender: PeerId, gossip: AtomicProofGossip) -> bool {
         // 1. Basic Verification (Anti-Replay & Format)
         if self.seen_atomic.contains(&gossip.tx_id) {
             return false;
@@ -1249,75 +1247,42 @@ impl P2PRecursiveManager {
         self.seen_atomic.insert(gossip.tx_id);
         self.pending_atomic.push(gossip.clone());
 
-        // 5. Forwarding Rules: Broadcast to random N peers
-        self.forward_proof(sender, "atomic", &serde_json::to_string(&gossip).unwrap());
-
-        // 6. Check Aggregation Trigger
-        self.check_aggregation_trigger();
-
         true
     }
 
-    pub fn handle_aggregate_gossip(&mut self, sender: PeerId, gossip: AggregateProofGossip) -> bool {
-        // 1. Depth-First Forwarding Rule
+    pub fn handle_aggregate_gossip(&mut self, _sender: PeerId, gossip: AggregateProofGossip) -> bool {
+        // 1. Dedup + depth check
         if let Some(&existing_depth) = self.seen_aggregate.get(&gossip.aggregate_id) {
             if gossip.depth <= existing_depth {
-                // If we already have a better or equal proof for this statement, drop it.
                 return false;
             }
         }
 
-        // 2. Validation Pipeline
-        let flow = hex_to_fp(&gossip.statement.total_flow);
-        if flow != Fp::ZERO {
+        // 2. Rate limiting: max 100 messages per 10s window
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_gossip_time).as_secs() >= 10 {
+            self.gossip_count_in_window = 0;
+            self.last_gossip_time = now;
+        }
+        self.gossip_count_in_window += 1;
+        if self.gossip_count_in_window > 100 {
             return false;
         }
 
+        // 3. Verify using the accumulator chain (O(n) replay; O(1) sig check
+        //    is available when an aggregator pubkey is configured).
         if !self.verify_aggregate_proof(&gossip) {
             println!("[Protocol] Aggregate proof validation failed: {}", hex::encode(gossip.aggregate_id));
             return false;
         }
 
-        // 3. Update Local State
-        println!("[Protocol] Received stronger aggregate proof: depth={}, txs={}", gossip.depth, gossip.leaf_txs.len());
+        // 4. Accept
+        println!("[Protocol] Accepted aggregate proof: aggregate_id={} depth={}", hex::encode(gossip.aggregate_id), gossip.depth);
         self.seen_aggregate.insert(gossip.aggregate_id, gossip.depth);
-
-        // 4. Forward if it provides competitive advantage
-        self.forward_proof(sender, "aggregate", &serde_json::to_string(&gossip).unwrap());
-
         true
     }
 
-    fn forward_proof(&self, exclude: PeerId, proof_type: &str, _payload: &str) {
-        // In a real libp2p implementation, this would publish to a Gossipsub topic.
-        // For now, we simulate the broadcast.
-        let target_peers: Vec<_> = self.known_peers.iter()
-            .filter(|&&p| p != exclude)
-            .collect();
-        
-        println!("[Protocol] Forwarding {} proof to {} peers", proof_type, target_peers.len());
-    }
 
-    fn check_aggregation_trigger(&mut self) {
-        let now = Instant::now();
-        let threshold_count = 16;
-        let timeout_ms = 500;
-
-        let should_aggregate = self.pending_atomic.len() >= threshold_count || 
-                              now.duration_since(self.last_aggregation).as_millis() >= timeout_ms;
-
-        if should_aggregate && !self.pending_atomic.is_empty() {
-            self.start_aggregation_step();
-        }
-    }
-
-    fn start_aggregation_step(&mut self) {
-        println!("[Protocol] Triggering aggregation step for {} pending proofs", self.pending_atomic.len());
-        // Implementation of actual aggregation logic would go here, 
-        // calling RecursiveAggregationCircuit and broadcasting the result.
-        self.pending_atomic.clear();
-        self.last_aggregation = Instant::now();
-    }
 
     /// Phase 1.3 stub: real params/PK preloading is deferred to Phase 1.4 (Pasta IPA).
     /// Retains the signature so existing FFI/callers compile, and so that
@@ -1335,7 +1300,14 @@ impl P2PRecursiveManager {
     }
 
     pub fn verify_aggregate_proof(&self, gossip: &AggregateProofGossip) -> bool {
-        self.verify_halo2_proof(&gossip.proof, &gossip.statement)
+        crate::block_aggregator::verify_accumulator_chain(
+            &gossip.accumulator,
+            &gossip.prev_accumulator,
+            &gossip.proofs,
+            &gossip.commitments_list,
+            &gossip.public_amounts,
+            None,
+        )
     }
 
     /// Phase 1.3 stub: fail-closed. Real verification returns once Phase 1.4 wires
@@ -1348,10 +1320,9 @@ impl P2PRecursiveManager {
     }
 
 
-    pub fn add_peer(&mut self, peer_id: PeerId) {
-        if !self.known_peers.contains(&peer_id) {
-            self.known_peers.push(peer_id);
-        }
+    pub fn add_peer(&mut self, _peer_id: PeerId) {
+        // Phase 1.11: peer tracking for DOS scoring is deferred; gossipsub
+        // handles propagation and scoring natively.
     }
 
     pub fn simulate_network_convergence(&mut self, tx_id: [u8; 32], network_size: usize) -> usize {
@@ -1403,18 +1374,12 @@ impl P2PRecursiveManager {
     /// calls for the same tx_id stay consistent (mimics old cache behavior).
     pub fn generate_atomic_proof(&mut self, tx_id: [u8; 32]) -> String {
         let tx_id_hex = hex::encode(tx_id);
-        if let Some(cached) = self.proof_cache.get(&tx_id_hex) {
-            return cached.clone();
-        }
-
-        let res = format!(
+        format!(
             "{{\"tx_id\": \"{}\", \"shard_id\": {}, \
              \"status\": \"unavailable\", \
              \"reason\": \"recursive proving deferred to Phase 1.4\"}}",
             tx_id_hex, self.shard_id
-        );
-        self.proof_cache.insert(tx_id_hex, res.clone());
-        res
+        )
     }
 
     pub fn handle_proof_json(&mut self, sender: PeerId, json: &str) -> i32 {
@@ -1422,8 +1387,8 @@ impl P2PRecursiveManager {
         0
     }
 
-    pub fn get_reward(&self, peer_id: &str) -> u64 {
-        *self.reward_pool.get(peer_id).unwrap_or(&0)
+    pub fn get_reward(&self, _peer_id: &str) -> u64 {
+        0
     }
 }
 
@@ -1633,28 +1598,29 @@ mod tests {
         // 3. Aggregate proof with garbage → fails validation
         let agg1 = AggregateProofGossip {
             aggregate_id: [10u8; 32],
-            statement: RecursiveStatement {
-                total_flow: fp_to_hex(&Fp::ZERO),
-                tx_root: fp_to_hex(&Fp::from(999)),
-            },
-            proof: vec![9, 9],
+            accumulator: b"not_an_accumulator".to_vec(),
+            prev_accumulator: b"not_an_accumulator".to_vec(),
+            proofs: vec![vec![9, 9]],
+            commitments_list: vec![vec![[1u8; 32]]],
+            public_amounts: vec![0],
             depth: 5,
-            leaf_txs: vec![[1u8; 32]],
+            timestamp: 123456789,
         };
         assert!(!manager.handle_aggregate_gossip(sender, agg1.clone()));
         
         // 4. Weaker aggregate (same aggregate_id, lower depth) also fails
         let agg2_weaker = AggregateProofGossip {
             aggregate_id: [10u8; 32],
-            depth: 4, // Smaller depth for same ID
+            depth: 4,
             ..agg1.clone()
         };
         assert!(!manager.handle_aggregate_gossip(sender, agg2_weaker));
         
-        // 5. Stronger aggregate also fails (garbage proof bytes)
+        // 5. Stronger aggregate also fails (bad accumulator bytes fail verify)
         let agg3_stronger = AggregateProofGossip {
             aggregate_id: [10u8; 32],
-            depth: 6, // Greater depth
+            depth: 6,
+            accumulator: b"not_an_accumulator".to_vec(),
             ..agg1
         };
         assert!(!manager.handle_aggregate_gossip(sender, agg3_stronger));
@@ -1784,10 +1750,6 @@ mod tests {
         let manager = P2PRecursiveManager::new(peer_id, 42);
         assert_eq!(manager.peer_id, peer_id);
         assert_eq!(manager.shard_id, 42);
-        assert!(manager.known_peers.is_empty());
-        // Phase 1.3 stub: cached_params / cached_pk were removed when the
-        // Real KZG accumulator was deleted; the manager keeps only gossip/aggregation
-        // protocol state.
         assert!(manager.seen_atomic.is_empty());
         assert!(manager.seen_aggregate.is_empty());
         assert!(manager.pending_atomic.is_empty());
