@@ -2171,7 +2171,7 @@ Multi-agent investigation 找到 2 root causes:
 | `aetheris-recursive::P2PRecursiveManager::verify_aggregate_proof` | LOW | Design | Phase 1.5+ |
 | ISSUANCE-1.4.C: Accumulator 集成测试 (happy-path) | MEDIUM | Phase 1.4 | ✅ **FIXED in Phase 1.8** (5 new tests at `aetheris-recursive/src/block_aggregator.rs::tests` exercise real ZKP-backed accumulator chain: single/3-tx/multi-block/empty/tampered) |
 | ~~`aetheris-crypto::classgroup.rs:112` `debug_assert_eq!` 在错误 discriminant form 上 panic~~ | ~~MEDIUM (pre-existing)~~ | Phase 1.6 Review B | ✅ **FIXED in Phase 1.7** (boundary check in `VDF::verify` at `aetheris-crypto/src/vdf.rs:110-117` rejects forms with wrong discriminant at the boundary, before `compose` is called; 3 new crypto tests + 1 new zkp test) |
-| 🔴 **P0**: `ValueConservationCircuit` 在 `aetheris-zkp/src/halo2_pasta.rs` 不强制 `sum_in - sum_out = public_amount`,也不绑定 `output_commitments` 到 witness。`verify_conservation` 的 `_output_commitments` 参数是 unused。当前 tests 通过仅因 prover 端 `if net_value != 0 { Err(Synthesis) }` 预检 (`halo2_pasta.rs:224-226`),恶意 prover 可绕过。 | 🔴 **CRITICAL** | User audit (2026-06-06) | **Phase 1.9** (next): 加 real conservation running sum gate + commitment binding + 重写 `verify_conservation` 实际使用 commitments + 配套更新所有 call sites |
+| 🔴 **P0**: `ValueConservationCircuit` 在 `aetheris-zkp/src/halo2_pasta.rs` 不强制 `sum_in - sum_out = public_amount`,也不绑定 `output_commitments` 到 witness。`verify_conservation` 的 `_output_commitments` 参数是 unused。当前 tests 通过仅因 prover 端 `if net_value != 0 { Err(Synthesis) }` 预检 (`halo2_pasta.rs:224-226`),恶意 prover 可绕过。 | 🔴 **CRITICAL** | User audit (2026-06-06) | ✅ **FIXED in Phase 1.9** (real conservation running sum gate + commitment binding + verify_conservation uses commitments + 配套 call sites 更新) |
 
 ### Phase 1.5.6 — Deferred Issue Remediation (Post-Phase-1.5 cleanup)
 
@@ -2405,6 +2405,47 @@ Resolves the deferred Phase 1.4 review finding **ISSUANCE-1.4.C** ("Accumulator 
 - **bounded to**: `aetheris-recursive` (src/block_aggregator.rs::tests only) + `progress.md`
 - **未触及**: 任何 production code, 任何 cryptographic verification logic
 
-**Commit**: `9744659` (source) → `(next commit)` (docs)
+**Commit**: `9744659` (source) → `ef7eb01` (docs)
+
+---
+
+### Phase 1.9 P0 — Fix Conservation Circuit Soundness Gap (2026-06-06)
+
+**Root cause**: `ValueConservationCircuit::synthesize` (`aetheris-zkp/src/halo2_pasta.rs`) did NOT constrain `sum_in - sum_out = public_amount` or bind `output_commitments` to witness. The only check was a prover-side `if net_value != 0 { Err(Synthesis) }` pre-check that any caller could bypass. `verify_conservation`'s `_output_commitments` parameter was unused.
+
+**Fix**:
+- **ValueConfig**: advice columns 3→5, added `s_conservation: Selector`
+- **configure()**: +2 advice columns (commitment + signed_amount), +`s_conservation` gate `cur - prev - signed = 0`
+- **synthesize()**: running sum loop per amount, final row copy-constraint `instance[0]` via `s_constrain_equal`, per-output `assign_advice_from_instance(instance[1+j], advice[3])`
+- **prove/verify_conservation**: instance column rebuilt as `[public_amount, commitment_0, ..., commitment_{n_out-1}]`
+- **Removed**: prover-side pre-check (`halo2_pasta.rs:224-226`)
+- **Test**: renamed `test_mint_shape_wrong_sign_panics_at_synthesis` → `test_mint_shape_wrong_sign_rejected_by_verifier`; added `test_commitment_binding_rejects_tampered`
+- **Cross-crate**: updated stale comment in `accumulator.rs:179-187`
+
+**Design decisions**:
+- No wire format change (`halo2_ipa_pasta_v1_` prefix unchanged)
+- No `extern "C"` signature change (commitments always passed by caller)
+- Commitment binding is permutation copy-constraint, NOT in-circuit hash (deferred to future)
+- Same pattern as BN254 backend (commitment binding verified externally)
+
+**Test results** (workspace lib + FFI `--test-threads=1`):
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- aetheris-core: 21/21
+- aetheris-crypto: 41/41
+- aetheris-node: 9/9
+- aetheris-recursive: 33/33
+- aetheris-wallet: 5/5
+- aetheris-ffi: 3/3
+- aetheris-zkp: **69/69** (was 68, +1 new test)
+- Total: **181/181** (was 180, +1 new)
+
+**Files modified** (2 source + progress.md):
+- `aetheris-zkp/src/halo2_pasta.rs` — +87/-63 lines
+- `aetheris-recursive/src/accumulator.rs` — comment update (stale `verify_conservation ignores output_commitments`)
+- `progress.md` — this entry + P0 row marked FIXED
+
+**Multi-Agent Review**: 2 subagents (security + code quality), both ✅ APPROVED with no blocking issues. Minor warnings (dead `s_constrain_equal` gate, optional test coverage) documented but acknowledged as non-blocking.
+
+**Commit**: `7e14bdf` (source) → `(next commit)` (docs)
 
 
