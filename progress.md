@@ -2083,3 +2083,110 @@ Happy-path test 留 Phase 1.5 (需要暴露 `make_proof` helper)。
 | **ISSUE-1.4.E** | Output commitments 在 chain 绑定 (challenge domain 加 commitments hash) | Phase 1.5+ |
 
 ### Phase 1.4 范围严格 bounded 到 aetheris-recursive + 新 accumulator module,未触及 aetheris-zkp / aetheris-node / FFI / wallet 的 verification/aggregation 逻辑。
+
+---
+
+## Phase 1.5 — IPA Accumulator 集成到区块生产 + libp2p hang 修复
+
+### 1.5.0 前置 (ISSUE-1.4.D / 1.4.E hardening)
+- `aetheris-zkp/src/halo2_pasta.rs:386-393`: `verify_conservation` 添加 I/O shape self-bound (max 30 proof I/O ops),close 23-byte DoS vector 在 direct callers
+- `aetheris-recursive/src/accumulator.rs` 1.4.E: `inner_proof_hash_eff` = `blake3(proof) XOR blake3(0xC0 || len_le || commitments || public_amount_le)` 注入 `hash_to_curve_nums_eff` / challenge / transcript_new,实现 output commitments 在 chain 绑定
+
+### 1.5.1 trait 扩展取消,新建 `aetheris-recursive::block_aggregator`
+- **设计调整**:最初计划把 `accumulate_proof` / `verify_accumulator_chain` 加到 `aetheris-zkp::ZkProverSystem` trait。但 1.4 已经使 `aetheris-recursive` 依赖 `aetheris-zkp`,反过来加 trait 方法会引入循环依赖
+- **解决方案**:新建 `aetheris-recursive/src/block_aggregator.rs` 模块,4 free functions:
+  - `accumulate_proof(accumulator, proof, output_commitments, public_amount) -> Result<Vec<u8>, String>`
+  - `empty_accumulator() -> Vec<u8>` (96B genesis sentinel,depth=0)
+  - `verify_accumulator_chain(claimed, prev, tx_proofs, tx_commitments, tx_public_amounts) -> bool`
+  - `INNER_PROOF_PREFIX = b"halo2_ipa_pasta_v1_"` (re-export)
+- `aetheris-zkp/src/lib.rs` re-export `TxCommitments` (= `Vec<[u8; 32]>`) 给 caller 使用
+- 4 new tests in `block_aggregator.rs`: `empty_chain_validates`, `mismatched_lengths_rejected`, `bad_wire_format_rejected`, `accumulate_proof_bad_proof_returns_err`
+
+### 1.5.2 aetheris-node 集成
+- `aetheris-node/Cargo.toml`: + `aetheris-recursive` dep
+- `aetheris-node/src/state.rs`:
+  - 3 genesis sites (`b"genesis_proof"` placeholders) → `empty_accumulator()` (lines 49, 67, 172)
+  - Validator 改用 `verify_accumulator_chain` + **coinbase filter** (line ~333-355): `filter(|tx| tx.public_amount <= 0)` 跳过 coinbase (IPA accumulator 不能 fold 空 proof,而 coinbase 仍走 `validate_issuance_rules` 共识路径)
+  - 5 tests 改用 IPA wire format (96B prefix + identity Q + transcript + depth LE)
+- **3 pre-existing failing tests NOW PASS**: `test_block_application`, `test_reorganize_chain`, `test_rollback_block`
+
+### 1.5.3 FFI 集成
+- 3 callsites in `aetheris-ffi/src/lib.rs`:
+  - **Genesis (line 315)**: 跳过 coinbase (mint tx),`accumulate_proof` 循环 fold transfer tx
+  - **Reward tx (line 1615)**: identity fold (no accumulator change) — `ledger.last_aggregate_proof.clone()`
+  - **Mining (line 1720-1750)**: 过滤 coinbase,循环 `accumulate_proof`,错误时 `continue` 跳过
+- `aetheris-recursive` 已在 FFI `Cargo.toml`
+
+### 1.5.5 libp2p hang 修复 (Phase 1.5.5)
+
+#### 调查结论
+Multi-agent investigation 找到 2 root causes:
+1. **`Runtime::drop` deadlock** (real): swarm task `loop { tokio::select! { ... } }` 无 exit path,`reset_ffi_test_state` 设 `*TOKIO_RUNTIME = None` 触发 `Runtime::drop` 阻塞调用线程,等待 swarm task 永远不退出
+2. **VDF difficulty=1000 太慢** (~7 min): 实际测试时掩盖了 (1),`apply_block` 在 7 min VDF proof 验证上 hanging,看起来像 deadlock
+
+#### 修复 A: 协同 shutdown
+- `aetheris-ffi/src/lib.rs:369-381`: 新 `static SWARM_STOP_FLAG: Lazy<Arc<AtomicBool>>` (mirrors `MINING_STOP_FLAG` pattern)
+- `aetheris_start_node` (~line 418): **TOKIO_RUNTIME lock held across runtime acquisition AND `SWARM_STOP_FLAG.store(false)`**,close race window with stop_node
+- Swarm loop (~line 437-450): 4th `select!` arm with 50ms `MissedTickBehavior::Skip` ticker,check flag,break
+- `aetheris_stop_node` (line 736-744): 新 FFI export,hold `TOKIO_RUNTIME` lock across flag-set + `rt_guard.take()`,then clear `P2P_COMMAND_SENDER`
+- `reset_ffi_test_state` (~line 2231): 同 pattern
+
+#### 修复 B: VDF speed
+- `AETHERIS_VDF_DIFFICULTY` 1000→10 in both FFI tests (line 2249, 2294)。理论 min 2,10 = 5× safety margin
+
+#### 验证
+- `cargo check --workspace` 0 errors, 0 new warnings
+- `aetheris-recursive` 28/28 (+4 `block_aggregator` tests,was 24)
+- `aetheris-zkp` 56/56
+- `aetheris-node` 9/9
+- `aetheris-ffi` 2/2 in 9.47s (5s each;was hanging indefinitely)
+
+#### Multi-Agent Review 1.5.5
+
+**First pass** (2 subagents):
+- Reviewer A ⚠️ WARNINGS: 1 BLOCKER (mining race, out of 1.5 scope) + 2 MAJOR (state leakage / coinbase double-spend, out of scope) + 1 MINOR (`aetheris_start_node` return code)
+- Reviewer B ⚠️ WARNINGS: VDF difficulty 10 ✅ | SEVERE pre-existing (tests silently swallow `apply_block` errors,genesis `state_root: [0u8; 32]` hardcoded,`EXPECTED_GENESIS_HASH` stale) | LOW (ARBITRATOR/RECURSIVE_MANAGER not reset)
+
+**Iteration** (lead): 4 fixes to FFI libp2p code (lock-around-flag-reset, `P2P_COMMAND_SENDER` cleanup, `MissedTickBehavior::Skip` on discovery_interval, first-tick-immediate comment)
+
+**Second pass** (2 subagents):
+- Reviewer A ✅ APPROVED (all 4 hunks + cross-cutting: locking correctness, sender cleanup, no new deadlock, comment accuracy)
+- Reviewer B ✅ APPROVED (no regressions); ⚠️ pre-existing HIGH (genesis state_root) + 1 minor (pre-existing dropped `assert_eq!` on `aetheris_start_node` return, not from this iteration)
+
+### 已知 Open Issues (Phase 1.5+ 待修)
+
+| Issue | Severity | Source | Status |
+|-------|----------|--------|--------|
+| Mining race in `apply_block_for_mining` | BLOCKER | Review A | Out of 1.5 scope; defer to 1.6 |
+| State leakage: `state.cipher` reuse with `public_amount=0` | MAJOR | Review A | Out of 1.5 scope; defer to 1.6 |
+| Coinbase double-spend on shared DB paths | MAJOR | Review A | Out of 1.5 scope; defer to 1.6 |
+| `aetheris_start_node` returns 0 on network init failure | MINOR | Review A | Out of 1.5 scope; defer to 1.6 |
+| Genesis `state_root: [0u8; 32]` hardcoded mismatch with H-1 validation | HIGH (pre-existing) | Review B | Out of 1.5 scope; defer to 1.6 |
+| `test_genesis_import` swallows `apply_block` errors | HIGH (pre-existing) | Review B | Out of 1.5 scope; defer to 1.6 |
+| `EXPECTED_GENESIS_HASH` stale | HIGH (pre-existing) | Review B | Out of 1.5 scope; defer to 1.6 |
+| `aetheris_start_node` 缺 `assert_eq!(_, 0)` in `test_full_wallet_flow` | MINOR (pre-existing) | Review B | Out of 1.5 scope; defer to 1.6 |
+| `aetheris-zkp` 3 pre-existing warnings (strategy.rs:369, halo2_pasta.rs:947, halo2_pasta.rs:993) | LOW | Review A | Pre-existing, not regressions; defer to separate cleanup commit |
+| P2P gossip `AggregateProofGossip` stub | LOW | Design | Phase 1.5+ |
+| `aetheris-recursive::P2PRecursiveManager::verify_aggregate_proof` | LOW | Design | Phase 1.5+ |
+| ISSUANCE-1.4.C: Accumulator 集成测试 (happy-path) | MEDIUM | Phase 1.4 | Phase 1.5+ (需 make_proof helper 暴露) |
+
+### Phase 1.5 范围
+- **bounded to**: `aetheris-recursive` (新 `block_aggregator.rs` module) + `aetheris-zkp/src/lib.rs` (TxCommitments re-export) + `aetheris-node/Cargo.toml` + `aetheris-node/src/state.rs` + `aetheris-ffi/src/lib.rs`
+- **未触及**: aetheris-core, aetheris-crypto, aetheris-wallet, aetheris-ffi/Cargo.toml (dep 早加), 任何 verification 逻辑(IPA chain validation 是 1.5 范围;conservation proof verification 保持 1.4)
+
+### Wire Format
+
+| 字段 | 大小 | 说明 |
+|------|------|------|
+| `ACCUMULATOR_WIRE_PREFIX` | 28 B | `aetheris-ipa-accumulator-v1\x00` |
+| Q (compressed Pallas point) | 32 B | Identity element = generator |
+| transcript | 32 B | blake3 hash |
+| depth (LE u32) | 4 B | 累加的 inner proof 数 |
+| **Total** | **96 B** | |
+
+### Pre-existing warnings
+`aetheris-zkp` 有 3 个 pre-existing warnings (Phase 1.1.5 之前就在,非 1.5 regression):
+- `strategy.rs:369`: unused `ParamsVerifier` import
+- `halo2_pasta.rs:947`: unused `RngCore` import
+- `halo2_pasta.rs:993`: unused `n` variable
+
