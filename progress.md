@@ -2407,4 +2407,58 @@ Resolves the deferred Phase 1.4 review finding **ISSUANCE-1.4.C** ("Accumulator 
 
 **Commit**: `9744659` (source) → `(next commit)` (docs)
 
+### Phase 1.9 — P0 Conservation Circuit Soundness Fix (IN PROGRESS)
+
+Closes the CRITICAL soundness gap flagged in Open Issues. The `ValueConservationCircuit` in `aetheris-zkp/src/halo2_pasta.rs` currently:
+- Does NOT enforce `sum_in - sum_out = public_amount` cryptographically (only a bypassable prover-side sanity check at `halo2_pasta.rs:224-226`)
+- Does NOT bind `output_commitments` to the witness (the field exists in struct at line 145 but is never read in `synthesize`)
+- Has `verify_conservation` parameter `_output_commitments` (unused) at line 380
+
+**Threat model closed**: A malicious prover who bypasses the Rust API can currently forge conservation proofs for arbitrary `(amounts_in, amounts_out, public_amount)` triples, because the circuit constraints do not actually verify the conservation equation or bind commitments. The pre-synthesis check is a code smell that the prover-side Rust code violates and the verifier-side ignores.
+
+**Design (5 advice columns, 1 instance column, 4 gates)**:
+
+| Component | Before | After |
+|-----------|--------|-------|
+| Advice columns | 3 | 5 (add `commitment` + `signed_amount`) |
+| Instance column | 1 (just `public_amount`) | 1 (holds `[public_amount, commitment_0, ..., commitment_{n_out-1}]`) |
+| Gates | 3 (`s_running_sum`, `bit_constraint`, `s_constrain_equal`) | 4 (+ `s_conservation` for running sum update) |
+
+**Circuit changes** (`halo2_pasta.rs::ValueConservationCircuit`):
+- `configure`: add 2 new advice columns (`advice[3]`, `advice[4]`), 1 new selector `s_conservation`
+- New gate `s_conservation`: `cur_running_sum - prev_running_sum - signed_amount = 0` over `advice[2]` and `advice[4]` (and uses `Rotation(-1)` on `advice[2]`)
+- `synthesize`: remove the `if net_value != 0 { Err(Synthesis) }` pre-check; add a true conservation running sum that walks through all amounts and accumulates `+amount_in - amount_out` in `advice[2]`; at each amount's gap row, also assign `advice[4][gap] = signed_amount` and enable `s_conservation`; for each output, assign `advice[3][gap] = commitment` (witness) and copy-constrain to `instance[1 + output_idx]`; at final row, keep existing net_value copy and additionally copy-constrain `advice[2][final]` to `instance[0]` (= public_amount)
+- Reuse `advice[2]` for both the running sum (at gap rows) and the net_value copy (at final row) — these don't conflict because `s_constrain_equal` is only enabled at the final row
+
+**Proof API changes** (`ZkProverSystem` trait at `trait_.rs:18-31`):
+- Trait signatures: **unchanged** (`prove_conservation` and `verify_conservation` keep the same params)
+- `_output_commitments` renamed to `output_commitments` in `verify_conservation` (the trait param was already named `output_commitments`; only the impl was `_output_commitments`)
+
+**Prove/verify changes**:
+- `prove_conservation` now constructs `instances = [[public_amount, commitment_0, ..., commitment_{n_out-1}]]` (was just `[[public_amount]]`)
+- `verify_conservation` reconstructs the same instance from `output_commitments` + `public_amount` and passes it to `verify_proof_with_strategy`. The proof bytes are unchanged: `halo2_ipa_pasta_v1_` (19B) + shape (4B) + proof
+
+**Wire format**: unchanged. The instance column is set by the verifier, not encoded in proof bytes. The 23-byte prefix + 4-byte shape are still sufficient.
+
+**Commitment binding limitation (deferred to future)**: The in-circuit constraint does NOT verify `commitment = amount + H(blinding)`. It only copy-constrains the witness commitment to the instance column. The `commitment = create_commitment(amount, blinding)` equation is enforced at the Rust level. This matches the `aetheris-zkp/src/halo2_bn254.rs:198-206` "commitment binding is verified externally" pattern. A future in-circuit blake3 (or poseidon) chip would be needed to close this gap; that's a separate research project, not Phase 1.9.
+
+**Test updates**:
+- `make_proof` helper now passes proper `out_blindings` (was empty `&[]`); commitments are derived from `(amount, blinding)` in the test, not passed as zero
+- `test_mint_shape_wrong_sign_panics_at_synthesis` (line 638-642, `#[should_panic]`): **REMOVED** — the pre-synthesis check is gone, the circuit will reject via `verify_conservation` returning `false` instead of panicking
+- 3 new violation tests:
+  - `test_conservation_rejects_inconsistent_amounts` — sum_in ≠ sum_out + public_amount, no pre-check panic
+  - `test_conservation_rejects_wrong_commitment` — commitment in instance doesn't match `output_commitments` param
+  - `test_conservation_rejects_missing_commitment` — no commitments provided
+- Existing tests updated to use new `make_proof` helper
+
+**Call site updates** (needed for consistency, no behavior change):
+- `aetheris-node/src/state.rs` validator — already passes commitments, no logic change
+- `aetheris-ffi/src/lib.rs` 4 C-ABI functions — no signature change, but `output_commitments` is now actually used
+- `aetheris-recursive/src/block_aggregator.rs` Phase 1.8 helper `make_tx_proof` — already uses real commitments
+- `aetheris-wallet` send path — no change needed
+
+**Phase 1.9 范围**:
+- **bounded to**: `aetheris-zkp/src/halo2_pasta.rs` (circuit + prove/verify + tests) + call site touch-ups
+- **未触及**: `aetheris-zkp/src/halo2_bn254.rs` (intentionally untracked), `aetheris-crypto`, `aetheris-core`, `aetheris-node` (validator passes commitments already, no change), `aetheris-ffi` (signature unchanged), `aetheris-wallet`, `aetheris-recursive` (Phase 1.8 helper already correct)
+
 
