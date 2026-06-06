@@ -1080,6 +1080,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_deep_corruption_rejected() {
+        // Phase 1.7: now that aetheris-crypto::VDF::verify rejects
+        // mismatched-discriminant forms at the boundary (vdf.rs:110-117),
+        // we can corrupt a byte DEEP in the form encoding (not just the
+        // length prefix) without triggering the pre-existing
+        // classgroup.rs:112 debug_assert_eq! panic.
+        let seed = b"pasta_vdf_deep_corrupt_seed";
+        let (result, mut proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        let deep_idx = proof.len() / 2;
+        proof[deep_idx] ^= 0xFF;
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&result, &proof, seed, PASTA_VDF_DIFF),
+            "deep-form-encoding corruption must be rejected at discriminant boundary (no panic)"
+        );
+    }
 }
 
 // ─── Synthetic IFFT roundtrip tests ────────────────────────────────────────

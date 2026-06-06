@@ -108,12 +108,12 @@ impl VDF {
         let x = Form::hash_to_form(seed, &self.sqrt_abs_d, &self.discriminant);
         trace_elapsed!(_t0, "  hash_to_form done");
         let y = match Form::from_bytes(result) {
-            Some(f) => f.reduce(&self.sqrt_abs_d),
-            None => return false,
+            Some(f) if f.abs_discriminant() == self.discriminant => f.reduce(&self.sqrt_abs_d),
+            _ => return false,
         };
         let pi = match Form::from_bytes(proof) {
-            Some(f) => f.reduce(&self.sqrt_abs_d),
-            None => return false,
+            Some(f) if f.abs_discriminant() == self.discriminant => f.reduce(&self.sqrt_abs_d),
+            _ => return false,
         };
 
         let l = self.generate_l(&x, &y);
@@ -524,5 +524,66 @@ mod tests {
         let (result2, proof2, _) = vdf_large.solve(seed2);
         assert!(vdf_large.verify(seed2, &result2, &proof2),
             "Large-difficulty deserialized reduced forms must verify");
+    }
+
+    // ─── Discriminant-mismatch rejection (Option B boundary check) ────────
+    //
+    // Phase 1.7: VDF::verify now rejects forms whose discriminant differs
+    // from self.discriminant at the boundary, preventing a debug-mode
+    // panic at classgroup.rs:112 (compose: discriminant mismatch) and
+    // the related line-139 CRT-exact-division assertion.
+
+    /// Mutate the `a` coefficient of a serialized Form such that
+    /// |b² − 4ac| changes (length prefix and sign byte stay valid).
+    ///
+    /// Wire format: `4B a_len ‖ a_bytes ‖ 4B b_len ‖ b_sign ‖ b_magnitude ‖ 4B c_len ‖ c_bytes`.
+    /// Offset 8 lands inside `a_bytes` for any `a_len ≥ 5`. For the 2048-bit
+    /// discriminant, `a` is at most ~256 bytes, so offset 8 is always inside `a`.
+    /// Flipping a byte changes `a` → `a'`, so the new "discriminant"
+    /// `|D'| = 4a'c − b² = |D| + 4(a' − a)c ≠ |D` (since `a' ≠ a` and `c ≠ 0`).
+    fn corrupt_form_discriminant(serialized: &mut Vec<u8>) {
+        assert!(serialized.len() > 8, "form too short to corrupt a-region byte");
+        serialized[8] ^= 0xFF;
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_discriminant_result() {
+        let vdf = VDF::new(10);
+        let seed = b"discrim_result_test";
+        let (result, proof, _) = vdf.solve(seed);
+        let mut bad_result = result.clone();
+        corrupt_form_discriminant(&mut bad_result);
+        assert!(!vdf.verify(seed, &bad_result, &proof),
+            "Mismatched-discriminant result must be rejected (no panic)");
+        assert!(vdf.verify(seed, &result, &proof),
+            "Original (un-corrupted) roundtrip must still verify");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_discriminant_proof() {
+        let vdf = VDF::new(10);
+        let seed = b"discrim_proof_test";
+        let (result, proof, _) = vdf.solve(seed);
+        let mut bad_proof = proof.clone();
+        corrupt_form_discriminant(&mut bad_proof);
+        assert!(!vdf.verify(seed, &result, &bad_proof),
+            "Mismatched-discriminant proof must be rejected (no panic)");
+        assert!(vdf.verify(seed, &result, &proof),
+            "Original (un-corrupted) roundtrip must still verify");
+    }
+
+    #[test]
+    fn test_verify_rejects_both_wrong_discriminant() {
+        let vdf = VDF::new(10);
+        let seed = b"discrim_both_test";
+        let (result, proof, _) = vdf.solve(seed);
+        let mut bad_result = result.clone();
+        let mut bad_proof = proof.clone();
+        corrupt_form_discriminant(&mut bad_result);
+        corrupt_form_discriminant(&mut bad_proof);
+        assert!(!vdf.verify(seed, &bad_result, &bad_proof),
+            "Both-mismatched-discriminant must be rejected (no panic)");
+        assert!(vdf.verify(seed, &result, &proof),
+            "Original (un-corrupted) roundtrip must still verify");
     }
 }
