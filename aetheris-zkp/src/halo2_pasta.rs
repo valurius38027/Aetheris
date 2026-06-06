@@ -509,14 +509,6 @@ impl ZkProverSystem for Halo2PastaBackend {
 
         true
     }
-
-    fn prove_vdf(_public_seed: &[u8], _difficulty: u64) -> Vec<u8> {
-        b"vdf_zkp_pasta_v1_simulated".to_vec()
-    }
-
-    fn verify_vdf(_proof: &[u8], _public_seed: &[u8], _difficulty: u64) -> bool {
-        true
-    }
 }
 
 impl Halo2PastaBackend {
@@ -940,6 +932,153 @@ mod tests {
         let commitments = vec![[0u8; 32]; 1];
         let proof = make_proof(&[42], &[42], &commitments, 0);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, 0));
+    }
+
+    // ─── ZkProverSystem::prove_vdf / verify_vdf (real Wesolowski VDF) ──────
+    //
+    // Phase 1.6: trait methods are no longer stubs; they delegate to
+    // `aetheris_crypto::VDF::solve` / `VDF::verify` (default trait impl).
+    // These tests lock in the contract: prove→verify roundtrip; wrong
+    // difficulty/seed/corruption must reject; the old stub output must
+    // not bypass verify.
+    //
+    // PASTA_VDF_DIFF=10 matches the FFI tests' AETHERIS_VDF_DIFFICULTY=10
+    // env-var value (~1s per solve). The trait method is a pure function
+    // `(seed, difficulty) -> (result, proof)`, so we use a local constant
+    // rather than the env-var pattern (which would be a layering violation
+    // for a library crate).
+
+    const PASTA_VDF_DIFF: u64 = 10;
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_roundtrip() {
+        let seed = b"pasta_vdf_roundtrip_seed";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        assert!(
+            Halo2PastaBackend::verify_vdf(&result, &proof, seed, PASTA_VDF_DIFF),
+            "prove→verify roundtrip must succeed"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_wrong_difficulty() {
+        let seed = b"pasta_vdf_wrong_diff_seed";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&result, &proof, seed, PASTA_VDF_DIFF + 10),
+            "proof generated at D=10 must fail verification at D=20 (difficulty binding)"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_wrong_seed() {
+        let seed_a = b"pasta_vdf_seed_A_xxxxxxxxxxxxxx";
+        let seed_b = b"pasta_vdf_seed_B_xxxxxxxxxxxxxx";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed_a, PASTA_VDF_DIFF);
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&result, &proof, seed_b, PASTA_VDF_DIFF),
+            "proof generated with seed A must fail verification with seed B"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_difficulty_zero() {
+        let seed = b"pasta_vdf_d0_seed";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed, 0);
+        assert!(
+            Halo2PastaBackend::verify_vdf(&result, &proof, seed, 0),
+            "difficulty-0 roundtrip must succeed (no iterations)"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_bypass_rejected() {
+        let seed = b"pasta_vdf_bypass_seed";
+        assert!(
+            !Halo2PastaBackend::verify_vdf(
+                b"vdf_zkp_pasta_v1_simulated",
+                b"vdf_zkp_pasta_v1_simulated",
+                seed,
+                PASTA_VDF_DIFF
+            ),
+            "old 18-byte stub output must not bypass verify"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_corrupted_proof() {
+        let seed = b"pasta_vdf_corrupt_seed";
+        let (result, mut proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        proof[0] ^= 0xFF;
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&result, &proof, seed, PASTA_VDF_DIFF),
+            "length-prefix-corrupted proof must fail verification via Form::from_bytes rejection"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_empty_inputs_rejected() {
+        let seed = b"pasta_vdf_empty_seed";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&[], &proof, seed, PASTA_VDF_DIFF),
+            "empty result must reject"
+        );
+        assert!(
+            !Halo2PastaBackend::verify_vdf(&result, &[], seed, PASTA_VDF_DIFF),
+            "empty proof must reject"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_determinism() {
+        let seed = b"pasta_vdf_determinism_seed";
+        let (r1, p1) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        let (r2, p2) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        assert_eq!(r1, r2, "same seed + difficulty must produce identical result");
+        assert_eq!(p1, p2, "same seed + difficulty must produce identical proof");
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_wire_format_size() {
+        let seed = b"pasta_vdf_size_seed";
+        let (result, proof) = Halo2PastaBackend::prove_vdf(seed, PASTA_VDF_DIFF);
+        assert!(result.len() > 100, "result must be class-group-sized, got {}", result.len());
+        assert!(proof.len() > 100, "proof must be class-group-sized, got {}", proof.len());
+        assert!(
+            !result.starts_with(b"vdf_zkp_"),
+            "result must not be the historical stub prefix"
+        );
+        assert!(
+            !proof.starts_with(b"vdf_zkp_"),
+            "proof must not be the historical stub prefix"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_empty_seed() {
+        let (result, proof) = Halo2PastaBackend::prove_vdf(b"", PASTA_VDF_DIFF);
+        assert!(
+            Halo2PastaBackend::verify_vdf(&result, &proof, b"", PASTA_VDF_DIFF),
+            "empty seed roundtrip must succeed"
+        );
+    }
+
+    #[test]
+    fn test_pasta_backend_prove_vdf_bypass_rejected_comprehensive() {
+        let seed = b"pasta_vdf_bypass_comprehensive_seed";
+        let bypass_attempts: &[&[u8]] = &[
+            b"vdf_zkp_pasta_v1_simulated",
+            b"vdf_zkp_pasta_v1_simulated_real_data_appended_xxxxxxxxxxxx",
+            b"vdf_zkp_",
+            b"vdf_zkp_v1_simulated",
+        ];
+        for (i, attempt) in bypass_attempts.iter().enumerate() {
+            assert!(
+                !Halo2PastaBackend::verify_vdf(attempt, attempt, seed, PASTA_VDF_DIFF),
+                "bypass attempt #{} ({:?}) must be rejected by verify", i, attempt
+            );
+        }
     }
 }
 
