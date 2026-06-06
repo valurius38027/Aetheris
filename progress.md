@@ -2505,4 +2505,55 @@ Resolves the deferred Phase 1.4 review finding **ISSUANCE-1.4.C** ("Accumulator 
 ### Multi-Agent Review
 - Reviewer: ✅ APPROVED (2 🟡 warnings addressed: add_msm consistency assert + magic header; 1 🟢 unused-import cleaned)
 
+---
+
+## Stage 32 — §1.10 Signed Accumulator (ed25519 O(1) Optimization, 2026-06-06)
+
+**Scope**: Add ed25519-dalek signing to the IPA accumulator chain, enabling O(1) block-level verification for trusted-aggregator mode. O(n) ZK replay retained as optional audit fallback.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-recursive/Cargo.toml` | +`ed25519-dalek = { workspace = true }` |
+| `aetheris-recursive/src/accumulator.rs` | +`signature: Option<[u8; 64]>` field on `AccumulatorIPA`; +`SIGNED_ACCUMULATOR_WIRE_PREFIX` (28B); +`ACCUMULATOR_SIGNATURE_DOMAIN`; +`with_signature()`, `to_signed_bytes()`; dual-format `from_bytes()` accepts both 96B unsigned and 160B signed |
+| `aetheris-recursive/src/block_aggregator.rs` | +`signed_accumulate_proof()`; `verify_accumulator_chain` gains `aggregator_pubkey: Option<&VerifyingKey>` — `Some(pk)` + signed accumulator → O(1) sig check, `None` → O(n) replay |
+| `aetheris-recursive/src/lib.rs` | Re-export `signed_accumulate_proof` |
+| `aetheris-node/src/state.rs` | Pass `None` for pubkey (O(n) mode, backward compat) |
+
+### Wire Format (Signed)
+```
+SIGNED_ACCUMULATOR_WIRE_PREFIX (28B) || Q (32B) || transcript (32B) || ed25519_sig (64B) || depth (4B) = 160B
+```
+
+### Signature Scheme
+- Message: `blake3(ACCUMULATOR_SIGNATURE_DOMAIN || prev_bytes || claimed_unsigned_bytes)`
+- Verifier: ed25519 verify(pk, msg, sig) — if valid, trust the aggregator; else fall through to O(n) replay
+- Compatible with unsigned format (96B, auto-detected by prefix + length)
+
+### New Tests (6)
+
+| Test | What It Verifies |
+|------|------------------|
+| `signed_single_tx_chain_validates` | O(1) passes with correct pubkey |
+| `signed_chain_wrong_pubkey_falls_back_to_on_replay` | Wrong pubkey → O(1) fails, O(n) still passes (valid accumulator) |
+| `signed_verify_falls_back_to_unsigned_on_unsigned_input` | Unsigned input + Some(pk) → O(n) fallback passes |
+| `signed_accumulator_tampered_rejected_by_on_replay` | Corrupted Q → both O(1) sig check and O(n) replay fail |
+| `signed_three_tx_chain_validates` | 3-step chain roundtrip via signed_accumulate_proof |
+| `accumulator_signed_serialize_roundtrip` | 160B wire format to_signed_bytes/from_bytes inverse |
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace --all-targets` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive` | ✅ 40/40 unit + 4/4 compat = 44 |
+| `cargo test -p aetheris-node --lib` | ✅ 9/9 |
+| FFI `test_genesis_import` | ❌ pre-existing crash (T-01, sled DB temp path race — unrelated) |
+
+### Trust Model
+- **O(1) fast path**: trusts the aggregator's ed25519 signature — aggregator must be honest or slashed
+- **O(n) audit**: full ZK replay for dispute resolution (unchanged from Phase 1.5)
+- **Cryptographic soundness** of the IPA chain itself is unchanged (still trusted-aggregator until §1.12 in-circuit IPA verifier)
+
 
