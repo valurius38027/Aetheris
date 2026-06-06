@@ -568,12 +568,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_commitments, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
                     last_block_proof = aggregate_proof.clone();
 
-                    // 3. Propose Block — hash computed from serialized block (matches state.rs)
-                    let block_for_hash = Block {
+                    // 3. Propose Block — single timestamp, hash from serialized block
+                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    let block = Block {
                         header: BlockHeader {
                             parent_hash,
                             state_root,
-                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                            timestamp,
                             vdf_result: vdf_result.clone(),
                             vdf_proof: vdf_proof.clone(),
                             aggregate_proof: aggregate_proof.clone(),
@@ -582,7 +583,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         },
                         transactions: txs.clone(),
                     };
-                    let block_hash = aetheris_core::block_hash(&block_for_hash);
+                    let block_hash = aetheris_core::block_hash(&block);
 
                     let proposal = BlockProposal {
                         height: current_height,
@@ -593,8 +594,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         aggregate_proof,
                         sender: swarm.local_peer_id().to_string(),
                         difficulty: current_difficulty,
-                        state_root, // Include state_root in proposal
-                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        state_root,
+                        timestamp,
                     };
 
                     println!("🚀 Proposing Block #{} with {} txs (VDF Solved!)", current_height, tx_count);

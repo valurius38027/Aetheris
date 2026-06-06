@@ -207,13 +207,11 @@ fn create_genesis_block() -> aetheris_core::Block {
     } else {
         #[cfg(debug_assertions)]
         {
-            let mut hasher = Keccak::v256();
-            hasher.update(TEST_SEED_MNEMONIC.as_bytes());
-            hasher.finalize(&mut seed_viewing_key);
+            let vk = blake3::hash(&[TEST_SEED_MNEMONIC.as_bytes(), b"aetheris-viewing-key"].concat());
+            seed_viewing_key.copy_from_slice(vk.as_bytes());
 
-            let mut hasher = Keccak::v256();
-            hasher.update(TEST_DEV_MNEMONIC.as_bytes());
-            hasher.finalize(&mut dev_viewing_key);
+            let vk = blake3::hash(&[TEST_DEV_MNEMONIC.as_bytes(), b"aetheris-viewing-key"].concat());
+            dev_viewing_key.copy_from_slice(vk.as_bytes());
         }
         #[cfg(not(debug_assertions))]
         panic!("No genesis config found. Use --config to specify genesis allocations.");
