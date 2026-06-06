@@ -1,6 +1,7 @@
 use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
-use aetheris_zkp::{build_merkle_root, ZkProverSystem};
+use aetheris_zkp::build_merkle_root;
+use aetheris_recursive::{empty_accumulator, verify_accumulator_chain};
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;
@@ -46,7 +47,7 @@ impl LedgerState {
             db,
             height: 0,
             last_block_hash: [0u8; 32],
-            last_aggregate_proof: b"genesis_proof".to_vec(),
+            last_aggregate_proof: empty_accumulator(),
             current_difficulty: VDF_DIFFICULTY,
             timestamps: Vec::new(),
         };
@@ -64,7 +65,7 @@ impl LedgerState {
             self.commitments.clear();
             self.all_outputs.clear();
             self.last_block_hash = [0u8; 32];
-            self.last_aggregate_proof = b"genesis_proof".to_vec();
+            self.last_aggregate_proof = empty_accumulator();
             self.current_difficulty = VDF_DIFFICULTY;
             self.timestamps.clear();
             self.height = 0;
@@ -169,7 +170,7 @@ impl LedgerState {
                 }
             } else {
                 self.last_block_hash = [0u8; 32];
-                self.last_aggregate_proof = b"genesis_proof".to_vec();
+                self.last_aggregate_proof = empty_accumulator();
             }
 
             self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
@@ -322,22 +323,36 @@ impl LedgerState {
         }
 
         // Verify Aggregate ZK Proof (skip coinbase tx — validated by consensus, not ZK)
-        // All txs (including coinbase) are aggregated into a single ZK proof at the prover
-        // side (aetheris-ffi/src/lib.rs aggregate_proofs). The merkle root is computed over
-        // every proof, so the verifier MUST see the same set. Coinbase issuance is enforced
-        // separately by `validate_issuance_rules` below.
-        let tx_proofs: Vec<Vec<u8>> = block.transactions.iter().map(|tx| tx.proof.clone()).collect();
+        // Non-coinbase txs (those with `public_amount <= 0` in the consensus
+        // accounting layer) are folded into the IPA accumulator chain at the
+        // prover side (aetheris-ffi/src/lib.rs accumulate_proof loop). The
+        // accumulator is replayed from the parent's state and compared to the
+        // claimed state stored in the block header. Coinbase issuance is
+        // enforced separately by `validate_issuance_rules` below — it carries
+        // no ZK proof because it is consensus-minted.
+        //
+        // Note: `circuit_public_amount` returns the per-tx circuit public
+        // input (signed: positive for coinbase, negative/zero for shielded
+        // transfers). Coinbase txs (public_amount > 0) are filtered out of
+        // the accumulator chain here.
+        let tx_proofs: Vec<Vec<u8>> = block.transactions.iter()
+            .filter(|tx| tx.public_amount <= 0)
+            .map(|tx| tx.proof.clone())
+            .collect();
         let tx_commitments: Vec<Vec<[u8; 32]>> = block.transactions.iter()
-            .map(|tx| tx.outputs.iter().map(|o| o.commitment).collect()).collect();
-        let public_amounts: Vec<i64> = block.transactions.iter().map(|tx| tx.circuit_public_amount()).collect();
-        if !tx_proofs.is_empty() && !aetheris_zkp::ZKProofSystem::verify_aggregate(
+            .filter(|tx| tx.public_amount <= 0)
+            .map(|tx| tx.outputs.iter().map(|o| o.commitment).collect())
+            .collect();
+        let public_amounts: Vec<i64> = block.transactions.iter()
+            .filter(|tx| tx.public_amount <= 0)
+            .map(|tx| tx.circuit_public_amount())
+            .collect();
+        if !tx_proofs.is_empty() && !verify_accumulator_chain(
             &block.header.aggregate_proof,
             &self.last_aggregate_proof,
             &tx_proofs,
             &tx_commitments,
             &public_amounts,
-            block.header.height,
-            &block.header.state_root
         ) {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }
@@ -608,7 +623,7 @@ mod tests {
         println!("Created LedgerState with height: {}", state.height);
         assert_eq!(state.height, 0);
         assert_eq!(state.last_block_hash, [0u8; 32]);
-        assert_eq!(state.last_aggregate_proof, b"genesis_proof");
+        assert_eq!(state.last_aggregate_proof, empty_accumulator());
         assert!(state.nullifiers.is_empty());
         assert!(state.commitments.is_empty());
         assert!(state.all_outputs.is_empty());
@@ -628,7 +643,7 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
+                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
             },
@@ -641,21 +656,15 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof =
-            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        state.last_aggregate_proof = empty_accumulator();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Solve VDF and create aggregate proof for the new block
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
-        let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &state.last_aggregate_proof,
-            &[],
-            &[],
-            &[],
-            1,
-            &[0u8; 32],
-        ).unwrap();
+        // No transactions in this test, so the new accumulator is just
+        // the parent's accumulator (identity fold over an empty set).
+        let agg_proof = state.last_aggregate_proof.clone();
 
         let state_root = state.get_state_root();
         let reward = calculate_block_reward_atoms(1);
@@ -688,7 +697,7 @@ mod tests {
         assert!(result.is_ok(), "Block application failed: {:?}", result);
         assert_eq!(state.height, 2);
         assert_ne!(state.last_block_hash, [0u8; 32]);
-        assert!(state.last_aggregate_proof.starts_with(b"aetheris_aggregate_v1_"));
+        assert!(state.last_aggregate_proof.starts_with(b"aetheris_accumulator_ipa_v1_"));
     }
 
     #[test]
@@ -705,7 +714,7 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
+                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
             },
@@ -716,8 +725,7 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof =
-            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        state.last_aggregate_proof = empty_accumulator();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Apply a block to get to height 2
@@ -734,9 +742,8 @@ mod tests {
             public_amount: reward,
             proof: vec![],
         };
-        let agg_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
-        ).unwrap();
+        // No transactions, so the new accumulator is just the parent's.
+        let agg_proof = state.last_aggregate_proof.clone();
         let state_root = state.get_state_root();
         let block = Block {
             header: BlockHeader {
@@ -771,10 +778,19 @@ mod tests {
         let db = sled::open(dir.path()).unwrap();
         let mut state = LedgerState::new_with_db(db.clone());
 
-        // Manually set state fields (simulating applied state)
+        // Manually set state fields (simulating applied state). Build a
+        // non-trivial 96-byte accumulator wire format (28B prefix + 32B
+        // identity Q + 32B transcript + 4B depth=7) that round-trips
+        // through `AccumulatorIPA::from_bytes`. We avoid folding an
+        // actual proof here because the snapshot test is about byte-level
+        // persistence, not chain semantics.
+        let mut acc_bytes = empty_accumulator();
+        let len = acc_bytes.len();
+        // depth is the last 4 bytes of the 96-byte wire format
+        acc_bytes[len - 4..len].copy_from_slice(&7u32.to_le_bytes());
         state.height = 5;
         state.last_block_hash = [0xAA; 32];
-        state.last_aggregate_proof = b"aetheris_aggregate_v1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec();
+        state.last_aggregate_proof = acc_bytes;
         state.nullifiers.insert([1u8; 32]);
         state.commitments.insert([2u8; 32]);
         state.all_outputs.push(ShieldedOutput {
@@ -795,8 +811,7 @@ mod tests {
         println!("Restored state height: {}", state2.height);
         assert_eq!(state2.height, 5);
         assert_eq!(state2.last_block_hash, [0xAA; 32]);
-        assert_eq!(state2.last_aggregate_proof,
-            b"aetheris_aggregate_v1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(state2.last_aggregate_proof, state.last_aggregate_proof);
         assert!(state2.nullifiers.contains(&[1u8; 32]));
         assert!(state2.commitments.contains(&[2u8; 32]));
         assert_eq!(state2.all_outputs.len(), 1);
@@ -817,7 +832,7 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
+                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
             },
@@ -828,16 +843,14 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof =
-            b"aetheris_aggregate_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        state.last_aggregate_proof = empty_accumulator();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Apply block A (height 1) — canonical chain goes to height 2
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_a, proof_a, _) = vdf.solve(&state.last_block_hash);
-        let agg_a = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &state.last_aggregate_proof, &[], &[], &[], 1, &[0u8; 32],
-        ).unwrap();
+        // No transactions, so the new accumulator is just the parent's.
+        let agg_a = state.last_aggregate_proof.clone();
         let reward = calculate_block_reward_atoms(1);
         let coinbase_tx = Transaction {
             inputs: vec![],
@@ -876,9 +889,8 @@ mod tests {
             hasher.finalize().into()
         };
         let (vdf_b, proof_b, _) = vdf.solve(&block_0_hash);
-        let agg_b = aetheris_zkp::ZKProofSystem::aggregate_proofs(
-            &agg_a, &[], &[], &[], 1, &[0xBBu8; 32],
-        ).unwrap();
+        // No transactions, so the new accumulator is just the parent's.
+        let agg_b = agg_a.clone();
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: block_0_hash,

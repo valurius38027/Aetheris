@@ -88,6 +88,10 @@ use grain::GrainLFSR;
 pub mod accumulator;
 pub use accumulator::{AccumulatorError, AccumulatorIPA};
 
+pub mod block_aggregator;
+pub use block_aggregator::{accumulate_proof, empty_accumulator, verify_accumulator_chain};
+pub use accumulator::INNER_PROOF_PREFIX;
+
 #[derive(Clone, Debug)]
 pub struct PoseidonSpec<const T: usize, const RATE: usize> {
     pub r_f: usize,

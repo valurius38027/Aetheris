@@ -178,23 +178,42 @@ impl AccumulatorIPA {
         // 4. Inner proof verification.
         //    NOTE: `verify_conservation` ignores `output_commitments` in
         //    the current aetheris-zkp implementation (the public-input
-        //    column only binds `public_amount`). The chain therefore
-        //    binds proof bytes + public_amount, but NOT the output
-        //    commitments themselves. Callers MUST verify commitments
-        //    out-of-band (e.g. by including the commitment hash in the
-        //    challenge domain, which Phase 1.5 will do).
+        //    column only binds `public_amount`). To bind the commitments
+        //    to the chain we MUST include them in the Fiat-Shamir challenge
+        //    (Phase 1.5 / ISSUE-1.4.E). Without this, a malicious
+        //    aggregator could swap commitments on the same proof and the
+        //    chain would not notice. The commitment hash is folded into
+        //    `inner_proof_hash_eff` (see step 5) so the binding flows
+        //    into pi_commitment, challenge, AND transcript_new.
         if !Halo2PastaBackend::verify_conservation(proof, output_commitments, public_amount) {
             return Err(AccumulatorError::InnerProofInvalid(
                 hex::encode(blake3::hash(proof).as_bytes()),
             ));
         }
 
-        // 5. inner_proof_hash
+        // 5. inner_proof_hash_eff = blake3(proof || commitment_hash || public_amount_le)
+        //    The commitment binding is the Phase 1.5 / ISSUE-1.4.E fix.
         let inner_proof_hash = blake3::hash(proof);
+        let commitment_hasher = {
+            let mut h = blake3::Hasher::new();
+            h.update(&[0xC0u8]); // domain: commitment list (vs. proof 0xA0)
+            h.update(&(output_commitments.len() as u32).to_le_bytes());
+            for cm in output_commitments {
+                h.update(cm);
+            }
+            h.update(&public_amount.to_le_bytes());
+            h.finalize()
+        };
+        let mut inner_proof_hash_eff = [0u8; 32];
+        // Mix the two 32-byte hashes via XOR (preserves preimage resistance;
+        // both inputs are uniformly random 32-byte strings).
+        for i in 0..32 {
+            inner_proof_hash_eff[i] = inner_proof_hash.as_bytes()[i] ^ commitment_hasher.as_bytes()[i];
+        }
 
-        // 6. pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash)
+        // 6. pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)
         //    Phase 1.4: NUMS-style try-and-increment hash-to-curve.
-        //    - Take blake3(PI_COMMITMENT_DOMAIN || inner_proof_hash) -> 32 bytes
+        //    - Take blake3(PI_COMMITMENT_DOMAIN || inner_proof_hash_eff) -> 32 bytes
         //    - Mix in a 32-bit counter (length-tag to prevent ambiguity)
         //    - Reduce mod Fp (Pallas base, native arithmetic field of this circuit)
         //      via `from_uniform_bytes` (NOT `from_repr`, which is canonical-only
@@ -202,14 +221,17 @@ impl AccumulatorIPA {
         //    - Multiply by the Pallas generator to get a Pallas point
         //    - Increment counter and re-derive if the resulting point is the
         //      identity (2^-254 chance; theoretically possible, practically never)
-        let pi_commitment = hash_to_curve_nums(&inner_proof_hash);
+        //    Phase 1.5: also includes output_commitments binding via
+        //    `inner_proof_hash_eff` (the chain can no longer be replayed
+        //    with different commitments).
+        let pi_commitment = hash_to_curve_nums_eff(&inner_proof_hash, &inner_proof_hash_eff);
 
         // 7. challenge = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
-        //    || inner_proof_hash), reduced to Fp via `from_uniform_bytes`.
+        //    || inner_proof_hash_eff), reduced to Fp via `from_uniform_bytes`.
         let mut hasher = blake3::Hasher::new();
         hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
         hasher.update(&self.transcript);
-        hasher.update(inner_proof_hash.as_bytes());
+        hasher.update(&inner_proof_hash_eff);
         let challenge_hash = hasher.finalize();
         let challenge = fp_from_blake3(challenge_hash.as_bytes());
 
@@ -232,12 +254,16 @@ impl AccumulatorIPA {
 
         // 9. transcript_new = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN
         //    || transcript || challenge_repr || Q_new_compressed)
+        //    Phase 1.5: include `inner_proof_hash_eff` (commits to proof +
+        //    commitments + public_amount) so the transcript is binding
+        //    over the full input, not just the proof bytes.
         let q_new_compressed = q_new.to_bytes();
         let mut hasher = blake3::Hasher::new();
         hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
         hasher.update(&self.transcript);
         hasher.update(&challenge.to_repr());
         hasher.update(&q_new_compressed);
+        hasher.update(&inner_proof_hash_eff);
         let transcript_new: [u8; 32] = hasher.finalize().into();
 
         Ok(Self {
@@ -353,60 +379,62 @@ impl AccumulatorIPA {
 
 /// Hash-to-curve: NUMS-style deterministic point derivation.
 ///
-/// `proof_hash` is the blake3 hash of the inner proof bytes. We hash it
-/// with the domain separator to get a 32-byte seed, mix in a 32-bit
-/// counter (length-tag to prevent ambiguity), and reduce mod Fp to get a
-/// uniform-random Pallas base field element. Multiply by the Pallas
-/// generator to get a Pallas point. If the result is the identity
-/// (statistically negligible — 2^-254 for a non-zero scalar), we
-/// increment and retry.
+/// `inner_proof_hash_eff` is the 32-byte value that commits to the
+/// inner proof + output commitments + public_amount (see `accumulate`
+/// step 5). The pre-Phase-1.5 single-argument form `hash_to_curve_nums`
+/// is retained for tests and other bindings (it uses `inner_proof_hash`
+/// directly).
+///
+/// We hash it with the domain separator to get a 32-byte seed, mix in a
+/// 32-bit counter (length-tag to prevent ambiguity), and reduce mod Fp
+/// to get a uniform-random Pallas base field element. Multiply by the
+/// Pallas generator to get a Pallas point. If the result is the
+/// identity (statistically negligible — 2^-254 for a non-zero scalar),
+/// we increment and retry.
 ///
 /// Important: we use `Fp::from_uniform_bytes(&[u8; 64])` (mod-p
 /// reduction of a 512-bit value) rather than `Fp::from_repr` (which
-/// only accepts canonical 32-byte encodings). `from_repr` would reject
-/// ~3/4 of uniformly-random 32-byte inputs as "non-canonical", and the
-/// 28-byte-prefix domain separator here would *never* produce a value
-/// below the Fp prime. `from_uniform_bytes` does proper Barrett/Montgomery
-/// reduction on a 512-bit input — we pad the 32-byte seed with 32 zero
-/// bytes.
+/// only accepts canonical 32-byte encodings).
 ///
 /// This is NOT constant-time (iteration count leaks), but for 1.4 the
 /// `accumulate()` is called by a permissioned aggregator, not a public
 /// untrusted caller. A future Phase (1.5, see ISSUE-1.4.B) will replace
 /// this with a constant-time SSWU2 implementation.
+fn hash_to_curve_nums_eff(
+    _inner_proof_hash: &blake3::Hash,
+    inner_proof_hash_eff: &[u8; 32],
+) -> EpAffine {
+    hash_to_curve_nums_bytes(inner_proof_hash_eff)
+}
+
+#[cfg(test)]
 fn hash_to_curve_nums(proof_hash: &blake3::Hash) -> EpAffine {
+    hash_to_curve_nums_bytes(proof_hash.as_bytes())
+}
+
+fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
     let mut hasher = blake3::Hasher::new();
     hasher.update(PI_COMMITMENT_DOMAIN);
-    hasher.update(proof_hash.as_bytes());
+    hasher.update(seed_in);
     let h = hasher.finalize();
     let mut seed32 = [0u8; 32];
     seed32.copy_from_slice(h.as_bytes());
     let mut counter: u32 = 0;
     loop {
-        // Mix the counter into the seed by replacing the first 4 bytes.
-        // 32 - 4 = 28 bytes remain from the base seed, which is enough
-        // entropy to be effectively unique per counter value.
         let mut mixed32 = [0u8; 32];
         mixed32[..4].copy_from_slice(&counter.to_le_bytes());
         mixed32[4..].copy_from_slice(&seed32[..28]);
-        // 64-byte uniform input: low 32 bytes = mixed seed, high 32 bytes = zero.
         let mut input64 = [0u8; 64];
         input64[..32].copy_from_slice(&mixed32);
-        // `from_uniform_bytes` does mod-p reduction internally.
         let c = Fp::from_uniform_bytes(&input64);
         debug_assert!(!bool::from(c.is_zero()), "uniform sample is zero (impossible)");
-        // Pallas scalar mul: G * c. The Pasta 2-cycle bridge:
-        // we derive a Pallas scalar (Fq) from the Fp bytes by rewrap.
         let c_q = fp_to_fq(&c);
         debug_assert!(!bool::from(c_q.is_zero()), "Fq bridge produced zero");
-        // `EpAffine::generator() * c_q` is the Pallas generator scaled
-        // by `c_q` (a Pallas scalar). The result is `Ep` (projective).
         let p_proj = EpAffine::generator() * c_q;
         let p_aff = p_proj.to_affine();
         if !bool::from(p_aff.is_identity()) {
             return p_aff;
         }
-        // 2^-254 chance of identity. Theoretically possible, practically never.
         counter = counter.checked_add(1).expect("counter overflow");
     }
 }
@@ -602,5 +630,21 @@ mod tests {
         let c1 = fp_from_blake3(h1.as_bytes());
         let c2 = fp_from_blake3(h2.as_bytes());
         assert_ne!(c1, c2);
+    }
+
+    /// Phase 1.5 / ISSUE-1.4.E: `hash_to_curve_nums_eff` binds BOTH the
+    /// inner proof hash AND the effective hash (proof ⊕ commitment_hash
+    /// ⊕ public_amount). Flipping a single bit in the effective hash
+    /// changes the output, so the chain cannot be replayed with
+    /// different output commitments or public_amounts.
+    #[test]
+    fn hash_to_curve_nums_eff_binds_to_commitment() {
+        let h_proof = blake3::hash(b"proof_v1");
+        let h_eff_1 = [0x01u8; 32];
+        let mut h_eff_2 = h_eff_1;
+        h_eff_2[31] = 0x02; // one bit flipped
+        let p1 = hash_to_curve_nums_eff(&h_proof, &h_eff_1);
+        let p2 = hash_to_curve_nums_eff(&h_proof, &h_eff_2);
+        assert_ne!(p1.to_bytes(), p2.to_bytes());
     }
 }

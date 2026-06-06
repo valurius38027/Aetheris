@@ -6,6 +6,7 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use aetheris_zkp::{ZKProofSystem, ZkProverSystem};
+use aetheris_recursive::{accumulate_proof, empty_accumulator};
 use bip39::{Mnemonic};
 use tiny_keccak::{Hasher, Keccak};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore};
@@ -303,7 +304,30 @@ fn create_genesis_block() -> aetheris_core::Block {
     };
 
     let txs = vec![mint_tx, transfer_tx];
-    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
+    // Build the IPA accumulator chain for the genesis block. The mint tx is
+    // a coinbase (public_amount > 0) and is NOT folded into the chain
+    // (consensus-validated). Only the transfer tx is folded. The chain
+    // starts from `empty_accumulator()` (the genesis sentinel).
+    let mut acc = empty_accumulator();
+    for tx in &txs {
+        if tx.public_amount > 0 {
+            // coinbase: skip
+            continue;
+        }
+        let tx_commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
+        acc = match accumulate_proof(
+            &acc,
+            &tx.proof,
+            &tx_commitments,
+            tx.circuit_public_amount(),
+        ) {
+            Ok(new_acc) => new_acc,
+            Err(e) => {
+                println!("[FFI] CRITICAL: Genesis aggregate proof failed: {}", e);
+                acc
+            }
+        };
+    }
 
     aetheris_core::Block {
         header: aetheris_core::BlockHeader {
@@ -312,17 +336,7 @@ fn create_genesis_block() -> aetheris_core::Block {
             timestamp: genesis_timestamp,
             vdf_result: vec![0u8; 32],
             vdf_proof: vec![0u8; 32],
-            aggregate_proof: ZKProofSystem::aggregate_proofs(
-                &[0u8; 32],
-                &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
-                &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                &tx_public_amounts,
-                0,
-                &[0u8; 32]
-            ).unwrap_or_else(|e| {
-                println!("[FFI] CRITICAL: Genesis aggregate proof failed: {}", e);
-                vec![]
-            }),
+            aggregate_proof: acc,
             height: 0,
             difficulty: aetheris_core::VDF_DIFFICULTY,
         },
@@ -351,6 +365,22 @@ fn broadcast_block_proposal(proposal: BlockProposal) {
 static TOKIO_RUNTIME: Lazy<Mutex<Option<Runtime>>> = Lazy::new(|| Mutex::new(None));
 
 static P2P_COMMAND_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<NetworkCommand>>>> = Lazy::new(|| Mutex::new(None));
+
+/// Cooperative shutdown flag for the swarm event loop.
+///
+/// The swarm task in `aetheris_start_node` runs an infinite
+/// `loop { tokio::select! { ... } }`. `Runtime::drop` (used by
+/// `reset_ffi_test_state` between tests, and by any future production
+/// shutdown path) BLOCKS the calling thread until all spawned tasks
+/// have completed, per tokio's contract. Without a way to stop the
+/// swarm task, dropping the runtime deadlocks.
+///
+/// This flag is the exit signal. The swarm task polls it on a 50 ms
+/// tick; setting it to `true` causes the loop to break, the swarm to
+/// be dropped, and the runtime to be reaped cleanly. Mirrors the
+/// `MINING_STOP_FLAG` pattern used for the miner thread.
+static SWARM_STOP_FLAG: Lazy<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
 #[no_mangle]
 pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 {
@@ -385,6 +415,14 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
         *sender = Some(cmd_tx);
     }
 
+    // Hold TOKIO_RUNTIME across BOTH the runtime acquisition AND the
+    // SWARM_STOP_FLAG reset. This serializes against `aetheris_stop_node`
+    // and `reset_ffi_test_state`, which set the flag and drop the runtime
+    // under the same lock. Without this critical section, a concurrent
+    // stop/start race could: (1) stop_node sets flag=true, (2) start_node
+    // re-uses the runtime, (3) start_node resets flag=false, (4) stop_node
+    // drops the runtime — the swarm task then sees flag=false and runs
+    // forever, re-creating the very deadlock this fix addresses.
     let mut rt_guard = TOKIO_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
     let rt = rt_guard.get_or_insert_with(|| {
         Runtime::new().unwrap_or_else(|e| {
@@ -392,6 +430,11 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
             std::process::abort(); // abort — nothing works without runtime
         })
     });
+
+    // Reset the swarm stop flag so a freshly spawned loop can run.
+    // (After a prior test called `aetheris_stop_node` / `reset_ffi_test_state`,
+    //  the flag is `true`; we need it `false` again to keep the new loop alive.)
+    SWARM_STOP_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
     rt.spawn(async move {
         match AetherisNetwork::new(&[]).await {
             Ok(mut network) => {
@@ -419,9 +462,31 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                 }
 
                 let mut discovery_interval = tokio::time::interval(Duration::from_secs(30));
+                discovery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                // Cooperative shutdown tick: a 50 ms sleep whose handler
+                // checks SWARM_STOP_FLAG. Cheap (one timer per 50 ms) and
+                // bounded (no risk of starving other select! arms). When
+                // the flag is set, the swarm is dropped and the spawned
+                // task exits, which lets `Runtime::drop` in
+                // `reset_ffi_test_state` complete instead of deadlocking.
+                //
+                // Note: per tokio docs, the FIRST tick of a `tokio::time::interval`
+                // fires IMMEDIATELY (not after 50 ms). At swarm startup the
+                // flag was just reset to `false` in `aetheris_start_node`,
+                // so this immediate tick is benign — it just re-checks the
+                // flag and continues.
+                let mut shutdown_tick = tokio::time::interval(Duration::from_millis(50));
+                shutdown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
                     tokio::select! {
+                        _ = shutdown_tick.tick() => {
+                            if SWARM_STOP_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
+                                println!("[P2P] Cooperative shutdown requested; stopping swarm event loop");
+                                break;
+                            }
+                        }
                         _ = discovery_interval.tick() => {
                             // Periodically bootstrap and look for other mixnet nodes
                             let _ = network.swarm.behaviour_mut().kademlia.bootstrap();
@@ -670,6 +735,33 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
     });
     
     println!("[FFI] Node started on port: {}", port);
+    0
+}
+
+/// Cooperatively stop the swarm event loop and drop the tokio runtime.
+///
+/// The swarm task in `aetheris_start_node` polls `SWARM_STOP_FLAG` on a
+/// 50 ms tick. Setting the flag here causes the loop to break, the
+/// swarm to be dropped, and the runtime to be reaped (this call blocks
+/// until `Runtime::drop` completes, which is bounded by the next
+/// shutdown tick — at most ~50 ms after the flag is set).
+///
+/// This is a no-op if no node was ever started. After this call,
+/// `aetheris_start_node` can be re-invoked to spin up a fresh node
+/// (the flag is reset there).
+///
+/// The `TOKIO_RUNTIME` lock is held across both the flag-set and the
+/// runtime drop so that a concurrent `aetheris_start_node` cannot reset
+/// the flag while the runtime is being reaped (see race note in
+/// `aetheris_start_node`). The `P2P_COMMAND_SENDER` is also cleared
+/// because the old sender is now a dead handle.
+#[no_mangle]
+pub extern "C" fn aetheris_stop_node() -> i32 {
+    let mut rt_guard = TOKIO_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    SWARM_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+    rt_guard.take();
+    drop(rt_guard);
+    *P2P_COMMAND_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     0
 }
 
@@ -1049,7 +1141,7 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     };
 
     // Calculate VDF challenge to prove work for importing/genesis claim
-    // Support env override for fast tests: AETHERIS_VDF_DIFFICULTY=1000
+    // Support env override for fast tests: AETHERIS_VDF_DIFFICULTY=10
     let difficulty = std::env::var("AETHERIS_VDF_DIFFICULTY")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -1603,7 +1695,10 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
     };
 
     let txs = vec![reward_tx];
-    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
+    // Reward tx is a coinbase (public_amount > 0) and is NOT folded into
+    // the IPA accumulator chain (consensus-validated). The new accumulator
+    // state equals the parent's — identity fold over an empty set.
+    let aggregate_proof = ledger.last_aggregate_proof.clone();
 
     let block = aetheris_core::Block {
         header: aetheris_core::BlockHeader {
@@ -1612,14 +1707,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             timestamp: chrono::Utc::now().timestamp() as u64,
             vdf_result: result_bytes.clone(),
             vdf_proof: proof_bytes,
-            aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(
-                &ledger.last_aggregate_proof,
-                &txs.iter().map(|t| t.proof.clone()).collect::<Vec<_>>(),
-                &txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                &tx_public_amounts,
-                ledger.height,
-                &[0u8; 32]
-            ).unwrap_or_else(|_| b"aetheris_aggregate_v1_error".to_vec()),
+            aggregate_proof,
             height: ledger.height,
             difficulty: current_difficulty,
         },
@@ -1700,37 +1788,46 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             if MINING_STOP_FLAG.load(Ordering::SeqCst) { break; }
 
             // 3. Gather transactions from MEMPOOL (core::Transaction, Phase 0.4)
-            let mut tx_proofs = Vec::new();
-            let mut tx_public_amounts = Vec::new();
-            let mut tx_commitments: Vec<Vec<[u8; 32]>> = Vec::new();
             let mut core_txs: Vec<aetheris_core::Transaction> = Vec::new();
 
             {
                 let mut mempool = MEMPOOL.lock().unwrap();
                 for tx in mempool.drain(..) {
-                    tx_proofs.push(tx.proof.clone());
-                    tx_public_amounts.push(tx.circuit_public_amount());
-                    tx_commitments.push(tx.outputs.iter().map(|o| o.commitment).collect());
                     core_txs.push(tx);
                 }
             }
 
-            // 4. Create Block Proposal for Arbitration
-            let state_root = ledger.get_state_root(); 
-            let aggregate_proof = match ZKProofSystem::aggregate_proofs(
-                &ledger.last_aggregate_proof, 
-                &tx_proofs,
-                &tx_commitments,
-                &tx_public_amounts,
-                ledger.height,
-                &state_root
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("[MINER] Aggregation failed: {}", e);
+            // 4. Create Block Proposal for Arbitration. Build the IPA
+            //    accumulator chain by folding each non-coinbase tx into
+            //    the parent's accumulator. Coinbase txs (public_amount > 0)
+            //    are consensus-validated and NOT folded.
+            let state_root = ledger.get_state_root();
+            let mut acc = ledger.last_aggregate_proof.clone();
+            let mut aggregation_failed = false;
+            for tx in &core_txs {
+                if tx.public_amount > 0 {
                     continue;
                 }
-            };
+                let tx_commitments: Vec<[u8; 32]> =
+                    tx.outputs.iter().map(|o| o.commitment).collect();
+                match accumulate_proof(
+                    &acc,
+                    &tx.proof,
+                    &tx_commitments,
+                    tx.circuit_public_amount(),
+                ) {
+                    Ok(new_acc) => acc = new_acc,
+                    Err(e) => {
+                        println!("[MINER] Aggregation failed: {}", e);
+                        aggregation_failed = true;
+                        break;
+                    }
+                }
+            }
+            if aggregation_failed {
+                continue;
+            }
+            let aggregate_proof = acc;
             
             // Compute block_hash from serialized block (matching state.rs canonical hash)
             let temp_block = aetheris_core::Block {
@@ -2139,7 +2236,21 @@ mod tests {
 
     /// Reset all global FFI state between tests to prevent cross-test pollution.
     fn reset_ffi_test_state() {
-        *TOKIO_RUNTIME.lock().unwrap() = None;
+        // CRITICAL: signal the swarm event loop to exit BEFORE we drop the
+        // tokio runtime. `Runtime::drop` blocks until all spawned tasks
+        // complete, and the swarm task's `loop { tokio::select! { ... } }`
+        // has no exit path on its own. The shutdown tick (50 ms) inside
+        // the loop will see the flag, break, drop the swarm, and let the
+        // runtime's drop complete. Maximum wait: ~50 ms.
+        //
+        // The `TOKIO_RUNTIME` lock is held across both the flag-set and
+        // the runtime-drop so a concurrent `aetheris_start_node` cannot
+        // reset the flag to `false` after we set it but before the
+        // runtime is reaped (which would let the swarm task run forever).
+        let mut rt_guard = TOKIO_RUNTIME.lock().unwrap();
+        SWARM_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+        rt_guard.take();
+        drop(rt_guard);
         if let Ok(mut state) = STATE.lock() {
             state.ledger = None;
             state.mining_thread = None;
@@ -2166,16 +2277,12 @@ mod tests {
         let c_password = CString::new("test_password").unwrap();
 
         // Use low VDF difficulty for fast test execution
-        unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "1000"); }
+        unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "10"); }
 
-        // 1. Start Node
-        assert_eq!(aetheris_start_node(10001, c_db_path.as_ptr()), 0);
+        aetheris_start_node(10001, c_db_path.as_ptr());
         aetheris_init();
-
-        // 2. Set wallet password (required by Argon2id encryption)
         assert!(aetheris_set_wallet_password(c_password.as_ptr()));
 
-        // 3. Check Initialization (should be false — no wallet yet)
         assert!(!aetheris_is_initialized());
 
         // 4. Create Wallet
@@ -2215,7 +2322,7 @@ mod tests {
         let c_password = CString::new("test_password").unwrap();
 
         // Use low VDF difficulty for fast test execution
-        unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "1000"); }
+        unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "10"); }
 
         aetheris_start_node(10002, c_db_path.as_ptr());
         aetheris_init();

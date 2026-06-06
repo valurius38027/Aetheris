@@ -383,6 +383,16 @@ impl ZkProverSystem for Halo2PastaBackend {
         const PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
         const PREFIX_LEN: usize = 19;
         const SHAPE_LEN: usize = 4;
+        // Phase 1.5 / ISSUE-1.4.D: bound the proof I/O shape BEFORE calling
+        // `ensure_keys`. With PROVING_K = 11 (2048 rows), each input/output
+        // cell costs ~66 rows; shapes (in_len + out_len) > 30 overflow the
+        // row budget and would cause `ensure_keys` to panic via
+        // `expect("keygen_vk failed")`. A 23-byte payload with
+        // `(in_len=65535, out_len=0)` is sufficient to crash any direct
+        // caller. We bound the shape here so that ALL callers
+        // (mempool DoS guard, accumulator, FFI mining loop, etc.) are
+        // protected uniformly.
+        const MAX_PROOF_IOPS: usize = 30;
         if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
             return false;
         }
@@ -390,6 +400,9 @@ impl ZkProverSystem for Halo2PastaBackend {
         let out_len = u16::from_le_bytes(
             proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN].try_into().unwrap(),
         ) as usize;
+        if in_len + out_len > MAX_PROOF_IOPS {
+            return false;
+        }
         let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
 
         let (params, (vk, _)) = (ensure_params(), ensure_keys(in_len, out_len));
