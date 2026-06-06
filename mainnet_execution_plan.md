@@ -288,6 +288,100 @@ Phase 4   生产就绪     ─→  文档/清理
 - **动作**: 修复 `ZKProofSystem` API 变更影响的所有调用点（FFI、wallet、node）
 - **验证**: `cargo check --workspace` 无警告
 
+### 1.8 Accumulator Happy-Path 集成测试 ✅ DONE
+- **来源**: ISSUANCE-1.4.C (Phase 1.4 review deferred)
+- **动作**: 5 个 end-to-end tests in `aetheris-recursive/src/block_aggregator.rs::tests` 验证 `accumulate_proof` + `verify_accumulator_chain` 用真实 ZKP proofs (非合成 bytes)
+- **文件**: `aetheris-recursive/src/block_aggregator.rs`
+- **提交**: `9744659` (source) + `ef7eb01` (docs)
+- **验证**: aetheris-recursive 33/33 pass (was 28, +5);workspace 180/180
+- **P0 风险**: 见 1.9 — circuit soundness gap 仍存在,此 5 tests 通过仅因 honest prover
+
+### 1.9 P0 — Conservation Circuit Soundness Fix 🔴 **CRITICAL, 立即启动**
+- **来源**: 用户审计 2026-06-06;`aetheris-zkp/src/halo2_pasta.rs:219-279`
+- **现状问题**:
+  1. `ValueConservationCircuit` 不约束 `sum_in - sum_out = public_amount` (仅 prover 端 `if net_value != 0 { Err(Synthesis) }` 预检 line 224-226;恶意 prover 可绕过)
+  2. `output_commitments` 字段在 synthesis 完全不用 (`halo2_pasta.rs:145` 存了但 233-278 的 `synthesize` 从未读)
+  3. `verify_conservation` 的 `_output_commitments` 参数 unused (`halo2_pasta.rs:380`)
+- **后果**: 恶意 prover 直接构造 witness + IPADeserialize,可声称任何 `amounts_in/amounts_out/public_amount` 都通过验证;`make_tx_proof` 诚实并不证明电路在保护
+- **修复范围**:
+  1. **删除预检** `if net_value != 0 { Err(Synthesis) }` (line 224-226);电路成为唯一 source of truth
+  2. **新增 gate** `conservation_running_sum`:advice 列累加 `+amount_in - amount_out`,实例列约束累加终值 = public_amount
+  3. **新增 gate** `commitment_binding` + **新 instance column**:`commitment = amount + H(blinding)`;commitments 放 instance column,verifier 可抽
+  4. **`prove_conservation` 改造**:commitments 填 instance column;返回 bytes 含 instance 数量
+  5. **`verify_conservation` 改造**:从 instance column 抽 commitments,与 `output_commitments` 参数 (改名为非 `_`) 实际比较 (不再只是 hash 进 transcript)
+  6. **Wire format**:`halo2_ipa_pasta_v1_` (19B) + shape (4B) + public_amount_instance (32B) + commitments (32B × N) + proof
+- **配套更新**:
+  - `aetheris-node/src/state.rs` validator:实际 verify commitments
+  - `aetheris-ffi/src/lib.rs` 4 个 C-ABI 函数:thread commitments 正确
+  - `aetheris-recursive/src/accumulator.rs` + `block_aggregator.rs`:commitments 验证变严肃
+  - `aetheris-wallet` send path
+  - Phase 1.8 tests `make_tx_proof` helper:新 signature
+- **新测试**:
+  - `test_conservation_rejects_inconsistent_amounts` (sum_in≠sum_out+public_amount,验证绕过预检后仍能 fail)
+  - `test_conservation_rejects_wrong_commitment` (commitment 不匹配 amount/blinding)
+  - `test_conservation_rejects_missing_commitment` (空 commitments)
+  - 回归:改写 `test_conservation_*` 系列用新 API
+- **预估**: 300-500 行,~1 天
+- **启动门**: **必须** 在 §1.12 之前完成,否则 trustless 模式基于 broken circuit
+
+### 1.10 Signed Accumulator (trusted 模式 O(1) 优化,~1 周)
+- **来源**: P1 改进
+- **动作**:
+  - `accumulate_proof` 加 ed25519 签名 (prover 私钥签 `blake3(prev_accumulator || proof || commitments || public_amount)`)
+  - `verify_accumulator_chain` 优先 O(1) signature check;O(n) replay 降为可选 audit mode
+  - Wire format:28B prefix + Q + transcript + ed25519_sig (64B) + depth = 160B
+- **未触及**: cryptographic soundness (仍 trusted aggregator)
+- **预估**: 200 行
+
+### 1.11 P2P Proof Gossip (P2P 层改进,~2 周)
+- **来源**: `AggregateProofGossip` stub in `aetheris-recursive/src/lib.rs:1175`
+- **动作**:
+  - `AggregateProofGossip` 消息体: `claimed_accumulator (96B) || proof (var) || commitments (32B × N) || signature (64B)`
+  - Receivers P2P 层先 verify signature + replay 再 gossip;拒绝伪造;DOS 防护
+  - 兼容 §1.10 (有签名) 与无签名模式
+- **未触及**: 递归 SNARK (仍 trusted)
+- **预估**: 400 行
+
+### 1.12 In-Circuit IPA Verifier Gadget (trustless blocker, 2-3 个月研发) 🔬 **研究级**
+- **目标**: 实现 Pasta 标量域算术 in Pasta Fq 域电路;IPA verifier 可在电路内 verify 一个 IPA proof
+- **基础**: Pasta 2-cycle → `Fp` (Pallas base) = `Fq` (Vesta scalar) → **原生递归,无 NonNativeChip 开销**
+- **范围**:
+  - IPA verifier 电路: 接受 IPA proof bytes + claim (Pallas point), 产生 single bit (valid/invalid)
+  - Pasta scalar field chip: Fp operations in Fq circuit
+  - Multi-open / quotient polynomial verification
+  - Fiat-Shamir transcript verification (sha/poseidon)
+- **当前位置**: `aetheris-recursive/src/lib.rs` 有 `PoseidonChip` (line 150) + `EccChip` (line 378) + `GrainLFSR` (grain.rs);**缺 IPA verifier gadget** (`NonNativeChip` / `AccumulatorChip` / `KzgChip` 不存在或已删,见 `AGENTS.md` known-buggy 备注)
+- **预估**: 1000-2000 行 gadget + 大量测试;**2-3 个月** (需熟悉 halo2_proofs + Pasta 2-cycle)
+- **依赖**: halo2_proofs PSE fork (当前 vendor) + 可能的 pasta/zk-sdk 升级
+
+### 1.13 Recursive Proof Wrapper (依赖 §1.12, ~1 周)
+- **目标**: Halo2 电路 wrapping 整个 accumulator chain → 输出 constant-size proof
+- **范围**:
+  - 电路内 verify IPA proof (用 §1.12 gadget) + 累加新 tx → 输出新 recursive proof
+  - Output: `Vec<u8>` (recursive proof bytes, 固定大小 < 10 KB)
+  - 兼容"恒定证明大小" (vs 当前 accumulator 线性增长)
+- **预估**: 300-500 行
+
+### 1.14 State Root + FFI Migration (依赖 §1.13, ~3 天)
+- **状态根**: `state_root = blake3(recursive_proof_bytes)` (新) vs `blake3(accumulator_state)` (旧)
+- **新 C-ABI** (叠加,不破现有):
+  - `aetheris_verify_recursive_proof(proof: *const u8, len: usize) -> i32` 
+  - `aetheris_get_recursive_state_root(proof: *const u8, len: usize, out: *mut [u8; 32]) -> i32`
+- **向后兼容**: 旧 node (无 recursive proof) 仍能 verify accumulator 链 (回退 §1.5-1.8 trusted 模式)
+
+### 1.15 Soft Fork Activation (~1 周)
+- **新 Block::header 字段**: `recursive_proof: Option<Vec<u8>>` (None = trusted 模式)
+- **共识规则**:
+  - block 有 `recursive_proof` → 必须 verify 成功 (用 §1.12+§1.13) 才接受
+  - block 无 `recursive_proof` → 接受 (回退 §1.5-1.8 trusted 模式)
+  - Mainnet 激活后: **必须** 带 `recursive_proof`
+- **Mainnet 启动门** = §1.12-§1.15 全部完成 + 安全审计 + testnet 试运行
+
+### 1.16 Mainnet Launch 🚀
+- **触发**: §1.12-§1.15 完成 + Phase 2-4 完成 + 全安全审计
+- **启动模式**: trustless O(1) recursive proof (新模式) + trusted accumulator 模式 (emergency fallback,默认禁用)
+- **保留代码**: §1.5-§1.8 trusted accumulator 全部保留,作为 fallback 路径 (在 hard fork 撤销前可用)
+
 ---
 
 ## Phase 2 — 钱包与隐私
