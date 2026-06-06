@@ -2592,4 +2592,8 @@ SIGNED_ACCUMULATOR_WIRE_PREFIX (28B) || Q (32B) || transcript (32B) || ed25519_s
 | `cargo test -p aetheris-wallet` | ✅ 5/5 |
 | FFI | ❌ T-01 pre-existing crash (unchanged) |
 
+### Post-Review Fix (Multi-Agent Review §1.11)
+- **Issue**: main.rs accumulator gossip handler had no dedup or rate limiting — attacker could bypass `P2PRecursiveManager`'s 100/10s limit by sending directly to the P2P event loop
+- **Fix**: +`seen_aggregates: HashSet<[u8; 32]>` for dedup + 50 verify-calls/10s window rate limiter in main.rs event loop state (commit `cb880ce`)
+
 
