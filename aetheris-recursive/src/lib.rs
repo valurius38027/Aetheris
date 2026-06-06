@@ -89,7 +89,9 @@ pub mod accumulator;
 pub use accumulator::{AccumulatorError, AccumulatorIPA};
 
 pub mod block_aggregator;
-pub use block_aggregator::{accumulate_proof, empty_accumulator, verify_accumulator_chain};
+pub use block_aggregator::{
+    accumulate_proof, empty_accumulator, signed_accumulate_proof, verify_accumulator_chain,
+};
 pub use accumulator::INNER_PROOF_PREFIX;
 
 #[derive(Clone, Debug)]

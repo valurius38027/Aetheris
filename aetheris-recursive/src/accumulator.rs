@@ -41,6 +41,14 @@ pub const INNER_PROOF_PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
 /// 28 bytes including the trailing separator.
 pub const ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_accumulator_ipa_v1_";
 
+/// Wire format prefix for the signed accumulator state.
+/// 28 bytes including the trailing separator.
+/// Total: 28 + 32 + 32 + 64 + 4 = 160 bytes.
+pub const SIGNED_ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_signed_accumulator_v1_";
+
+/// Domain separator for the ed25519 signature on accumulator claims.
+pub const ACCUMULATOR_SIGNATURE_DOMAIN: &[u8] = b"aetheris-accumulator-sig-v1\x00";
+
 /// Maximum chain depth (anti-DoS bound). 1M accumulated proofs is well
 /// beyond any realistic block chain (at 1k txs/block, 1000 blocks of
 /// depth).
@@ -87,6 +95,8 @@ pub struct AccumulatorIPA {
     pub Q: EpAffine,
     pub transcript: [u8; 32],
     pub depth: u32,
+    /// ed25519 signature on the signed claim (empty if unsigned).
+    pub signature: Option<[u8; 64]>,
 }
 
 impl Default for AccumulatorIPA {
@@ -108,6 +118,7 @@ impl AccumulatorIPA {
             Q: EpAffine::identity(),
             transcript,
             depth: 0,
+            signature: None,
         }
     }
 
@@ -266,6 +277,7 @@ impl AccumulatorIPA {
             Q: q_new,
             transcript: transcript_new,
             depth: self.depth + 1,
+            signature: None,
         })
     }
 
@@ -304,7 +316,14 @@ impl AccumulatorIPA {
         true
     }
 
-    /// Serialize to wire bytes. Format:
+    /// Attach an ed25519 signature to this accumulator.
+    /// Returns a new accumulator with the signature set.
+    pub fn with_signature(mut self, sig: [u8; 64]) -> Self {
+        self.signature = Some(sig);
+        self
+    }
+
+    /// Serialize (unsigned) to wire bytes. Format:
     ///   `ACCUMULATOR_WIRE_PREFIX` (28 bytes)
     ///   || `Q_compressed` (32 bytes; all zeros = identity)
     ///   || `transcript` (32 bytes)
@@ -329,27 +348,61 @@ impl AccumulatorIPA {
         out
     }
 
-    /// Inverse of `to_bytes`.
+    /// Serialize (signed) to wire bytes. Format:
+    ///   `SIGNED_ACCUMULATOR_WIRE_PREFIX` (28 bytes)
+    ///   || `Q_compressed` (32 bytes)
+    ///   || `transcript` (32 bytes)
+    ///   || `signature` (64 bytes, ed25519)
+    ///   || `depth` (4 bytes, little-endian)
+    ///
+    /// Returns `Err` if no signature is attached.
+    pub fn to_signed_bytes(&self) -> Result<Vec<u8>, AccumulatorError> {
+        let sig = self.signature.ok_or_else(|| {
+            AccumulatorError::BadWireFormat("no signature attached".to_string())
+        })?;
+        let mut out = Vec::with_capacity(SIGNED_ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 64 + 4);
+        out.extend_from_slice(SIGNED_ACCUMULATOR_WIRE_PREFIX);
+        if bool::from(self.Q.is_identity()) {
+            out.extend_from_slice(&[0u8; 32]);
+        } else {
+            out.extend_from_slice(self.Q.to_bytes().as_ref());
+        }
+        out.extend_from_slice(&self.transcript);
+        out.extend_from_slice(&sig);
+        out.extend_from_slice(&self.depth.to_le_bytes());
+        Ok(out)
+    }
+
+    /// Deserialize from unsigned or signed wire bytes.
+    /// Auto-detects format by prefix and length:
+    /// - 96B + `ACCUMULATOR_WIRE_PREFIX` → unsigned
+    /// - 160B + `SIGNED_ACCUMULATOR_WIRE_PREFIX` → signed (signature extracted)
+    ///
+    /// This is backward-compatible: old unsigned accumulators (96B) still
+    /// deserialize without error.
     #[allow(non_snake_case)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AccumulatorError> {
-        const EXPECTED_LEN: usize = ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 4;
-        if bytes.len() != EXPECTED_LEN {
+        let unsigned_len = ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 4; // 96
+        let signed_len = SIGNED_ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 64 + 4; // 160
+
+        // Determine format
+        let (prefix, is_signed) = if bytes.len() == signed_len && bytes.starts_with(SIGNED_ACCUMULATOR_WIRE_PREFIX) {
+            (SIGNED_ACCUMULATOR_WIRE_PREFIX, true)
+        } else if bytes.len() == unsigned_len && bytes.starts_with(ACCUMULATOR_WIRE_PREFIX) {
+            (ACCUMULATOR_WIRE_PREFIX, false)
+        } else {
             return Err(AccumulatorError::BadWireFormat(format!(
-                "expected {} bytes, got {}",
-                EXPECTED_LEN,
+                "expected {}B (unsigned) or {}B (signed) with correct prefix, got {}B",
+                unsigned_len,
+                signed_len,
                 bytes.len()
             )));
-        }
-        if !bytes.starts_with(ACCUMULATOR_WIRE_PREFIX) {
-            return Err(AccumulatorError::BadWireFormat("bad prefix".to_string()));
-        }
-        let q_start = ACCUMULATOR_WIRE_PREFIX.len();
+        };
+
+        let q_start = prefix.len();
         let mut q_bytes = [0u8; 32];
         q_bytes.copy_from_slice(&bytes[q_start..q_start + 32]);
 
-        // All-zeros encoding is reserved for the identity point (the initial
-        // accumulator). Any other encoding must deserialize as a valid
-        // non-identity on-curve Pallas point.
         let Q = if q_bytes == [0u8; 32] {
             EpAffine::identity()
         } else {
@@ -360,16 +413,27 @@ impl AccumulatorIPA {
         let mut transcript = [0u8; 32];
         transcript.copy_from_slice(&bytes[t_start..t_start + 32]);
 
-        let d_start = t_start + 32;
+        let (sig_start, d_start) = if is_signed {
+            // signed: 28 + 32 + 32 = 92, sig at 92..156, depth at 156..160
+            let sig_s = t_start + 32;
+            (Some(sig_s), sig_s + 64)
+        } else {
+            (None, t_start + 32)
+        };
+
+        let signature = if let Some(ss) = sig_start {
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&bytes[ss..ss + 64]);
+            Some(sig)
+        } else {
+            None
+        };
+
         let mut depth_bytes = [0u8; 4];
         depth_bytes.copy_from_slice(&bytes[d_start..d_start + 4]);
         let depth = u32::from_le_bytes(depth_bytes);
 
-        // Phase 1.4 on-curve validation: `EpAffine::from_bytes` already
-        // rejects points that are not on Pallas, so any non-None result is
-        // an on-curve point. No additional gate is needed here.
-
-        Ok(Self { Q, transcript, depth })
+        Ok(Self { Q, transcript, depth, signature })
     }
 }
 
@@ -535,6 +599,20 @@ mod tests {
         assert_eq!(acc.transcript, recovered.transcript);
         assert_eq!(acc.depth, recovered.depth);
         assert_eq!(acc.Q.to_bytes(), recovered.Q.to_bytes());
+        assert!(recovered.signature.is_none());
+    }
+
+    #[test]
+    fn accumulator_signed_serialize_roundtrip() {
+        let acc = AccumulatorIPA::new();
+        let sig = [0xABu8; 64];
+        let signed = acc.clone().with_signature(sig);
+        let bytes = signed.to_signed_bytes().expect("to_signed_bytes");
+        let recovered = AccumulatorIPA::from_bytes(&bytes).expect("deserialize signed");
+        assert_eq!(acc.transcript, recovered.transcript);
+        assert_eq!(acc.depth, recovered.depth);
+        assert_eq!(acc.Q.to_bytes(), recovered.Q.to_bytes());
+        assert_eq!(recovered.signature, Some(sig));
     }
 
     #[test]
@@ -546,11 +624,18 @@ mod tests {
 
     #[test]
     fn accumulator_serialize_rejects_bad_prefix() {
-        // Use the correct wire-format length (28 + 32 + 32 + 4 = 96) so the
-        // length check passes and the prefix-rejection branch is exercised.
+        // Use the correct unsigned wire-format length (28 + 32 + 32 + 4 = 96)
+        // so the length check passes and the prefix-rejection branch is exercised.
         let mut bytes = vec![0u8; ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 4];
         bytes[..4].copy_from_slice(b"junk");
         let result = AccumulatorIPA::from_bytes(&bytes);
+        assert!(matches!(result, Err(AccumulatorError::BadWireFormat(_))));
+    }
+
+    #[test]
+    fn accumulator_to_signed_bytes_fails_without_signature() {
+        let acc = AccumulatorIPA::new();
+        let result = acc.to_signed_bytes();
         assert!(matches!(result, Err(AccumulatorError::BadWireFormat(_))));
     }
 

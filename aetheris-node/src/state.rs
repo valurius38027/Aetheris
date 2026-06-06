@@ -353,6 +353,7 @@ impl LedgerState {
             &tx_proofs,
             &tx_commitments,
             &public_amounts,
+            None, // §1.10: No aggregator pubkey configured yet
         ) {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }
