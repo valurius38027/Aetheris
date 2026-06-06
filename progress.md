@@ -2169,8 +2169,9 @@ Multi-agent investigation 找到 2 root causes:
 | ~~`aetheris-zkp` 3 pre-existing warnings (strategy.rs:369, halo2_pasta.rs:960, halo2_pasta.rs:1006)~~ | ~~LOW~~ | Review A | ✅ **FIXED in Phase 1.5.7** (2 unused imports removed, 1 unused `n` used in eprintln) |
 | P2P gossip `AggregateProofGossip` stub | LOW | Design | Phase 1.5+ |
 | `aetheris-recursive::P2PRecursiveManager::verify_aggregate_proof` | LOW | Design | Phase 1.5+ |
-| ISSUANCE-1.4.C: Accumulator 集成测试 (happy-path) | MEDIUM | Phase 1.4 | Phase 1.5+ (需 make_proof helper 暴露) |
+| ISSUANCE-1.4.C: Accumulator 集成测试 (happy-path) | MEDIUM | Phase 1.4 | ✅ **FIXED in Phase 1.8** (5 new tests at `aetheris-recursive/src/block_aggregator.rs::tests` exercise real ZKP-backed accumulator chain: single/3-tx/multi-block/empty/tampered) |
 | ~~`aetheris-crypto::classgroup.rs:112` `debug_assert_eq!` 在错误 discriminant form 上 panic~~ | ~~MEDIUM (pre-existing)~~ | Phase 1.6 Review B | ✅ **FIXED in Phase 1.7** (boundary check in `VDF::verify` at `aetheris-crypto/src/vdf.rs:110-117` rejects forms with wrong discriminant at the boundary, before `compose` is called; 3 new crypto tests + 1 new zkp test) |
+| 🔴 **P0**: `ValueConservationCircuit` 在 `aetheris-zkp/src/halo2_pasta.rs` 不强制 `sum_in - sum_out = public_amount`,也不绑定 `output_commitments` 到 witness。`verify_conservation` 的 `_output_commitments` 参数是 unused。当前 tests 通过仅因 prover 端 `if net_value != 0 { Err(Synthesis) }` 预检 (`halo2_pasta.rs:224-226`),恶意 prover 可绕过。 | 🔴 **CRITICAL** | User audit (2026-06-06) | **Phase 1.9** (next): 加 real conservation running sum gate + commitment binding + 重写 `verify_conservation` 实际使用 commitments + 配套更新所有 call sites |
 
 ### Phase 1.5.6 — Deferred Issue Remediation (Post-Phase-1.5 cleanup)
 
@@ -2230,6 +2231,13 @@ All 4 deferred warnings (1 MINOR pre-existing test defect + 3 LOW pre-existing a
 ### Phase 1.5 范围
 - **bounded to**: `aetheris-recursive` (新 `block_aggregator.rs` module) + `aetheris-zkp/src/lib.rs` (TxCommitments re-export) + `aetheris-node/Cargo.toml` + `aetheris-node/src/state.rs` + `aetheris-ffi/src/lib.rs`
 - **未触及**: aetheris-core, aetheris-crypto, aetheris-wallet, aetheris-ffi/Cargo.toml (dep 早加), 任何 verification 逻辑(IPA chain validation 是 1.5 范围;conservation proof verification 保持 1.4)
+
+> ⚠️ **P1 — Accumulator 是 trusted-aggregator + O(n) replay,不是 O(1) trustless recursive SNARK。**
+> `aetheris-recursive::block_aggregator::accumulate_proof` 由单一 prover 在链外累加 `hash(proof || commitments)`;`verify_accumulator_chain` 在 verifier 端 O(n) replay 累加并比较。
+> - **接受标准 (Phase 1.5)**: 篡改 proof/commitments/public_amount → 链 replay 拒绝;wire format 稳定;coinbase 排除规则清晰
+> - **未声称为**: O(1) trustless 递归验证 (in-circuit IPA verification);accumulator 可被单一 prover 完全控制
+> - **O(1) trustless 递归是未来工作** (Phase 3+? 需 IPA verifier gadget + 真正的 Halo2 recursive proof wrapper)
+> - **实际意义**: 在 mainnet 启动的初期,可假设 validator 节点是诚实的;若要 trustless,需 (a) IPA verifier 电路 (b) accumulator 自身的 SNARK wrapper (c) P2P 重新设计 (gossip 累积 state 而非单一 accumulator)
 
 ### Phase 1.6 — Real Wesolowski VDF in `ZkProverSystem` Trait
 
@@ -2357,5 +2365,46 @@ Helper function `corrupt_form_discriminant` in `vdf.rs`: XOR-flip a byte at offs
 - **bounded to**: `aetheris-crypto` (src/vdf.rs) + `aetheris-zkp` (src/halo2_pasta.rs)
 - **未触及**: aetheris-core, aetheris-node, aetheris-ffi, aetheris-wallet, aetheris-recursive
 - **Note**: changed `aetheris-crypto` for the first time since Phase 1.0 (fix is in a new test section + a 4-line guard in the verify function; no public API changes)
+
+### Phase 1.8 — Accumulator Happy-Path Integration Tests (ISSUANCE-1.4.C)
+
+Resolves the deferred Phase 1.4 review finding **ISSUANCE-1.4.C** ("Accumulator 集成测试 (happy-path) 需 `make_proof` helper 暴露"). Adds 5 end-to-end tests in `aetheris-recursive/src/block_aggregator.rs::tests` that exercise `accumulate_proof` + `verify_accumulator_chain` with **real ZK proofs** (not synthetic bytes) via `ZKProofSystem::prove_conservation` + `create_commitment`.
+
+**Test helper** `make_tx_proof(amount, blinding_seed, public_amount) -> (Vec<u8>, Vec<[u8;32]>)`:
+- Builds `blinding = [blinding_seed; 32]`, `commitment = create_commitment(amount, &blinding)`
+- Calls `ZKProofSystem::prove_conservation(&[amount], &[amount], &[blinding], &[blinding], &[commitment], public_amount)`
+- Returns `(proof, vec![commitment])` for the accumulator
+
+**5 new tests**:
+1. `single_tx_chain_validates` — depth 1 roundtrip
+2. `three_tx_chain_validates` — depth 3 sequential accumulation
+3. `multi_block_chain_chains_across_blocks` — 2+2 cross-block, full replay from genesis ≡ block 2's chained claim
+4. `empty_block_still_produces_valid_accumulator` — no-op regression (no proofs → self-validates)
+5. `invalid_proof_byte_rejected` — tamper last byte → either accumulate returns Err or subsequent verify returns false
+
+**Why this matters**: Phase 1.5's accumulator had 4 unit tests but they used synthetic bytes that exercised the wire-format layer only. ISSUANCE-1.4.C was the deferred follow-up to validate that the accumulator correctly chains real ZK proofs. The 5 new tests lock in the protocol-level invariants (chained accumulation, cross-block continuity, full-replay equivalence, tamper rejection) that mainnet will rely on.
+
+**⚠️ P0 risk disclosure (see Open Issues table)**: The ValueConservationCircuit in `aetheris-zkp/src/halo2_pasta.rs` does NOT cryptographically bind `sum_in - sum_out = public_amount` or `commitment = amount + H(blinding)`. The `verify_conservation` `_output_commitments` parameter is unused. These 5 tests pass only because `make_tx_proof` is honest (self-conserving amounts via the prover-side pre-check at `halo2_pasta.rs:224-226`). **Phase 1.9 will close this gap by adding real circuit constraints**; the test helper's protocol-level coverage is valid regardless of the underlying circuit soundness.
+
+**Verification**:
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- aetheris-core: 21/21 pass
+- aetheris-crypto: 41/41 pass
+- aetheris-recursive: **33/33 pass** (was 28, +5 new) in ~23s
+- aetheris-node: 9/9 pass
+- aetheris-ffi: 3/3 pass (~18s)
+- aetheris-wallet: 5/5 pass
+- aetheris-zkp: 68/68 pass
+- Total: **180/180** (was 175, +5 new)
+
+**Files modified** (1 source + progress.md):
+- `aetheris-recursive/src/block_aggregator.rs` — +162 lines (5 tests + 1 helper)
+- `progress.md` — this entry + Open Issues ISSUANCE-1.4.C marked FIXED + new P0 row + P1 warning callout
+
+**Phase 1.8 范围**:
+- **bounded to**: `aetheris-recursive` (src/block_aggregator.rs::tests only) + `progress.md`
+- **未触及**: 任何 production code, 任何 cryptographic verification logic
+
+**Commit**: `9744659` (source) → `(next commit)` (docs)
 
 

@@ -268,6 +268,15 @@ Phase 4   生产就绪     ─→  文档/清理
 - **文件**: `aetheris-node/src/state.rs`、`aetheris-node/src/main.rs`
 - **验证**: 多区块递归链验证通过
 
+> ⚠️ **P1 — Accumulator 是 trusted-aggregator + O(n) replay,不是 O(1) trustless 递归。**
+> 当前实现 (`aetheris-recursive::block_aggregator`) 由单一 prover 在链外累加 `hash(proof || commitments)`;verifier O(n) replay 比对。**未实现 in-circuit IPA verification**;accumulator chain 不是递归 SNARK。
+>
+> **接受标准 (当前)**: (1) 篡改 proof/commitments/public_amount → 链 replay 拒绝; (2) wire format 稳定 (28B prefix + Pallas Q + transcript + LE u32 depth = 96B); (3) coinbase 排除规则清晰 (validator `filter(|tx| tx.public_amount <= 0)` in `aetheris-node::state.rs`)
+>
+> **未声称为**: O(1) trustless 递归 (需 IPA verifier gadget + 真正 Halo2 recursive proof wrapper);P2P gossip 累积 state 而非单一 accumulator
+>
+> **Mainnet 影响**: 启动期假设 validator 节点诚实;若要 trustless → Phase 3+ 重新设计 (a) IPA verifier 电路 (b) accumulator SNARK wrapper (c) P2P 累积协议 (d) 替换 gossip schema
+
 ### 1.6 实现真实 VDF prove/verify
 - **来源**: B-3（原是 1.5）
 - **动作**: 实现 Wesolowski VDF 证明生成和验证（非 blake3 hash）
