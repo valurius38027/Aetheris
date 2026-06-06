@@ -957,7 +957,6 @@ mod synthetic_roundtrip_tests {
     use halo2_proofs::halo2curves::ff::WithSmallOrderMulGroup;
     use halo2_backend::poly::{EvaluationDomain, Coeff, ExtendedLagrangeCoeff, Polynomial};
     use rand::rngs::OsRng;
-    use rand::RngCore;
 
     /// Evaluate a polynomial (coefficient slice) at a point using Horner.
     fn horner<F: Field>(coeff: &[F], point: F) -> F {
@@ -1054,8 +1053,8 @@ mod synthetic_roundtrip_tests {
                 max_spurious, degree, degree, extended_n
             );
         }
-        eprintln!("[SYNTH] test_extended_to_coeff_low_degree PASSED (deg={}, ext_n={})",
-            degree, extended_n);
+        eprintln!("[SYNTH] test_extended_to_coeff_low_degree PASSED (n={}, deg={}, ext_n={})",
+            n, degree, extended_n);
     }
 
     #[test]
