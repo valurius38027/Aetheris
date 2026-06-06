@@ -1396,7 +1396,7 @@ RSA-2048 VDF 的安全性依赖 **"RSA Labs 确实销毁了因数"** 这一信�
 |----|------|------|------|------|
 | **B-1** | aetheris-zkp | `unwrap_or(0)` 对 input/output amounts 静默截断 | `lib.rs:224, 279` | 缺项 amount 被零替换 |
 | **B-2** | aetheris-zkp | `unwrap_or(Fr::zero())` 对无效 commitment 字节静默接受 | `lib.rs:442, 490` | 畸形链上 commitment 被当作零 |
-| **B-3** | aetheris-zkp | `prove_vdf` 是 blake3 哈希，非 VDF 证明；无 `verify_vdf` | `lib.rs:705-715` | 半实现不可用 |
+| **B-3** | aetheris-zkp | `prove_vdf` 是 blake3 哈希，非 VDF 证明；无 `verify_vdf` | `lib.rs:705-715` | ✅ **FIXED in Phase 1.6** (real Wesolowski VDF via `aetheris_crypto::VDF` default trait impl; signature changed to `(Vec<u8>, Vec<u8>)` for `prove_vdf`; 11 new tests cover roundtrip, wrong-difficulty, wrong-seed, D=0, bypass, corruption, empty, determinism, wire-format size, empty-seed, comprehensive bypass) |
 | **B-4** | aetheris-zkp | Viewing key 直接用作 X25519 `StaticSecret`（DH 权力与查看权力未分离） | `lib.rs:626-627` | 查看密钥有等同花费密钥的 DH 能力 |
 | **B-5** | aetheris-node | `get_state_root()` 是排序列表 Merkle root，非稀疏 Merkle 树，O(n log n)，不产生成员证明 | `state.rs:227-232` | 状态根承诺不可扩展 |
 | **B-6** | aetheris-node | Mempool 不检查 nullifier 唯一性、不验证 inputs 引用有效 commitment | `main.rs:25-37` | 双花 tx 可进入 mempool |
@@ -2160,7 +2160,8 @@ Multi-agent investigation 找到 2 root causes:
 | ~~Mining race in `apply_block_for_mining`~~ | ~~BLOCKER~~ | Review A | ✅ **FIXED in Phase 1.5.6** (mining thread refactor to use `state.ledger` under `STATE.lock()`) |
 | ~~State leakage: `state.cipher` reuse with `public_amount=0`~~ | ~~MAJOR~~ | Review A | ❌ **FALSE POSITIVE** (Phase 1.5.6 investigation: cipher is per-wallet; `trial_decrypt` returns `None` on wrong key, verified by `aetheris-zkp::halo2_pasta.rs:664-687` unit tests; no cross-user data path exists) |
 | ~~Coinbase double-spend on shared DB paths~~ | ~~MAJOR~~ | Review A | ❌ **FALSE POSITIVE** (Phase 1.5.6 investigation: `tempdir()` is unique per test; `aetheris-node::state.rs:275-277` apply_block height replay protection; `aetheris_import_wallet:1166-1168` mnemonic-already-exists guard; no exploit path) |
-| `aetheris_start_node` returns 0 on network init failure | MINOR | Review A | Out of 1.5 scope; defer to 1.6 |
+| `aetheris_start_node` returns 0 on network init failure | MINOR | Review A | Out of 1.5 scope; defer to 1.6+ |
+| ~~`aetheris-zkp::prove_vdf` 是 blake3 哈希,非 VDF 证明;无 `verify_vdf` (B-3)~~ | ~~MEDIUM (pre-existing)~~ | Audit B-3 | ✅ **FIXED in Phase 1.6** (real Wesolowski VDF via `aetheris_crypto::VDF` default trait impl; signature `(Vec<u8>, Vec<u8>)` for `prove_vdf` and `(result, proof, seed, diff)` for `verify_vdf`; 11 new tests at `aetheris-zkp/src/halo2_pasta.rs::tests`) |
 | ~~Genesis `state_root: [0u8; 32]` hardcoded mismatch with H-1 validation~~ | ~~HIGH (pre-existing)~~ | Review B | ✅ **FIXED in Phase 1.5.6** (now uses `aetheris_zkp::build_merkle_root(&[])` = `blake3("empty_tx_list")`, matches H-1's `get_state_root()`) |
 | ~~`test_genesis_import` swallows `apply_block` errors~~ | ~~HIGH (pre-existing)~~ | Review B | ✅ **FIXED in Phase 1.5.6** (production: `set_error` + `return false`; test strengthened to assert `height==1`, `commitments.len()==3`, `nullifiers.len()==1`, deterministic `genesis_identity_hash` in `b"genesis_identity_hash"` sled key) |
 | ~~`EXPECTED_GENESIS_HASH` stale~~ | ~~HIGH (pre-existing)~~ | Review B | ✅ **FIXED in Phase 1.5.6** (recomputed to `63644c4285ce95b5c9abc7cb1dbc8b473cf3c1ebfcaeb783f5399281f1b433fe`; new `b"genesis_identity_hash"` sled key persists deterministic hash; mainnet check non-blocking with CRITICAL log; `test_genesis_hash_locked` regression test) |
@@ -2228,6 +2229,66 @@ All 4 deferred warnings (1 MINOR pre-existing test defect + 3 LOW pre-existing a
 ### Phase 1.5 范围
 - **bounded to**: `aetheris-recursive` (新 `block_aggregator.rs` module) + `aetheris-zkp/src/lib.rs` (TxCommitments re-export) + `aetheris-node/Cargo.toml` + `aetheris-node/src/state.rs` + `aetheris-ffi/src/lib.rs`
 - **未触及**: aetheris-core, aetheris-crypto, aetheris-wallet, aetheris-ffi/Cargo.toml (dep 早加), 任何 verification 逻辑(IPA chain validation 是 1.5 范围;conservation proof verification 保持 1.4)
+
+### Phase 1.6 — Real Wesolowski VDF in `ZkProverSystem` Trait
+
+Resolves audit finding **B-3** (`prove_vdf` is blake3 hash, not VDF proof; no `verify_vdf`). The `ZkProverSystem::prove_vdf` / `verify_vdf` trait methods in `aetheris-zkp/src/trait_.rs:52-60` were previously stubbed (returned `b"vdf_zkp_pasta_v1_simulated"` and `true` respectively). Phase 1.6 replaces these with real Wesolowski class-group VDF calls delegating to `aetheris_crypto::VDF`.
+
+**Cargo**: `aetheris-zkp/Cargo.toml` adds `aetheris-crypto = { path = "../aetheris-crypto" }`. No cycle (crypto is a leaf crate; `aetheris-recursive` already links both as precedent).
+
+**Trait signature** (BREAKING — but no workspace callers, see Investigation):
+- `fn prove_vdf(public_seed: &[u8], difficulty: u64) -> (Vec<u8>, Vec<u8>)` — returns `(result, proof)` instead of single `Vec<u8>` (matches `VDF::solve` tuple, plus matches `Block::header.vdf_result`/`vdf_proof` field split used throughout the codebase).
+- `fn verify_vdf(result: &[u8], proof: &[u8], public_seed: &[u8], difficulty: u64) -> bool` — gained leading `result` arg, reordered to `(result, proof, public_seed, difficulty)` for natural read order matching block-header field order.
+
+**Default impl pattern**: trait methods now have default impls that call `aetheris_crypto::VDF::new(d).solve(seed)` and `VDF::new(d).verify(seed, result, proof)`. Both `Halo2PastaBackend` and `Halo2BN254Backend` inherit the same VDF (VDF is curve-independent; class group discriminant is hardcoded in `VDF::new`). The 6-line stub overrides in `halo2_pasta.rs:513-519` and `halo2_bn254.rs:438-444` were deleted (pasta) / made unreachable (bn254 is intentionally untracked + not in `lib.rs`).
+
+**Security properties preserved**:
+- Difficulty binding: `VDF::verify` recomputes `r = 2^d mod l` from the caller's difficulty, so a proof generated at D=10 is rejected at D=20 (empirically verified by `test_pasta_backend_prove_vdf_wrong_difficulty`).
+- No trusted setup: class group discriminant is deterministic (`b"Aetheris Class Group V1"`).
+- Sequential cost: `prove_vdf` is O(D) squarings — D=1.6M ≈ 80s on modern CPU. Documented in trait method doc-comments.
+
+**11 new tests** in `aetheris-zkp/src/halo2_pasta.rs::tests` (under "ZkProverSystem::prove_vdf / verify_vdf" section, ~0.1s total):
+1. `test_pasta_backend_prove_vdf_roundtrip` — prove→verify at same D/seed
+2. `test_pasta_backend_prove_vdf_wrong_difficulty` — D=10 prove, D=20 verify → false
+3. `test_pasta_backend_prove_vdf_wrong_seed` — seed A prove, seed B verify → false
+4. `test_pasta_backend_prove_vdf_difficulty_zero` — D=0 roundtrip
+5. `test_pasta_backend_prove_vdf_bypass_rejected` — old 25-byte stub string rejected
+6. `test_pasta_backend_prove_vdf_bypass_rejected_comprehensive` — 4 prefix variants rejected
+7. `test_pasta_backend_prove_vdf_corrupted_proof` — `proof[0] ^= 0xFF` rejected
+8. `test_pasta_backend_prove_vdf_empty_inputs_rejected` — empty result/proof rejected
+9. `test_pasta_backend_prove_vdf_determinism` — same args → identical output
+10. `test_pasta_backend_prove_vdf_wire_format_size` — output is class-group-sized (>100 bytes), not stub
+11. `test_pasta_backend_prove_vdf_empty_seed` — `prove_vdf(b"", 10)` roundtrip
+
+**Note on test 7**: flipping `proof[0]` corrupts the length prefix, causing `Form::from_bytes` to return `None` (deserialization rejection) — exercises the same path as `aetheris-crypto::vdf.rs:455-460` (the existing crypto test uses the same pattern). Flipping a byte deep in the form encoding would risk the `classgroup.rs:112` `debug_assert_eq!` panic (mismatched-discriminant form), which is a pre-existing limitation of the crypto layer (out of Phase 1.6 scope; would require converting the `debug_assert` to a runtime check returning an error).
+
+**Multi-Agent Review 1.6**:
+- Reviewer A: ✅ APPROVED (1 minor warning: doc comments — now added)
+- Reviewer B: ⚠️ WARNINGS (5 MUST-ADD: determinism, wire-format size, empty-seed at trait layer, more bypass attempts, more thorough corrupted-proof analysis; 3 SHOULD-ADD: doc comments, PASTA_VDF_DIFF constant rationale, cross-difficulty diff)
+- **Iteration** (lead): added 4 new tests (determinism, wire_format_size, empty_seed, bypass_rejected_comprehensive), added comprehensive `///` doc comments to both trait methods, fixed "18-byte" comment to "25-byte", added rationale comment for `PASTA_VDF_DIFF = 10` constant
+- **Note**: Reviewer B suggested flipping `proof[proof.len()-1]` (cryptographic-region corruption) but this triggers the pre-existing `classgroup.rs:112` debug_assert_eq! panic — same limitation as `aetheris-crypto::vdf.rs:455-460`; not addressed in this phase.
+
+**Verification**:
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- aetheris-core: 21/21 pass
+- aetheris-crypto: 38/38 pass
+- aetheris-recursive: 28/28 pass
+- aetheris-node: 9/9 pass
+- aetheris-ffi: 3/3 pass (~17s)
+- aetheris-wallet: 5/5 pass
+- aetheris-zkp: 67/67 pass (was 56, +11 new VDF tests; total: 171/171)
+
+**Files modified** (3 source + progress.md):
+- `aetheris-zkp/Cargo.toml` — added `aetheris-crypto` dep
+- `aetheris-zkp/src/trait_.rs` — default impls + doc comments
+- `aetheris-zkp/src/halo2_pasta.rs` — deleted stub, added 11 tests
+- `aetheris-zkp/src/halo2_bn254.rs` — deleted stub (file is untracked, not in `lib.rs`; change is cosmetic)
+- `progress.md` — this entry
+
+**Phase 1.6 范围**:
+- **bounded to**: `aetheris-zkp` only (Cargo.toml + src/trait_.rs + src/halo2_pasta.rs + src/halo2_bn254.rs)
+- **未触及**: aetheris-core, aetheris-crypto (consumer, not modified), aetheris-node, aetheris-ffi, aetheris-wallet, aetheris-recursive
+
 
 ### Wire Format
 
