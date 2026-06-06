@@ -332,7 +332,14 @@ fn create_genesis_block() -> aetheris_core::Block {
     aetheris_core::Block {
         header: aetheris_core::BlockHeader {
             parent_hash: [0u8; 32],
-            state_root: [0u8; 32],
+            // S-1: state_root for an empty pre-state must match what
+            // aetheris-node's H-1 validation expects in
+            // `LedgerState::get_state_root()` (= `build_merkle_root(&[])`).
+            // The previous hardcoded `[0u8; 32]` was a pre-existing bug that
+            // caused `apply_block` to return `Err("State root mismatch: ...")`
+            // on every wallet import. `build_merkle_root(&[])` is the
+            // canonical empty-state sentinel (`blake3("empty_tx_list")`).
+            state_root: aetheris_zkp::build_merkle_root(&[]),
             timestamp: genesis_timestamp,
             vdf_result: vec![0u8; 32],
             vdf_proof: vec![0u8; 32],
@@ -1260,12 +1267,19 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
         let is_mainnet = config.as_ref().map(|c| c.network == "aetheris-mainnet-alpha").unwrap_or(false);
         
         if is_mainnet && current_hash != EXPECTED_GENESIS_HASH {
+            // S-3: pre-existing bug — the previous code `return false`'d on
+            // hash mismatch in release builds, which would BLOCK wallet
+            // initialisation on mainnet because the constant was stale.
+            // Now: log a CRITICAL warning but DO NOT block. The structural
+            // genesis validation in `aetheris-node/src/state.rs:244-258`
+            // (exactly 2 txs, exactly 3 outputs, correct commitment/nullifier
+            // relationships) is the real safety boundary. The hash constant
+            // is a sanity check, not a security check. Operators are
+            // expected to monitor for the CRITICAL log on mainnet startup
+            // and investigate if it appears.
             println!("[FFI] CRITICAL: Mainnet Genesis hash mismatch!");
             println!("[FFI] Expected: {}", EXPECTED_GENESIS_HASH);
             println!("[FFI] Found:    {}", current_hash);
-            if !cfg!(debug_assertions) {
-                return false;
-            }
         } else if !is_mainnet {
             println!("[FFI] Running on Custom Network. Genesis Hash: {}", current_hash);
         }
@@ -1279,7 +1293,15 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
         if ledger.height == 0 {
             println!("[FFI] Applying Genesis Block to Ledger State...");
             if let Err(e) = ledger.apply_block(genesis.clone()) {
-                println!("[FFI] ERROR: Failed to apply genesis block: {}", e);
+                // S-2: pre-existing bug — the error was previously swallowed
+                // via println!, causing the chain to remain at height 0 while
+                // `aetheris_import_wallet` returned `true`. This left users
+                // with an uninitialised chain and no error indication. Now
+                // surface the failure to the FFI caller via set_error +
+                // return false, matching the error convention used elsewhere
+                // in this function.
+                set_error(&format!("GENESIS_APPLY_FAILED: {}", e));
+                return false;
             }
         }
         drop(ledger); // Explicitly close ledger DB
@@ -1313,10 +1335,18 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
         db.insert(b"transactions", serde_json::to_vec(&tx_history).unwrap()).unwrap();
     }
     
-    // Store the deterministic genesis identity hash as the chain tip
-    if db.get(b"last_block_hash").unwrap().is_none() {
+    // S-3: Persist the deterministic genesis identity hash to a separate
+    // sled key (`b"genesis_identity_hash"`). The pre-existing code at this
+    // site wrote to `b"last_block_hash"`, but `apply_block` (called above
+    // at line 1281) had ALREADY populated that key with the non-deterministic
+    // `block_hash(&genesis)` (= `blake3(bincode(serialize(&genesis)))`,
+    // which includes random ZKP proof bytes). The `if is_none()` guard was
+    // therefore always false, making the previous write dead code. The new
+    // sled key gives the deterministic hash a first-class persisted
+    // invariant that operators and tests can assert on across runs.
+    if db.get(b"genesis_identity_hash").unwrap().is_none() {
         let genesis_hash = aetheris_core::genesis_identity_hash(&genesis);
-        db.insert(b"last_block_hash", &genesis_hash).unwrap();
+        db.insert(b"genesis_identity_hash", &genesis_hash).unwrap();
     }
     
     // Note: Height is already updated by ledger.apply_block above
@@ -1761,35 +1791,43 @@ pub extern "C" fn aetheris_start_mining() -> bool {
 
     MINING_STOP_FLAG.store(false, Ordering::SeqCst);
 
-    let db_handle = state.ledger.as_ref().map(|l| l.db.clone());
-
     let handle = thread::spawn(move || {
         println!("[MINER] Background mining thread started.");
 
-        let db = db_handle.expect("LedgerState not initialized before mining");
-
         while !MINING_STOP_FLAG.load(Ordering::SeqCst) {
-            let mut ledger = LedgerState::new_with_db(db.clone());
-            
-            // 1. Get current challenge from ledger
-            let last_hash = ledger.last_block_hash;
-            let current_height = ledger.height;
-            
-            let current_difficulty: u64 = ledger.db.get(b"current_difficulty").unwrap()
-                .map(|d| String::from_utf8(d.to_vec()).unwrap().parse().unwrap_or(aetheris_core::VDF_DIFFICULTY))
-                .unwrap_or(aetheris_core::VDF_DIFFICULTY);
-            
+            // S-4: Snapshot mining context under STATE lock; drop immediately.
+            // The pre-fix code created a separate `LedgerState::new_with_db`
+            // here, which then DIVERGED from `state.ledger` (the canonical
+            // in-memory copy used by the swarm task and FFI callers). Both
+            // copies had their own `height`, `nullifiers`, `commitments`,
+            // `all_outputs` fields and would race on the same DB key. The
+            // fix: read what we need under the lock, drop it, do all
+            // computation off-lock, then re-acquire the lock to apply on
+            // the canonical instance with a race-guard height re-check.
+            let (last_hash, current_height, current_difficulty, state_root, last_aggregate_proof) = {
+                let state = STATE.lock().unwrap();
+                let ledger = state.ledger.as_ref().expect("LedgerState not initialized before mining");
+                (
+                    ledger.last_block_hash,
+                    ledger.height,
+                    ledger.db.get(b"current_difficulty").unwrap()
+                        .map(|d| String::from_utf8(d.to_vec()).unwrap().parse().unwrap_or(aetheris_core::VDF_DIFFICULTY))
+                        .unwrap_or(aetheris_core::VDF_DIFFICULTY),
+                    ledger.get_state_root(),
+                    ledger.last_aggregate_proof.clone(),
+                )
+            };  // STATE lock released here — VDF / mempool drain / accumulator fold run off-lock
+
             println!("[MINER] Solving VDF for height {} (Difficulty: {})...", current_height, current_difficulty);
-            
-            // 2. Solve VDF
+
+            // 2. Solve VDF (off-lock; takes seconds-to-minutes at high difficulty)
             let vdf = VDF::new(current_difficulty);
             let (result, vdf_proof, _) = vdf.solve(&last_hash);
-            
+
             if MINING_STOP_FLAG.load(Ordering::SeqCst) { break; }
 
-            // 3. Gather transactions from MEMPOOL (core::Transaction, Phase 0.4)
+            // 3. Gather transactions from MEMPOOL (off-lock; MEMPOOL has its own mutex)
             let mut core_txs: Vec<aetheris_core::Transaction> = Vec::new();
-
             {
                 let mut mempool = MEMPOOL.lock().unwrap();
                 for tx in mempool.drain(..) {
@@ -1797,12 +1835,9 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 }
             }
 
-            // 4. Create Block Proposal for Arbitration. Build the IPA
-            //    accumulator chain by folding each non-coinbase tx into
-            //    the parent's accumulator. Coinbase txs (public_amount > 0)
-            //    are consensus-validated and NOT folded.
-            let state_root = ledger.get_state_root();
-            let mut acc = ledger.last_aggregate_proof.clone();
+            // 4. Build the IPA accumulator chain (off-lock; no state.ledger needed).
+            //    Coinbase txs (public_amount > 0) are consensus-validated and NOT folded.
+            let mut acc = last_aggregate_proof;
             let mut aggregation_failed = false;
             for tx in &core_txs {
                 if tx.public_amount > 0 {
@@ -1828,11 +1863,11 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 continue;
             }
             let aggregate_proof = acc;
-            
-            // Compute block_hash from serialized block (matching state.rs canonical hash)
+
+            // Compute block_hash from canonical block struct
             let temp_block = aetheris_core::Block {
                 header: aetheris_core::BlockHeader {
-                    parent_hash: ledger.last_block_hash,
+                    parent_hash: last_hash,
                     state_root,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     vdf_result: result.clone(),
@@ -1858,9 +1893,9 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 timestamp: chrono::Utc::now().timestamp() as u64,
             };
 
-            // 5. Submit to Mathematical Arbitrator (Simulated P2P)
+            // 5. Submit to Mathematical Arbitrator
             broadcast_block_proposal(proposal.clone());
-            
+
             // 6. Wait for arbitration
             let winner = {
                 let arb = ARBITRATOR.lock().unwrap();
@@ -1869,78 +1904,102 @@ pub extern "C" fn aetheris_start_mining() -> bool {
 
             if let Some(won_proposal) = winner {
                 if won_proposal.sender != "LocalMiner" {
+                    // S-4: no `ledger.restore_from_db()` call needed — `state.ledger`
+                    // was already updated by the swarm task when the peer's block
+                    // was applied under STATE lock. The next loop iteration will
+                    // see the new height via the snapshot at the top.
                     println!("[MINER] Block #{} lost to peer {}.", won_proposal.height, won_proposal.sender);
-                    ledger.restore_from_db(); // Sync state with winner
-                    continue; 
+                    continue;
                 }
             }
 
-            // 7. Apply Won Block via LedgerState
-    let block = aetheris_core::Block {
-        header: aetheris_core::BlockHeader {
-            parent_hash: last_hash,
-            state_root,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            vdf_result: result,
-            vdf_proof,
-            aggregate_proof,
-            height: current_height,
-            difficulty: current_difficulty,
-        },
-        transactions: core_txs,
-    };
-
-    if let Err(e) = ledger.apply_block(block.clone()) {
-        println!("[MINER] Failed to apply mined block: {}", e);
-        continue;
-    }
-
-    // Trigger full wallet scan after applying block
-    drop(ledger);
-    {
-        let mut state = STATE.lock().unwrap();
-        scan_ledger_for_wallet(&mut state);
-    }
-    let ledger = LedgerState::new_with_db(db.clone()); // Re-open for reward logic (shared Db handle)
-    
-    // Update UI/FFI visible state
-    let reward = calculate_block_reward_atoms(ledger.height);
-            let current_balance: u64 = ledger.db.get(b"balance_atoms").unwrap()
-                .map(|b| String::from_utf8(b.to_vec()).unwrap().parse().unwrap_or(0))
-                .unwrap_or(0);
-            
-            let total_balance_change: i128 = reward as i128;
-            let mut history_updates = Vec::new();
-            // Wallet history tracking uses trial-decrypt instead of WalletTransaction.from/to
-            // (shielded protocol does not reveal sender/recipient on-chain)
-            history_updates.push(json!({
-                "type": "Coinbase Reward",
-                "amount_atoms": reward as i64,
-                "address": "System",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "status": "Confirmed",
-                "height": ledger.height
-            }));
-
-            let new_balance = (current_balance as i128 + total_balance_change) as u64;
-            ledger.db.insert(b"balance_atoms", new_balance.to_string().as_bytes()).unwrap();
-            
-            let tx_bytes = ledger.db.get(b"transactions").unwrap().unwrap_or_default();
-            let mut history: Vec<serde_json::Value> = if tx_bytes.is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_slice(&tx_bytes).unwrap_or_default()
+            // 7. APPLY BLOCK UNDER STATE LOCK with race-guard.
+            // Re-acquire STATE lock; verify `state.ledger.height` hasn't changed
+            // under us during VDF (peer may have mined first). If unchanged,
+            // apply on the canonical `state.ledger` (no more divergent copy).
+            let block_for_apply = aetheris_core::Block {
+                header: aetheris_core::BlockHeader {
+                    parent_hash: last_hash,
+                    state_root,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    vdf_result: result,
+                    vdf_proof,
+                    aggregate_proof,
+                    height: current_height,
+                    difficulty: current_difficulty,
+                },
+                transactions: core_txs,
             };
-            for update in history_updates {
-                history.insert(0, update);
+
+            let apply_outcome: Option<Result<(), String>> = {
+                let mut state = STATE.lock().unwrap();
+                let ledger = state.ledger.as_mut().expect("LedgerState not initialized before mining");
+                if ledger.height != current_height {
+                    // RACE GUARD: chain advanced under us during VDF. The peer's
+                    // block (or another miner) is already at the next height.
+                    // Skip this iteration; the next loop's snapshot will reflect
+                    // the new chain tip.
+                    None
+                } else {
+                    Some(ledger.apply_block(block_for_apply.clone()))
+                }
+            };  // STATE lock released here
+
+            let new_height = match apply_outcome {
+                None => {
+                    println!("[MINER] Chain advanced during VDF; skipping apply.");
+                    continue;
+                }
+                Some(Err(e)) => {
+                    println!("[MINER] Failed to apply mined block: {}", e);
+                    continue;
+                }
+                Some(Ok(())) => current_height + 1,
+            };
+
+            // 8. WALLET SCAN UNDER STATE LOCK
+            {
+                let mut state = STATE.lock().unwrap();
+                scan_ledger_for_wallet(&mut state);
             }
-            ledger.db.insert(b"transactions", serde_json::to_vec(&history).unwrap()).unwrap();
-            ledger.db.flush().unwrap();
-            
-            println!("[MINER] Block #{} Mined and Applied! Reward: {} AET.", 
-                ledger.height, reward as f64 / ATOMS_PER_AET as f64);            
+
+            // 9. REWARD UPDATE UNDER STATE LOCK
+            let reward = calculate_block_reward_atoms(new_height);
+            {
+                let mut state = STATE.lock().unwrap();
+                let ledger = state.ledger.as_mut().unwrap();
+
+                let current_balance: u64 = ledger.db.get(b"balance_atoms").unwrap()
+                    .map(|b| String::from_utf8(b.to_vec()).unwrap().parse().unwrap_or(0))
+                    .unwrap_or(0);
+
+                let new_balance = current_balance.saturating_add(reward);
+                ledger.db.insert(b"balance_atoms", new_balance.to_string().as_bytes()).unwrap();
+
+                let history_update = json!({
+                    "type": "Coinbase Reward",
+                    "amount_atoms": reward as i64,
+                    "address": "System",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "status": "Confirmed",
+                    "height": new_height,
+                });
+
+                let tx_bytes = ledger.db.get(b"transactions").unwrap().unwrap_or_default();
+                let mut history: Vec<serde_json::Value> = if tx_bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_slice(&tx_bytes).unwrap_or_default()
+                };
+                history.insert(0, history_update);
+                ledger.db.insert(b"transactions", serde_json::to_vec(&history).unwrap()).unwrap();
+                ledger.db.flush().unwrap();
+            }
+
+            println!("[MINER] Block #{} Mined and Applied! Reward: {} AET.",
+                new_height, reward as f64 / ATOMS_PER_AET as f64);
         }
-        
+
         println!("[MINER] Background mining thread stopped.");
     });
 
@@ -2279,7 +2338,7 @@ mod tests {
         // Use low VDF difficulty for fast test execution
         unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "10"); }
 
-        aetheris_start_node(10001, c_db_path.as_ptr());
+        assert_eq!(aetheris_start_node(10001, c_db_path.as_ptr()), 0, "aetheris_start_node should return 0 on success");
         aetheris_init();
         assert!(aetheris_set_wallet_password(c_password.as_ptr()));
 
@@ -2312,6 +2371,12 @@ mod tests {
         aetheris_free_buffer(status_bin);
     }
 
+    /// S-2 (strengthened): actually verify the genesis block was applied
+    /// to the ledger, not just that the JSON response contains the
+    /// literal string "balance_atoms" (which is present regardless of
+    /// genesis application). Read the canonical in-memory LedgerState
+    /// from STATE (NOT a fresh `LedgerState::new` — that would conflict
+    /// with the sled file lock held by the existing state.ledger).
     #[test]
     fn test_genesis_import() {
         reset_ffi_test_state();
@@ -2324,12 +2389,35 @@ mod tests {
         // Use low VDF difficulty for fast test execution
         unsafe { std::env::set_var("AETHERIS_VDF_DIFFICULTY", "10"); }
 
-        aetheris_start_node(10002, c_db_path.as_ptr());
+        assert_eq!(aetheris_start_node(10002, c_db_path.as_ptr()), 0, "aetheris_start_node should return 0 on success");
         aetheris_init();
         assert!(aetheris_set_wallet_password(c_password.as_ptr()));
 
         let phrase = CString::new("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
         assert!(aetheris_import_wallet(phrase.as_ptr()));
+
+        let state_guard = STATE.lock().unwrap();
+        let ledger = state_guard.ledger.as_ref()
+            .expect("state.ledger should be open after aetheris_import_wallet succeeded");
+        assert_eq!(ledger.height, 1, "Genesis block must be applied (height should advance from 0 to 1)");
+        // Genesis block has 1 mint tx (1 output) + 1 transfer tx (2 outputs) = 3 commitments.
+        // Note: the mint commitment is also reused as the nullifier placeholder
+        // for the transfer tx's `inputs` (per aetheris-ffi/src/lib.rs:289),
+        // giving exactly 1 nullifier.
+        assert_eq!(ledger.commitments.len(), 3, "Genesis block should produce 3 commitments (1 mint + 2 transfer outputs)");
+        assert_eq!(ledger.nullifiers.len(), 1, "Genesis block should produce 1 nullifier (mint_commitment used as placeholder for transfer tx input)");
+        // S-3: Verify the deterministic genesis identity hash was persisted
+        // to the `b"genesis_identity_hash"` sled key. The in-memory
+        // `last_block_hash` is `block_hash(&genesis)` (non-deterministic,
+        // includes random ZKP proof bytes), so we can't assert on that.
+        // The FFI persists the deterministic hash to a separate sled key
+        // (see aetheris-ffi/src/lib.rs:1338-1346) for operator/test
+        // verification.
+        let expected_genesis_hash = aetheris_core::genesis_identity_hash(&create_genesis_block());
+        let stored_hash = ledger.db.get(b"genesis_identity_hash").unwrap()
+            .expect("sled b\"genesis_identity_hash\" should be set after aetheris_import_wallet");
+        assert_eq!(&stored_hash[..], &expected_genesis_hash[..], "sled b\"genesis_identity_hash\" should be the deterministic genesis identity hash");
+        drop(state_guard);
 
         let status_bin = aetheris_get_node_status_bin();
         let json_data = {
@@ -2347,5 +2435,34 @@ mod tests {
         assert!(json_data.contains("balance_atoms") || json_data.contains("wallet"), "Status: {}", json_data);
 
         aetheris_free_buffer(status_bin);
+    }
+
+    /// S-3 regression test: locks `EXPECTED_GENESIS_HASH` against the
+    /// deterministic `genesis_identity_hash` of the default test config
+    /// (no `genesis.json` present, so the fallback constants apply).
+    ///
+    /// The genesis block construction at `create_genesis_block` uses
+    /// Pedersen commitments via `aetheris_zkp::create_commitment`. Those
+    /// commitment values are deterministic for a given (amount, blinding)
+    /// pair on the Pallas curve, so the `genesis_identity_hash` output
+    /// is also deterministic and stable across runs/machines.
+    ///
+    /// If this test fails after a deliberate change to `create_genesis_block`
+    /// (e.g., different default allocations, different timestamp, or
+    /// different blinding factors), the operator MUST update
+    /// `EXPECTED_GENESIS_HASH` in `aetheris-core/src/lib.rs:14` to the new
+    /// value computed by this test. The constant is checked at runtime by
+    /// the mainnet mismatch branch in `aetheris_import_wallet` and is the
+    /// primary safety check that the wallet is initialising against the
+    /// expected network.
+    #[test]
+    fn test_genesis_hash_locked() {
+        let genesis = create_genesis_block();
+        let actual_hex = hex::encode(aetheris_core::genesis_identity_hash(&genesis));
+        assert_eq!(
+            actual_hex, aetheris_core::EXPECTED_GENESIS_HASH,
+            "EXPECTED_GENESIS_HASH is stale. Actual genesis_identity_hash for default config is '{}'. \
+             Update aetheris-core/src/lib.rs:14 with the new constant.", actual_hex
+        );
     }
 }

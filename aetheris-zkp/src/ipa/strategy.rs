@@ -366,8 +366,6 @@ mod tests {
 
     #[test]
     fn test_multi_point_ipa_roundtrip() {
-        use halo2_backend::poly::commitment::ParamsVerifier;
-
         let engine = H2cEngine::new();
         let params = ParamsIPA::<EpAffine>::setup_deterministic(4);
         let n = params.n() as usize;

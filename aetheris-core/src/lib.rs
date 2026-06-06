@@ -11,7 +11,19 @@ pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // Adjust difficulty every 1
 pub const MAX_VDF_SPEED: u64 = 5_000_000; // Max 5M iterations/sec (Anti-acceleration threshold)
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
-pub const EXPECTED_GENESIS_HASH: &str = "15db1dd5d89d5d1e19ee65a2221e156ea84083f59a127b99a595fe6e305b914c";
+// S-3: Recomputed 2026-06-06 from `genesis_identity_hash(&create_genesis_block())`
+// using the DEFAULT test config (no `genesis.json` present in CWD):
+//   - timestamp = 1771035455
+//   - parent_hash = [0u8; 32]
+//   - mint = 21_000_000 * ATOMS_PER_AET  (blinding [0u8; 32])
+//   - dev  =  5_000_000 * ATOMS_PER_AET  (blinding [1u8; 32])
+//   - change = 16_000_000 * ATOMS_PER_AET (blinding [2u8; 32])
+// The previous value was stale (last set 2026-06-01 for a non-deterministic
+// hash algorithm that included random ZKP proof bytes). This constant is
+// locked by `aetheris-ffi::tests::test_genesis_hash_locked` — if you change
+// `create_genesis_block`'s default parameters, re-run that test to obtain
+// the new value.
+pub const EXPECTED_GENESIS_HASH: &str = "63644c4285ce95b5c9abc7cb1dbc8b473cf3c1ebfcaeb783f5399281f1b433fe";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShieldedOutput {
