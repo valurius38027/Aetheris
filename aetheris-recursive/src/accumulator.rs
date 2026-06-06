@@ -176,15 +176,11 @@ impl AccumulatorIPA {
         }
 
         // 4. Inner proof verification.
-        //    NOTE: `verify_conservation` ignores `output_commitments` in
-        //    the current aetheris-zkp implementation (the public-input
-        //    column only binds `public_amount`). To bind the commitments
-        //    to the chain we MUST include them in the Fiat-Shamir challenge
-        //    (Phase 1.5 / ISSUE-1.4.E). Without this, a malicious
-        //    aggregator could swap commitments on the same proof and the
-        //    chain would not notice. The commitment hash is folded into
-        //    `inner_proof_hash_eff` (see step 5) so the binding flows
-        //    into pi_commitment, challenge, AND transcript_new.
+        //    `verify_conservation` now binds output_commitments in its
+        //    instance column (Phase 1.9 P0 fix), providing in-circuit
+        //    commitment binding via the permutation argument. The accumulator
+        //    additionally folds commitments into `inner_proof_hash_eff`
+        //    (step 5) for defense-in-depth (Phase 1.5 / ISSUE-1.4.E).
         if !Halo2PastaBackend::verify_conservation(proof, output_commitments, public_amount) {
             return Err(AccumulatorError::InnerProofInvalid(
                 hex::encode(blake3::hash(proof).as_bytes()),
