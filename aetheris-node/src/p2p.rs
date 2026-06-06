@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use anyhow::Result;
 use aetheris_core::Transaction;
+use aetheris_recursive::AggregateProofGossip;
 use crate::consensus::BlockProposal;
 
 #[derive(NetworkBehaviour)]
@@ -27,6 +28,7 @@ pub struct AetherisBehaviour {
 pub enum NetworkEvent {
     BlockProposed(BlockProposal),
     TransactionReceived(Transaction),
+    AggregateGossipReceived(AggregateProofGossip),
     NewPeerDiscovered(PeerId),
     PeerDiscoveredMdns(PeerId, Multiaddr),
     PeerIdentified(PeerId, String, Vec<Multiaddr>),
@@ -39,6 +41,7 @@ pub enum NetworkEvent {
 pub enum NetworkCommand {
     BroadcastBlock(BlockProposal),
     BroadcastTransaction(Transaction),
+    BroadcastAggregateGossip(AggregateProofGossip),
     Dial(Multiaddr),
     RequestSync { start_height: u64, peer_id: PeerId },
     SendSyncResponse { blocks: Vec<aetheris_core::Block>, peer_id: PeerId },
@@ -49,6 +52,7 @@ pub struct AetherisNetwork {
     pub swarm: libp2p::Swarm<AetherisBehaviour>,
     pub block_topic: gossipsub::IdentTopic,
     pub tx_topic: gossipsub::IdentTopic,
+    pub accumulator_topic: gossipsub::IdentTopic,
     pub mixnet_topic: gossipsub::IdentTopic,
     pub sync_topic: gossipsub::IdentTopic,
 }
@@ -131,6 +135,7 @@ impl AetherisNetwork {
 
         let block_topic = topic.clone();
         let tx_topic = gossipsub::IdentTopic::new("aetheris-txs");
+        let accumulator_topic = gossipsub::IdentTopic::new("aetheris-accumulators");
         let mixnet_topic = gossipsub::IdentTopic::new("aetheris-mixnet-pks");
 
         for addr_str in bootstrap_nodes {
@@ -154,6 +159,7 @@ impl AetherisNetwork {
             swarm,
             block_topic,
             tx_topic,
+            accumulator_topic,
             mixnet_topic,
             sync_topic,
         })
@@ -161,6 +167,7 @@ impl AetherisNetwork {
 
     pub fn subscribe_topics(&mut self) -> Result<()> {
         self.swarm.behaviour_mut().gossipsub.subscribe(&self.block_topic)?;
+        self.swarm.behaviour_mut().gossipsub.subscribe(&self.accumulator_topic)?;
         self.swarm.behaviour_mut().gossipsub.subscribe(&self.sync_topic)?;
         self.swarm.behaviour_mut().gossipsub.subscribe(&self.tx_topic)?;
         self.swarm.behaviour_mut().gossipsub.subscribe(&self.mixnet_topic)?;
@@ -188,6 +195,15 @@ impl AetherisNetwork {
             .behaviour_mut()
             .gossipsub
             .publish(self.tx_topic.clone(), data)?;
+        Ok(())
+    }
+
+    pub fn broadcast_accumulator(&mut self, gossip: AggregateProofGossip) -> Result<()> {
+        let data = serde_json::to_vec(&gossip)?;
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.accumulator_topic.clone(), data)?;
         Ok(())
     }
 

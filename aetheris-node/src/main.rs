@@ -2,6 +2,7 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
+use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain};
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -480,7 +481,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          continue;
                      }
 
-                     // 3. Handle P2P Sync Messages
+                     // 3. Handle Accumulator Gossip (§1.11)
+                     if let Ok(gossip) = serde_json::from_slice::<AggregateProofGossip>(&message.data) {
+                         let ok = verify_accumulator_chain(
+                             &gossip.accumulator,
+                             &gossip.prev_accumulator,
+                             &gossip.proofs,
+                             &gossip.commitments_list,
+                             &gossip.public_amounts,
+                             None,
+                         );
+                         if ok {
+                             println!("[AGG] Validated accumulator gossip: depth={}", gossip.depth);
+                         }
+                         let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                             &_id, &peer_id,
+                             if ok { gossipsub::MessageAcceptance::Accept }
+                             else { gossipsub::MessageAcceptance::Reject },
+                         );
+                         continue;
+                     }
+
+                     // 4. Handle P2P Sync Messages
                     if let Ok(p2p_msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
                         match p2p_msg {
                             P2PMessage::SyncRequest { start_height, end_height } => {
