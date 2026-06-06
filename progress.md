@@ -2446,6 +2446,63 @@ Resolves the deferred Phase 1.4 review finding **ISSUANCE-1.4.C** ("Accumulator 
 
 **Multi-Agent Review**: 2 subagents (security + code quality), both ✅ APPROVED with no blocking issues. Minor warnings (dead `s_constrain_equal` gate, optional test coverage) documented but acknowledged as non-blocking.
 
-**Commit**: `7e14bdf` (source) → `(next commit)` (docs)
+**Commit**: `7e14bdf` (source) → `d47ad77` (docs)
+
+---
+
+## Phase 0 — Node Life-Saving (Consolidated, 2026-06-06)
+
+**Scope**: 8 sub-items from `mainnet_execution_plan.md` §0. 0.3/0.5/0.7/0.8 already existed in code; only 0.1 (block hash) and 0.6 (viewing key) needed code changes.
+
+### Changes Made
+
+| Sub-item | Status | File | Description |
+|----------|--------|------|-------------|
+| 0.1 (A-3) | ✅ Fixed | `aetheris-node/src/main.rs:555-614` | Single `SystemTime::now()` call; block hash from canonical `Block::hash()` |
+| 0.2 | ✅ Already existed | MEMPOOL | Stored `Transaction`, not `WalletTransaction` |
+| 0.3 | ✅ Already existed | `state.rs` | Nullifier uniqueness + state_root validation + snapshot persistence |
+| 0.4 (L-1/A-8) | ✅ Already existed | `ffi/src/lib.rs` | `WalletTransaction` removed in Stage 28 |
+| 0.5 | ✅ Already existed | `Mempool::add_tx` | Inbound ZK proof verification |
+| 0.6 (B-13) | ✅ Fixed | `aetheris-ffi/src/lib.rs:207-216` | Viewing key unified: `blake3(spending_key \|\| b"aetheris-viewing-key")` |
+| 0.7 (B-11) | ✅ Already existed | `ffi/src/lib.rs` | All 7 `unsafe CStr::from_ptr` null-checked with `ffi_try!` |
+| 0.8 (B-12) | ✅ Already existed | `ffi/src/lib.rs` | `OsRng` already used (no `thread_rng`) |
+
+### Verification
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- 178/178 workspace lib tests pass (pre-Phase-1.9 baseline)
+
+**Commit**: `1322680` (source)
+
+---
+
+## Phase 1.1 — IPA 承诺方案底层安全审计 (2026-06-06)
+
+**Scope**: Multi-agent investigation (2 subagents) of `commitment.rs` + `prover.rs` + `verifier.rs`. 3🔴 + 4🟡 + 3🟢 issues found. All 🔴 and 🟡 resolved.
+
+### Changes Made
+
+| Fix | Severity | Files | Description |
+|-----|----------|-------|-------------|
+| 1.1.1a SRS域分离 | 🔴 | `commitment.rs`, `verifier.rs`, `strategy.rs`, `halo2_pasta.rs` | `derive_point` domain prefix includes circuit_id; `ParamsIPA::setup(k, rng, circuit_id)`; MSMIPA carries g/h/u from params; verifier uses MSM generators instead of hardcoded `derive_point` |
+| Dead code (double Horner) | 🔴 | `prover.rs:126-136` | Removed redundant Horner eval in debug block |
+| Shadowed MSM | 🔴 | `prover.rs:313-325` | Fixed shadowed MSM variable in debug block |
+| k encoding covert channel | 🟡 | `verifier.rs:68-80` | Zero-bytes check on k scalar |
+| Zero-challenge re-squeeze | 🟡 | `prover.rs:183-192`, `verifier.rs:130-140` | Reject x=0 or x=1; `common_scalar(reject_count)` + re-squeeze |
+| `debug_assert!` → `assert!` | 🟡 | `commitment.rs:134,214-220` | Poly size check always active |
+| add_msm generator consistency | 🟡 | `commitment.rs:302` | `debug_assert!` on generator len match |
+| Serialization magic header | 🟡 | `commitment.rs:140,148` | `"IPA2"` magic + circuit_id for backward compat |
+
+### Design Decisions
+- **Verifier uses params generators**: MSMIPA extended with `g`, `h`, `u` fields; `empty_msm()` populates from params; strategies (`SingleStrategyIPA`, `AccumulatorStrategyIPA`) use `params.empty_msm()`
+- **Circuit ID**: `ensure_params()` uses `"value_conservation"`; tests use `"default"` via `setup_deterministic`
+- **Serialization**: `k (4B) → magic (4B) → id_len (2B) → id (var) → g[] → h → u`
+
+### Verification
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- 178/178 workspace lib tests pass (69 zkp + 33 recursive + 21 core + 41 crypto + 9 node + 5 wallet)
+- FFI `test_genesis_import`: pre-existing recursive-accumulator crash (unrelated)
+
+### Multi-Agent Review
+- Reviewer: ✅ APPROVED (2 🟡 warnings addressed: add_msm consistency assert + magic header; 1 🟢 unused-import cleaned)
 
 
