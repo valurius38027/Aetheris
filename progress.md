@@ -2170,6 +2170,7 @@ Multi-agent investigation 找到 2 root causes:
 | P2P gossip `AggregateProofGossip` stub | LOW | Design | Phase 1.5+ |
 | `aetheris-recursive::P2PRecursiveManager::verify_aggregate_proof` | LOW | Design | Phase 1.5+ |
 | ISSUANCE-1.4.C: Accumulator 集成测试 (happy-path) | MEDIUM | Phase 1.4 | Phase 1.5+ (需 make_proof helper 暴露) |
+| ~~`aetheris-crypto::classgroup.rs:112` `debug_assert_eq!` 在错误 discriminant form 上 panic~~ | ~~MEDIUM (pre-existing)~~ | Phase 1.6 Review B | ✅ **FIXED in Phase 1.7** (boundary check in `VDF::verify` at `aetheris-crypto/src/vdf.rs:110-117` rejects forms with wrong discriminant at the boundary, before `compose` is called; 3 new crypto tests + 1 new zkp test) |
 
 ### Phase 1.5.6 — Deferred Issue Remediation (Post-Phase-1.5 cleanup)
 
@@ -2299,4 +2300,62 @@ Resolves audit finding **B-3** (`prove_vdf` is blake3 hash, not VDF proof; no `v
 | transcript | 32 B | blake3 hash |
 | depth (LE u32) | 4 B | 累加的 inner proof 数 |
 | **Total** | **96 B** | |
+
+### Phase 1.7 — Discriminant Boundary Check in `VDF::verify`
+
+Fixes the pre-existing `debug_assert_eq!` panic at `aetheris-crypto/src/classgroup.rs:112` ("compose: discriminant mismatch") and the related `debug_assert!` at `classgroup.rs:139-142` ("CRT exact division failed"). Both fired in debug builds when a deserialized form had a valid-looking but mismatched discriminant. The release build silently produced garbage and returned `false` from `left == y`, but in debug builds (CI, tests) the panic would crash the test.
+
+**Root cause**: `VDF::verify` deserialized attacker-controlled forms via `Form::from_bytes` (which doesn't validate discriminant) and passed them directly to `compose` / `pow`. A malicious proof with a wrong-discriminant form (which is easy to construct since the class group discriminant is a public constant `b"Aetheris Class Group VDF v1"`) would trigger the assertions.
+
+**Fix (Option B, surgical boundary check)**: `aetheris-crypto/src/vdf.rs:110-117`. The `Form::from_bytes` matchers now guard `if f.abs_discriminant() == self.discriminant`. On mismatch, `verify` cleanly returns `false` without ever calling `compose`. Both `result` and `proof` are validated.
+
+**Why Option B (boundary check) over Option A (change `compose` signature)**:
+- Surgical: 4-line change in 1 file
+- Catches at the only attacker-controlled entry point (the proof bytes)
+- Zero impact on `Form::compose`'s library contract
+- Transitively protects both `classgroup.rs:112` and `classgroup.rs:139-142` assertions (both reachable only via the `compose` call chain from `VDF::verify`)
+
+**4 new tests**:
+
+In `aetheris-crypto/src/vdf.rs::tests`:
+1. `test_verify_rejects_wrong_discriminant_result` — corrupt result's `a` byte, valid proof, verify returns `false`
+2. `test_verify_rejects_wrong_discriminant_proof` — valid result, corrupt proof's `a` byte, verify returns `false`
+3. `test_verify_rejects_both_wrong_discriminant` — corrupt both, verify returns `false`
+
+In `aetheris-zkp/src/halo2_pasta.rs::tests`:
+4. `test_pasta_backend_prove_vdf_deep_corruption_rejected` — flips `proof[proof.len() / 2]` (deep inside `a_bytes`, not the length prefix). Pre-fix, this would have panicked at `classgroup.rs:112`; post-fix, it cleanly returns `false`.
+
+Helper function `corrupt_form_discriminant` in `vdf.rs`: XOR-flip a byte at offset 8 (always inside `a_bytes` for 2048-bit |D|). Mathematically guaranteed to change discriminant: `|D'| = 4a'c − b² = |D| + 4(a' − a)c ≠ |D` since `a' ≠ a` and `c ≠ 0`. `assert!` guards against empty input.
+
+**Multi-Agent Review 1.7**:
+- Reviewer A: ✅ APPROVED (4 non-blocking observations: probabilistic panic claim, non-canonical sign byte in `from_bytes` [out of scope], underflow in `corrupt_form_discriminant` [fixed], missing doc on `VDF::verify` [deferred])
+- Reviewer B: ✅ APPROVED (4 nice-to-have suggestions: doc on helper [fixed], hard assert [fixed], final sanity-check test [optional not added], vary corruption index [overkill not added])
+- **Iteration** (lead): cleaned up `corrupt_form_discriminant` (replaced `.min()` fallback with `assert!`, replaced confusing comment with accurate wire-format explanation)
+
+**Verification**:
+- `cargo check --workspace --all-targets`: 0 errors, 0 warnings
+- aetheris-core: 21/21 pass
+- aetheris-crypto: 41/41 pass (was 38, +3 new)
+- aetheris-recursive: 28/28 pass
+- aetheris-node: 9/9 pass
+- aetheris-ffi: 3/3 pass (~18s)
+- aetheris-wallet: 5/5 pass
+- aetheris-zkp: 68/68 pass (was 67, +1 new)
+- Total: 175/175 (was 171, +4 new)
+
+**Out of scope (deferred)**:
+- `classgroup.rs:367-371` accepts non-canonical b-sign byte (`from_bytes` treats `b_bytes[0] == 0x01` as negative and **anything else** as positive, so 0x02..=0xFF also parse as positive). Roundtrip is broken for non-canonical encodings. Future hardening: reject sign bytes outside {0x00, 0x01}.
+- `classgroup.rs:198` unconditional `panic!("compose: no valid t found in [0, d)")` and `classgroup.rs:241` unconditional `panic!("hash_to_form: ...")` — library-internal tripwires, not reachable from attacker input. Keep.
+- `classgroup.rs:153` `debug_assert!(l.bits() >= 256)` — defense-in-depth, not reachable from attacker input. Keep.
+
+**Files modified** (2 source + progress.md):
+- `aetheris-crypto/src/vdf.rs` — 4-line boundary check + 3 tests + 1 helper
+- `aetheris-zkp/src/halo2_pasta.rs` — 1 test added
+- `progress.md` — this entry
+
+**Phase 1.7 范围**:
+- **bounded to**: `aetheris-crypto` (src/vdf.rs) + `aetheris-zkp` (src/halo2_pasta.rs)
+- **未触及**: aetheris-core, aetheris-node, aetheris-ffi, aetheris-wallet, aetheris-recursive
+- **Note**: changed `aetheris-crypto` for the first time since Phase 1.0 (fix is in a new test section + a 4-line guard in the verify function; no public API changes)
+
 
