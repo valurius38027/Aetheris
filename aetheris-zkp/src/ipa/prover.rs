@@ -123,23 +123,6 @@ where
             let mut r_points_prover: Vec<C> = Vec::new();
             let mut challenges_prover: Vec<C::ScalarExt> = Vec::new();
             let mut combined_eval_prover: C::ScalarExt = C::ScalarExt::ZERO;
-            for q in point_queries.iter() {
-                let mut ev = C::ScalarExt::ZERO;
-                for coeff in q.poly.values.iter().rev() {
-                    ev = ev * q.point + *coeff;
-                }
-                let mut pow_eval = C::ScalarExt::ONE;
-                if combined_eval_prover == C::ScalarExt::ZERO {
-                    pow_eval = C::ScalarExt::ONE;
-                }
-                let _ = pow_eval;
-            }
-            // Actually compute combined_eval using the same fold-aware loop:
-            // Each query contributes pow * eval(q) to combined_eval, where pow is theta^j.
-            // Note: combined_eval is evaluated independently of the prover's combined a vector
-            // (since the verifier recomputes it from q.eval). The prover's combined vector is
-            // a = sum theta^j * poly_j (in coefficient form), and combined_eval = sum theta^j * poly_j(point).
-            // We compute combined_eval here by reusing the pow from the r' loop:
             let mut pow_eval = C::ScalarExt::ONE;
             for q in point_queries.iter() {
                 let mut ev = C::ScalarExt::ZERO;
@@ -149,7 +132,6 @@ where
                 combined_eval_prover += pow_eval * ev;
                 pow_eval = pow_eval * theta_val;
             }
-            let _ = combined_eval_prover; // suppress unused warning
 
             while len > 1 {
                 let half = len / 2;
@@ -198,9 +180,16 @@ where
                     r_points_prover.push(r_aff);
                 }
 
-                let x: ChallengeScalar<C, RoundChallenge> =
+                let mut x: ChallengeScalar<C, RoundChallenge> =
                     transcript.squeeze_challenge_scalar();
-                let x_val = *x;
+                let mut x_val = *x;
+                let mut reject_count = 0u32;
+                while bool::from(x_val.is_zero()) || x_val == C::ScalarExt::ONE {
+                    reject_count += 1;
+                    transcript.common_scalar(C::ScalarExt::from(reject_count as u64))?;
+                    x = transcript.squeeze_challenge_scalar();
+                    x_val = *x;
+                }
                 if crate::diagnostics::dbg_enabled() {
                     challenges_prover.push(x_val);
                 }
@@ -304,26 +293,12 @@ where
                 // view of combined_msm and compare. We don't have the h_pieces in the prover, but
                 // we can simulate the verifier's structure.
 
-                // Now reconstruct the msm EXACTLY as the verifier does:
+                // Build the prover's view of the msm EXACTLY as the verifier does:
                 // 1. combined_msm
                 // 2. Add x_inv * L + x * R per round
                 // 3. Add (v - a*b) * U
                 // 4. Add -a * g_final
                 // 5. Add -r' * H
-                let mut provers_msm = MSMIPA::<C>::new();
-                provers_msm.add_msm(&combined_msm);
-                for (i, _) in l_points_prover.iter().enumerate() {
-                    let x: C::ScalarExt = challenges_prover[i];
-                    let x_inv: C::ScalarExt = Option::from(x.invert()).unwrap();
-                    provers_msm.append_term(x_inv, l_points_prover[i].to_curve());
-                    provers_msm.append_term(x, r_points_prover[i].to_curve());
-                }
-                let u_scalar_prover = combined_eval_prover - a_final_val * b_final_val;
-                provers_msm.append_term(u_scalar_prover, u_proj);
-                provers_msm.append_term(-a_final_val, g_final_prover.to_curve());
-                provers_msm.append_term(-r_prime, h.to_curve());
-
-                // Build the prover's view of the msm
                 let mut provers_msm = MSMIPA::<C>::new();
                 provers_msm.add_msm(&combined_msm);
                 // Add L, R

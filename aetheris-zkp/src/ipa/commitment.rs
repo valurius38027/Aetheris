@@ -28,6 +28,8 @@ pub struct ParamsIPA<C: CurveAffine> {
     h: C,
     /// IPA challenge generator
     u: C,
+    /// Circuit/application context for domain separation
+    circuit_id: String,
 }
 
 pub(crate) fn derive_point<C: CurveAffine>(domain_prefix: &str, tag: &[u8]) -> C
@@ -43,32 +45,30 @@ impl<C: CurveAffine> ParamsIPA<C>
 where
     C::CurveExt: CurveExt,
 {
-    /// Create new IPA parameters for a given domain size `k` (size = 2^k).
-    pub fn setup<R: RngCore>(k: u32, _rng: &mut R) -> Self {
-        // NOTE: The `where C::CurveExt: CurveExt` bound above is redundant
-        // (guaranteed by `CurveAffine::CurveExt: CurveExt`) but required for
-        // `hash_to_curve` calls within inherent methods.
+    /// Create new IPA parameters for a given domain size `k` (size = 2^k) and circuit context.
+    pub fn setup<R: RngCore>(k: u32, _rng: &mut R, circuit_id: &str) -> Self {
         let n = 1 << k;
         let mut g = Vec::with_capacity(n);
         for i in 0..n {
             let mut tag = b"g-".to_vec();
             tag.extend_from_slice(&i.to_le_bytes());
-            g.push(derive_point::<C>("aetheris-ipa-g", &tag));
+            g.push(derive_point::<C>(&format!("aetheris-ipa-g-{}", circuit_id), &tag));
         }
-        let h = derive_point::<C>("aetheris-ipa-h", b"h");
-        let u = derive_point::<C>("aetheris-ipa-u", b"u");
+        let h = derive_point::<C>(&format!("aetheris-ipa-h-{}", circuit_id), b"h");
+        let u = derive_point::<C>(&format!("aetheris-ipa-u-{}", circuit_id), b"u");
         ParamsIPA {
             k,
             n: n as u64,
             g,
             h,
             u,
+            circuit_id: circuit_id.to_string(),
         }
     }
 
     /// Create IPA parameters with a deterministic seed (for testing).
     pub fn setup_deterministic(k: u32) -> Self {
-        Self::setup(k, &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"))
+        Self::setup(k, &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"), "default")
     }
 
     /// Get the verifier parameters (clone of self, IPA doesn't separate prover/verifier params).
@@ -138,7 +138,11 @@ where
     }
 
     fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(b"IPA2")?;
         writer.write_all(&self.k.to_le_bytes())?;
+        let circuit_id_bytes = self.circuit_id.as_bytes();
+        writer.write_all(&(circuit_id_bytes.len() as u16).to_le_bytes())?;
+        writer.write_all(circuit_id_bytes)?;
         for point in &self.g {
             writer.write_all(point.to_bytes().as_ref())?;
         }
@@ -148,9 +152,22 @@ where
     }
 
     fn read<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic)?;
+        if &magic != b"IPA2" {
+            return Err(io::Error::new(io::ErrorKind::Other,
+                "ParamsIPA: invalid magic bytes (expected b\"IPA2\"; old format? regenerate crs.bin)"));
+        }
         let mut k_buf = [0u8; 4];
         reader.read_exact(&mut k_buf)?;
         let k = u32::from_le_bytes(k_buf);
+        let mut id_len_buf = [0u8; 2];
+        reader.read_exact(&mut id_len_buf)?;
+        let id_len = u16::from_le_bytes(id_len_buf) as usize;
+        let mut circuit_id_bytes = vec![0u8; id_len];
+        reader.read_exact(&mut circuit_id_bytes)?;
+        let circuit_id = String::from_utf8(circuit_id_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid circuit_id in ParamsIPA"))?;
         let n = 1 << k;
         let mut g = Vec::with_capacity(n);
         for _ in 0..n {
@@ -178,6 +195,7 @@ where
             g,
             h,
             u,
+            circuit_id,
         })
     }
 }
@@ -187,7 +205,7 @@ where
     C::CurveExt: CurveExt,
 {
     fn new(k: u32) -> Self {
-        Self::setup_deterministic(k)
+        Self::setup(k, &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"), "default")
     }
 
     fn commit(
@@ -200,7 +218,7 @@ where
         scalars.extend(poly.iter());
         let bases = &self.g;
         let size = scalars.len();
-        debug_assert!(
+        assert!(
             size <= self.n as usize,
             "commit: polynomial length {} exceeds domain size {}",
             size,
@@ -235,7 +253,13 @@ where
     const COMMIT_INSTANCE: bool = true;
 
     fn empty_msm(&'params self) -> MSMIPA<C> {
-        MSMIPA::new()
+        MSMIPA {
+            scalars: Vec::new(),
+            bases: Vec::new(),
+            g: self.g.clone(),
+            h: self.h,
+            u: self.u,
+        }
     }
 }
 
@@ -243,10 +267,16 @@ where
 ///
 /// Stores scalars and bases for batched MSM.
 /// Unlike KZG's DualMSM, IPA does not need a pairing check.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MSMIPA<C: CurveAffine> {
     pub(crate) scalars: Vec<C::ScalarExt>,
     pub(crate) bases: Vec<C>,
+    /// SRS generators (populated by `empty_msm` for verifier use)
+    pub(crate) g: Vec<C>,
+    /// Blinding generator
+    pub(crate) h: C,
+    /// IPA challenge generator
+    pub(crate) u: C,
 }
 
 impl<C: CurveAffine> MSMIPA<C> {
@@ -254,7 +284,16 @@ impl<C: CurveAffine> MSMIPA<C> {
         MSMIPA {
             scalars: Vec::new(),
             bases: Vec::new(),
+            g: Vec::new(),
+            h: C::identity(),
+            u: C::identity(),
         }
+    }
+}
+
+impl<C: CurveAffine> Default for MSMIPA<C> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -267,6 +306,20 @@ impl<C: CurveAffine> MSMTrait<C> for MSMIPA<C> {
     fn add_msm(&mut self, other: &Self) {
         self.scalars.extend(other.scalars.iter());
         self.bases.extend(other.bases.iter());
+        if !other.g.is_empty() {
+            debug_assert!(
+                self.g.is_empty() || self.g.len() == other.g.len(),
+                "add_msm: incompatible g generators (len {} vs {})",
+                self.g.len(), other.g.len()
+            );
+            self.g = other.g.clone();
+        }
+        if !bool::from(other.h.is_identity()) {
+            self.h = other.h;
+        }
+        if !bool::from(other.u.is_identity()) {
+            self.u = other.u;
+        }
     }
 
     fn scale(&mut self, factor: C::ScalarExt) {
@@ -524,7 +577,7 @@ where
     type ParamsVerifier = ParamsIPA<C>;
 
     fn new_params(k: u32) -> Self::ParamsProver {
-        ParamsIPA::setup_deterministic(k)
+        ParamsIPA::setup(k, &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"), "default")
     }
 
     fn read_params<R: io::Read>(reader: &mut R) -> io::Result<Self::ParamsProver> {

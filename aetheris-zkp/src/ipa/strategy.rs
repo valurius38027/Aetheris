@@ -1,4 +1,4 @@
-use halo2_backend::poly::commitment::{CommitmentScheme, MSM, Verifier};
+use halo2_backend::poly::commitment::{CommitmentScheme, MSM, ParamsVerifier, Verifier};
 use halo2_backend::poly::VerificationStrategy;
 use halo2_backend::plonk::Error;
 use halo2_middleware::zal::impls::H2cEngine;
@@ -28,7 +28,7 @@ where
     /// Constructs an empty single-proof verifier.
     pub fn new(params: &'params ParamsIPA<C>) -> Self {
         SingleStrategyIPA {
-            msm: MSMIPA::new(),
+            msm: params.empty_msm(),
             params,
         }
     }
@@ -89,7 +89,7 @@ where
     /// Constructs an empty batch verifier.
     pub fn new(params: &'params ParamsIPA<C>) -> Self {
         AccumulatorStrategyIPA {
-            msm_accumulator: MSMIPA::new(),
+            msm_accumulator: params.empty_msm(),
             params,
         }
     }

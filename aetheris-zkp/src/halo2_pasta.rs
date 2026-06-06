@@ -18,6 +18,8 @@ use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
 use std::sync::OnceLock;
 use std::fs;
 use rand::rngs::OsRng;
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::SeedableRng;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore, aead::Aead};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
@@ -50,7 +52,11 @@ fn ensure_params() -> &'static ParamsIPA<EpAffine> {
         }
         if cfg!(debug_assertions) {
             eprintln!("[ZK] WARNING: No params file found. Using deterministic IPA setup (DEV ONLY)");
-            return ParamsIPA::<EpAffine>::setup_deterministic(PROVING_K);
+            return ParamsIPA::<EpAffine>::setup(
+                PROVING_K,
+                &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"),
+                "value_conservation",
+            );
         }
         panic!("[ZK] FATAL: No params file found. Place a params file or run in debug mode.");
     })
@@ -536,7 +542,11 @@ impl ZkProverSystem for Halo2PastaBackend {
 
 impl Halo2PastaBackend {
     pub fn setup_params() -> ParamsIPA<EpAffine> {
-        ParamsIPA::<EpAffine>::setup_deterministic(PROVING_K)
+        ParamsIPA::<EpAffine>::setup(
+            PROVING_K,
+            &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"),
+            "value_conservation",
+        )
     }
 
     pub fn encrypt_output(
@@ -1140,7 +1150,6 @@ mod synthetic_roundtrip_tests {
     use super::*;
     use halo2_proofs::halo2curves::ff::WithSmallOrderMulGroup;
     use halo2_backend::poly::{EvaluationDomain, Coeff, ExtendedLagrangeCoeff, Polynomial};
-    use rand::rngs::OsRng;
 
     /// Evaluate a polynomial (coefficient slice) at a point using Horner.
     fn horner<F: Field>(coeff: &[F], point: F) -> F {

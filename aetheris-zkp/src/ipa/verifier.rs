@@ -10,7 +10,7 @@ use halo2_proofs::arithmetic::{CurveExt, Field};
 use halo2_proofs::halo2curves::group::{Curve as GroupCurve, Group};
 use halo2_proofs::halo2curves::CurveAffine;
 
-use crate::ipa::commitment::{derive_point, CommitmentSchemeIPA, GuardIPA, MSMIPA, ParamsIPA, ThetaChallenge, RoundChallenge};
+use crate::ipa::commitment::{CommitmentSchemeIPA, GuardIPA, MSMIPA, ParamsIPA, ThetaChallenge, RoundChallenge};
 use crate::dtrace;
 
 #[derive(Debug)]
@@ -49,7 +49,7 @@ where
             > + Clone,
     {
         let all_queries: Vec<VerifierQuery<'com, C, MSMIPA<C>>> = queries.into_iter().collect();
-        let h = derive_point::<C>("aetheris-ipa-h", b"h");
+        let h = msm.h;
         let mut seen = std::collections::BTreeSet::new();
         let unique_points: Vec<&VerifierQuery<'com, C, MSMIPA<C>>> = all_queries
             .iter()
@@ -69,11 +69,11 @@ where
                 transcript.read_scalar().map_err(|_| Error::OpeningError)?;
             let k_repr = PrimeField::to_repr(&k_raw);
             let k_bytes = k_repr.as_ref();
-            if k_bytes.len() < 4 {
-                return Err(Error::OpeningError);
-            }
             let mut k_buf = [0u8; 4];
             k_buf.copy_from_slice(&k_bytes[..4]);
+            if k_bytes[4..].iter().any(|&b| b != 0) {
+                return Err(Error::OpeningError);
+            }
             let k = u32::from_le_bytes(k_buf) as usize;
             if k >= 32 {
                 return Err(Error::OpeningError);
@@ -127,8 +127,17 @@ where
             for _ in 0..k {
                 let l = transcript.read_point().map_err(|_| Error::OpeningError)?;
                 let r = transcript.read_point().map_err(|_| Error::OpeningError)?;
-                let x: ChallengeScalar<C, RoundChallenge> =
+                let mut x: ChallengeScalar<C, RoundChallenge> =
                     transcript.squeeze_challenge_scalar();
+                let mut x_val = *x;
+                let mut reject_count = 0u32;
+                while bool::from(x_val.is_zero()) || x_val == C::ScalarExt::ONE {
+                    reject_count += 1;
+                    transcript.common_scalar(C::ScalarExt::from(reject_count as u64))
+                        .map_err(|_| Error::OpeningError)?;
+                    x = transcript.squeeze_challenge_scalar();
+                    x_val = *x;
+                }
                 if crate::diagnostics::dbg_enabled() {
                     if point_queries.len() == 15 {
                         let l_x = l.coordinates().map(|c| *c.x());
@@ -137,7 +146,7 @@ where
                 }
                 l_points.push(l);
                 r_points.push(r);
-                challenges.push(*x);
+                challenges.push(x_val);
             }
 
             let a_final: C::ScalarExt =
@@ -157,15 +166,9 @@ where
                 b_cur[i] = b_cur[i - 1] * point;
             }
 
-            // Derive G_i from hash_to_curve (same deterministic derivation as ParamsIPA)
-            let mut g_cur: Vec<C> = Vec::with_capacity(n);
-            for i in 0..n {
-                let mut tag = b"g-".to_vec();
-                tag.extend_from_slice(&i.to_le_bytes());
-                g_cur.push(derive_point::<C>("aetheris-ipa-g", &tag));
-            }
-
-            let u = derive_point::<C>("aetheris-ipa-u", b"u");
+            // Use G_i from params (via msm), same generators as prover used
+            let mut g_cur: Vec<C> = msm.g.clone();
+            let u = msm.u;
 
             // Fold b and G through the IPA challenges (same folding as prover)
             let mut len = n;
