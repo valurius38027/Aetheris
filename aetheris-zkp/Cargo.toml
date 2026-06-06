@@ -13,6 +13,7 @@ rand = { workspace = true }
 rand_core = "0.6"
 blake3 = { workspace = true }
 aetheris-core = { workspace = true }
+aetheris-crypto = { path = "../aetheris-crypto" }
 serde = { workspace = true }
 aes-gcm = { workspace = true }
 x25519-dalek = { workspace = true }
