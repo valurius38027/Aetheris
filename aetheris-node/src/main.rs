@@ -220,6 +220,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
     let mut last_block_proof = vec![0u8; 32]; // Initial proof for genesis
+    let mut seen_aggregates: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut agg_gossip_check = std::time::Instant::now();
+    let mut agg_gossip_count: u32 = 0;
     
     // Mixnet Static Keys — generated from OsRng; not derived from public PeerId
     let mut my_mix_sk = [0u8; 32];
@@ -483,16 +486,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                      // 3. Handle Accumulator Gossip (§1.11)
                      if let Ok(gossip) = serde_json::from_slice::<AggregateProofGossip>(&message.data) {
-                         let ok = verify_accumulator_chain(
-                             &gossip.accumulator,
-                             &gossip.prev_accumulator,
-                             &gossip.proofs,
-                             &gossip.commitments_list,
-                             &gossip.public_amounts,
-                             None,
-                         );
+                         // Dedup: skip if we already processed this aggregate_id
+                         let already_seen = !seen_aggregates.insert(gossip.aggregate_id);
+                         if already_seen {
+                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                 &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
+                             );
+                             continue;
+                         }
+                         // Rate limit: max 50 verify calls per 10s window
+                         let now = std::time::Instant::now();
+                         if now.duration_since(agg_gossip_check).as_secs() >= 10 {
+                             agg_gossip_count = 0;
+                             agg_gossip_check = now;
+                         }
+                         agg_gossip_count += 1;
+                         let ok = if agg_gossip_count > 50 {
+                             false
+                         } else {
+                             verify_accumulator_chain(
+                                 &gossip.accumulator,
+                                 &gossip.prev_accumulator,
+                                 &gossip.proofs,
+                                 &gossip.commitments_list,
+                                 &gossip.public_amounts,
+                                 None,
+                             )
+                         };
                          if ok {
                              println!("[AGG] Validated accumulator gossip: depth={}", gossip.depth);
+                         } else if agg_gossip_count > 50 {
+                             println!("[AGG] Rate limit exceeded, rejecting accumulator gossip");
                          }
                          let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                              &_id, &peer_id,
