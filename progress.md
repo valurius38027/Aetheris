@@ -2556,4 +2556,40 @@ SIGNED_ACCUMULATOR_WIRE_PREFIX (28B) || Q (32B) || transcript (32B) || ed25519_s
 - **O(n) audit**: full ZK replay for dispute resolution (unchanged from Phase 1.5)
 - **Cryptographic soundness** of the IPA chain itself is unchanged (still trusted-aggregator until §1.12 in-circuit IPA verifier)
 
+---
+
+## Stage 33 — §1.11 P2P Accumulator Gossip (2026-06-06)
+
+**Scope**: Wire `AggregateProofGossip` into the libp2p gossipsub layer with real accumulator-chain verification, DOS protection, and backward-compatible infrastructure.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-recursive/src/lib.rs` | Redesign `AggregateProofGossip`: `accumulator`, `prev_accumulator`, `proofs`, `commitments_list`, `public_amounts`, `depth`, `timestamp`. Remove `statement`/`proof`/`leaf_txs`. Simplify `P2PRecursiveManager`: remove simulation stubs (`forward_proof`, `check_aggregation_trigger`, `start_aggregation_step`), add rate limiting (100 msg/10s). `verify_aggregate_proof` now calls `verify_accumulator_chain` for real O(n) replay. |
+| `aetheris-node/src/p2p.rs` | +`accumulator_topic` ("aetheris-accumulators"), +`AggregateGossipReceived` event, +`BroadcastAggregateGossip` command, +`broadcast_accumulator()` method, subscribe in `subscribe_topics()`. |
+| `aetheris-node/src/main.rs` | +accumulator gossip handler in event loop: deserialize `AggregateProofGossip` → `verify_accumulator_chain(None)` → gossipsub Accept/Reject. |
+| `aetheris-ffi/src/lib.rs` | +match arm for `BroadcastAggregateGossip` (log-only). |
+
+### P2P Flow
+1. Miner produces block → broadcasts `BlockProposal` (existing, contains `aggregate_proof`).
+2. Nodes optionally broadcast `AggregateProofGossip` on separate topic for faster accumulator propagation.
+3. Receiver: parse → `verify_accumulator_chain` (O(n) replay, `None` pubkey) → gossipsub `Accept`/`Reject`.
+4. Dedup via gossipsub `message_id_fn` (hash of full message) + `seen_aggregate` HashMap.
+
+### DOS Protection
+- **Gossipsub layer**: `Strict` validation, `message_id_fn` dedup, mesh parameters (6-12-18), 10 MB max transmit.
+- **Application layer**: rate limit 100 messages per 10-second window per `P2PRecursiveManager` instance; dedup by `aggregate_id` + depth.
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace --all-targets` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive` | ✅ 40/40 |
+| `cargo test -p aetheris-node --lib` | ✅ 9/9 |
+| `cargo test -p aetheris-zkp` | ✅ 69/69 |
+| `cargo test -p aetheris-wallet` | ✅ 5/5 |
+| FFI | ❌ T-01 pre-existing crash (unchanged) |
+
 
