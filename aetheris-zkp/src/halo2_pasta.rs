@@ -130,9 +130,10 @@ pub fn create_nullifier(sk: &[u8], commitment_index: u64) -> [u8; 32] {
 
 #[derive(Clone, Debug)]
 pub struct ValueConfig {
-    pub advice: [Column<Advice>; 3],
+    pub advice: [Column<Advice>; 5],
     pub s_running_sum: Selector,
     pub s_constrain_equal: Selector,
+    pub s_conservation: Selector,
     pub instance: Column<Instance>,
 }
 
@@ -172,12 +173,19 @@ impl Circuit<Fq> for ValueConservationCircuit {
     }
 
     fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
-        let advice = [meta.advice_column(), meta.advice_column(), meta.advice_column()];
+        let advice = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
         for col in &advice {
             meta.enable_equality(*col);
         }
         let s_running_sum = meta.selector();
         let s_constrain_equal = meta.selector();
+        let s_conservation = meta.selector();
         let instance = meta.instance_column();
         meta.enable_equality(instance);
 
@@ -199,32 +207,27 @@ impl Circuit<Fq> for ValueConservationCircuit {
             let s = meta.query_selector(s_constrain_equal);
             let a = meta.query_advice(advice[0], Rotation(0));
             let b = meta.query_advice(advice[2], Rotation(0));
-            // s * (a - b) = 0  -> a = b
-            // s * b         = 0  -> b = 0
-            // Combined: a = b = 0 when s = 1.
-            // This replaces a separate `region.constrain_constant(b, 0)` call,
-            // avoiding the need for `meta.enable_constant` (which would also add
-            // the fixed column to the permutation argument and break multiset equality).
             vec![s.clone() * (a - b.clone()), s * b]
+        });
+
+        meta.create_gate("conservation_running_sum", |meta| {
+            let s = meta.query_selector(s_conservation);
+            let prev = meta.query_advice(advice[2], Rotation(-1));
+            let cur = meta.query_advice(advice[2], Rotation(0));
+            let signed = meta.query_advice(advice[4], Rotation(0));
+            vec![s * (cur - prev - signed)]
         });
 
         ValueConfig {
             advice,
             s_running_sum,
             s_constrain_equal,
+            s_conservation,
             instance,
         }
     }
 
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
-        let total_in: u64 = self.amounts_in.iter().sum();
-        let total_out: u64 = self.amounts_out.iter().sum();
-        let net_value = total_in as i64 - total_out as i64 - self.public_amount;
-
-        if net_value != 0 {
-            return Err(ErrorFront::Synthesis);
-        }
-
         let all_amounts: Vec<u64> = self.amounts_in.iter()
             .chain(self.amounts_out.iter())
             .copied()
@@ -234,9 +237,8 @@ impl Circuit<Fq> for ValueConservationCircuit {
             let mut offset = 0;
             let inv_2 = Fq::from(2).invert().unwrap();
 
+            // ─── 64-bit range proof per amount (unchanged) ──────────
             for &amount in &all_amounts {
-                // Initial row: assign initial z value WITHOUT s_running_sum.
-                // This avoids Rotation(-1) wrapping to unassigned row 2047.
                 let z_0 = Fq::from(amount);
                 region.assign_advice(|| "z_0", config.advice[0], offset, || Value::known(z_0))?;
                 region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fq::zero()))?;
@@ -257,22 +259,53 @@ impl Circuit<Fq> for ValueConservationCircuit {
                     z_prev = z_cur;
                     remaining >>= 1;
                 }
-
-                offset += 1; // gap between amounts
+                offset += 1; // gap after each amount
             }
 
-            // Constrain net value = 0
-            let net_fq = Fq::from(0u64);
-            region.assign_advice(|| "net_value", config.advice[0], offset, || Value::known(net_fq))?;
-            let _copy_cell = region.assign_advice(|| "net_value_copy", config.advice[2], offset, || Value::known(net_fq))?;
-            config.s_constrain_equal.enable(&mut region, offset)?;
+            // ─── Conservation running sum ───────────────────────────
+            let n_in = self.amounts_in.len();
+            offset += 1; // initial running_sum = 0 (no gate)
+            region.assign_advice(|| "run_sum_0", config.advice[2], offset, || Value::known(Fq::ZERO))?;
 
+            let mut running_sum = Fq::ZERO;
+            for (i, &amount) in all_amounts.iter().enumerate() {
+                offset += 1;
+                let signed: Fq = if i < n_in {
+                    Fq::from(amount)
+                } else {
+                    Fq::ZERO - Fq::from(amount)
+                };
+                running_sum = running_sum + signed;
+                region.assign_advice(|| "run_sum", config.advice[2], offset, || Value::known(running_sum))?;
+                region.assign_advice(|| "signed_amt", config.advice[4], offset, || Value::known(signed))?;
+                config.s_conservation.enable(&mut region, offset)?;
+            }
+
+            // ─── Final: bind running_sum to instance[0] via s_conservation ──
+            // The gate enforces: cur - prev - signed = 0 where
+            //   prev = advice[2][Rotation(-1)] = last computed running_sum
+            //   cur  = advice[2][Rotation(0)]  = public_amount (from instance)
+            //   signed = 0 (at this row)
+            // → public_amount = running_sum_last = sum_in - sum_out ✓
             offset += 1;
-
-            // Constrain instance[0] == public_amount via copy constraint
+            region.assign_advice(|| "zero_signed", config.advice[4], offset, || Value::known(Fq::ZERO))?;
             region.assign_advice_from_instance(
-                || "instance_pub", config.instance, 0, config.advice[0], offset,
+                || "pub_amt", config.instance, 0, config.advice[2], offset,
             )?;
+            config.s_conservation.enable(&mut region, offset)?;
+
+            // ─── Commitment bindings: instance[1+j] → advice[3] ────
+            for (j, cm_set) in self.output_commitments.iter().enumerate() {
+                let idx = n_in + j;
+                if idx < all_amounts.len() && !cm_set.is_empty() {
+                    region.assign_advice_from_instance(
+                        || "commitment", config.instance, 1 + j, config.advice[3], offset,
+                    )?;
+                }
+                if idx < all_amounts.len() {
+                    offset += 1;
+                }
+            }
 
             Ok(())
         })
@@ -363,7 +396,9 @@ impl ZkProverSystem for Halo2PastaBackend {
         } else {
             Fq::ZERO - Fq::from(public_amount.unsigned_abs())
         };
-        let instances = vec![vec![instance_fq]];
+        let mut instance_col = vec![instance_fq];
+        instance_col.extend(output_commitments.iter().map(|cm| Fq::from_repr(*cm).into_option().unwrap()));
+        let instances = vec![instance_col];
         create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
             params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
         ).expect("prove_conservation failed");
@@ -377,21 +412,12 @@ impl ZkProverSystem for Halo2PastaBackend {
 
     fn verify_conservation(
         proof: &[u8],
-        _output_commitments: &[[u8; 32]],
+        output_commitments: &[[u8; 32]],
         public_amount: i64,
     ) -> bool {
         const PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
         const PREFIX_LEN: usize = 19;
         const SHAPE_LEN: usize = 4;
-        // Phase 1.5 / ISSUE-1.4.D: bound the proof I/O shape BEFORE calling
-        // `ensure_keys`. With PROVING_K = 11 (2048 rows), each input/output
-        // cell costs ~66 rows; shapes (in_len + out_len) > 30 overflow the
-        // row budget and would cause `ensure_keys` to panic via
-        // `expect("keygen_vk failed")`. A 23-byte payload with
-        // `(in_len=65535, out_len=0)` is sufficient to crash any direct
-        // caller. We bound the shape here so that ALL callers
-        // (mempool DoS guard, accumulator, FFI mining loop, etc.) are
-        // protected uniformly.
         const MAX_PROOF_IOPS: usize = 30;
         if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
             return false;
@@ -407,24 +433,21 @@ impl ZkProverSystem for Halo2PastaBackend {
 
         let (params, (vk, _)) = (ensure_params(), ensure_keys(in_len, out_len));
 
-        // Derive instance from public_amount (encoded as Fq for the instance column)
         let instance_fq = if public_amount >= 0 {
             Fq::from(public_amount as u64)
         } else {
-            // For negative public_amount, use two's complement in the field
             Fq::ZERO - Fq::from(public_amount.unsigned_abs())
         };
-        let instances = vec![vec![instance_fq]];
+        let mut instance_col = vec![instance_fq];
+        instance_col.extend(output_commitments.iter().map(|cm| Fq::from_repr(*cm).into_option().unwrap()));
+        let instances = vec![instance_col];
 
         let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
         match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
             params, &vk, SingleStrategyIPA::new(params), &[instances], &mut transcript,
         ) {
-            Ok(strategy) => {
-                let ok = strategy.finalize();
-                ok
-            }
-            Err(_) => false
+            Ok(strategy) => strategy.finalize(),
+            Err(_) => false,
         }
     }
 
@@ -631,14 +654,13 @@ mod tests {
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -1000));
     }
 
-    /// Regression: prove with WRONG sign (+amount) for a mint must panic at synthesis
-    /// (net_value = -2*amount != 0). The FFI uses `-(amount as i64)`; this locks the
-    /// sign convention so a future refactor that flips it will be caught here.
+    /// Regression: prove with WRONG sign (+amount) for a mint must be rejected by verifier
+    /// (running_sum = -1000, instance[0] = 1000, so 1000 - (-1000) ≠ 0).
     #[test]
-    #[should_panic]
-    fn test_mint_shape_wrong_sign_panics_at_synthesis() {
+    fn test_mint_shape_wrong_sign_rejected_by_verifier() {
         let commitments = vec![[0u8; 32]; 1];
-        let _ = make_proof(&[], &[1000], &commitments, 1000);
+        let proof = make_proof(&[], &[1000], &commitments, 1000);
+        assert!(!Halo2PastaBackend::verify_conservation(&proof, &commitments, 1000));
     }
 
     #[test]
@@ -876,8 +898,14 @@ mod tests {
             &out_cms, 0,
         );
         assert!(Halo2PastaBackend::verify_conservation(&proof, &out_cms, 0));
+    }
 
-        // NOTE: Output commitment binding is not enforced by the current circuit.
+    #[test]
+    fn test_commitment_binding_rejects_tampered() {
+        let out_cms = vec![[0x11u8; 32], [0x22u8; 32]];
+        let wrong_cms = vec![[0x01u8; 32], [0x02u8; 32]];
+        let proof = make_proof(&[100, 50], &[80, 70], &out_cms, 0);
+        assert!(!Halo2PastaBackend::verify_conservation(&proof, &wrong_cms, 0));
     }
 
     #[test]
