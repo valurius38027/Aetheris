@@ -2596,4 +2596,75 @@ SIGNED_ACCUMULATOR_WIRE_PREFIX (28B) || Q (32B) || transcript (32B) || ed25519_s
 - **Issue**: main.rs accumulator gossip handler had no dedup or rate limiting — attacker could bypass `P2PRecursiveManager`'s 100/10s limit by sending directly to the P2P event loop
 - **Fix**: +`seen_aggregates: HashSet<[u8; 32]>` for dedup + 50 verify-calls/10s window rate limiter in main.rs event loop state (commit `cb880ce`)
 
+---
+
+## Stage 34 — §1.12a NonNativeFqChip for In-Circuit IPA Verifier (2026-06-07)
+
+**Scope**: Start §1.12 trustless in-circuit IPA verifier work by adding sound non-native Fq arithmetic over the recursive circuit field Fp. This is the prerequisite for verifying Pallas scalar arithmetic inside the Vesta-scalar Halo2 circuit.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-recursive/src/non_native_fq.rs` | New `NonNativeFqChip`: 3×85-bit Fq representation, add/sub/neg/mul/invert/range_check, Fq modulus constants, BigUint witness helpers, 9 unit tests |
+| `aetheris-recursive/src/lib.rs` | `pub mod non_native_fq;` export |
+| `aetheris-recursive/docs/in_circuit_ipa_verifier.md` | Design document for §1.12 in-circuit IPA verifier architecture |
+| `prototype/non_native_fq_proto.py` | Prototype validating 3×85-bit limb arithmetic |
+
+### Arithmetic Design
+
+- **Field placement**: recursive circuit runs over Pasta `Fp`; IPA scalars are `Fq`, so Fq arithmetic is non-native.
+- **Representation**: `FqElement = [l0, l1, l2]`, base `B = 2^85`, little-endian; 255 bits covers Fq.
+- **Addition**: two-pass carry + reduction:
+  1. `s_add` computes unreduced `S = a + b` with carry chain.
+  2. `s_reduce` constrains `S = R + k·Fq`; `k` bit-checked.
+  3. Row 8 gap added to avoid aux-cell overlap; row 9 range-checks `k`.
+- **Multiplication**: quotient/remainder witness with integer carry chain:
+  1. 9 `s_mul` rows: `p_ij = a_i · b_j`.
+  2. Witness `Q = floor(A·B / Fq)` and `R = A·B mod Fq`.
+  3. 9 `s_mul` rows: `qf_ij = q_i · fq_j`.
+  4. `s_add` rows accumulate `P_k` partial-product columns.
+  5. `s_reduce` rows constrain `P_k + c_{k-1} = (QF+R)_k + B·c_k`, plus final `c_4 = 0` check.
+  6. Range checks: Q limbs 3×85 bits, R limbs 3×85 bits, carries c0..c3 4×90 bits.
+- **Negation**: witness `Fq - a`, then verify in-circuit with `add(a, neg_a) == 0`.
+- **Inversion**: witness `a^(Fq-2) mod Fq`, then verify with `mul(a, inv) == 1`.
+
+### Review Findings and Fixes
+
+| Finding | Severity | Fix |
+|---------|----------|-----|
+| Missing R-limb range checks allowed quotient substitution attempts | ❌ Blocking | Added 3×85-bit R limb range checks |
+| `neg()` was witness-only and unconstrained | ❌ Blocking | `neg()` now calls `add(a, neg_a)` and constrains result to zero |
+| `add()` row 7 `borrow_out_3` shared `aux[8]` with row 8 `k_check` | ❌ Blocking | Moved `k_check` to row 9; row 8 is an explicit gap |
+| Carries c0..c3 were unbounded, so Fp equations did not imply integer equations | ❌ Blocking | Added 4×90-bit carry range checks linked to original carry-chain aux cells |
+| `add()` k flag proves bitness but not comparison `S >= Fq` | ⚠️ Non-blocking | Carried forward; honest witnesses set k correctly, and current verified paths reject wrong outputs |
+
+### Soundness Result
+
+The final multi-agent review approved the multiplication gadget after carry range checks. With `c_k < 2^90`, each carry-chain row is bounded by `< 2^176 << p_Fp`; therefore a satisfied Fp equation is also the corresponding integer equation. The weighted telescoping sum with `c_4 = 0` proves `A·B = Q·Fq + R` over integers, so returned `R` is the correct Fq product.
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test --workspace --lib --exclude aetheris-ffi` | ✅ 194/194 |
+| `cargo test -p aetheris-ffi --lib -- --test-threads=1` | ✅ 3/3 |
+| `aetheris-recursive::non_native_fq` tests | ✅ 9/9 |
+
+### Multi-Agent Review
+
+- First review: found 3 blocking issues (R limb range, unconstrained neg/sub, carry bounds) and one add-row cell conflict during implementation.
+- Iteration 1: added R checks, fixed `neg()`, moved `k_check` row.
+- Iteration 2: added carry range checks c0..c3.
+- Final review: ✅ **APPROVED**, no blocking issues. One non-blocking warning remains for future canonical-output/comparison hardening in `add()`.
+
+### Remaining Work
+
+- §1.12b: `NonNativeFqScalarMul` — windowed scalar multiplication using non-native Fq scalar.
+- §1.12c: `IpaFoldingChip` — fold G and b vectors across IPA rounds.
+- §1.12d: Poseidon transcript + `IpaVerifierCircuit` integration.
+- §1.12e: optimization and real proof verification benchmark.
+
+**Phase 1.12a scope**: bounded to `aetheris-recursive` non-native Fq arithmetic + design/prototype docs. No node, FFI, wallet, or ZKP verifier behavior changed.
 
