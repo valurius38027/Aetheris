@@ -1130,6 +1130,8 @@ impl EccChip {
 
 // --- Non-Native Arithmetic ---
 
+pub mod non_native_fq;
+
 #[derive(Clone, Debug)]
 pub struct Limb {
     pub value: Value<Fp>,
