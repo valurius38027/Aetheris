@@ -342,7 +342,28 @@ Phase 4   生产就绪     ─→  文档/清理
 - **未触及**: 递归 SNARK (仍 trusted)
 - **预估**: 400 行
 
+### 1.11.5 🔴 IPA-PLONK h_eval 约束修复（当前焦点，1-2 周）
+- **来源**: `ISSUE_IPA_PLONK_INTEGRATION.md`
+- **问题**: Prover 的 coset-FFT 路径和 verifier 的直接表达式求值产生不同的 `f(x)`。`expected_h_eval != transcript_h_eval` 约束检查被绕过 —— 所有 IPA 证明缺少完整 PLONK 验证。
+- **根因**: IFFT 在索引 ≥4094 处产生系统性 DC 伪影，h_poly 含虚假度数。extended_k=13 已保留为正确性改进但未解决 mismatch。
+- **动作**:
+  1. 修复 IFFT DC 伪影：调查 `extended_to_coeff` / `distribute_powers_zeta` 相位因子
+  2. 修复 `divide_by_vanishing_poly` 归一化误差（若存在）
+  3. 重新启用 h_eval 约束检查
+  4. 更新 `test_valid_proof_is_rejected_until_ipa_plonk_quotient_mismatch_is_fixed` 从 "expects failure" → "passes"
+- **文件**:
+  - `vendor/halo2/halo2_backend/src/plonk/vanishing/prover.rs` — h_poly 构造
+  - `vendor/halo2/halo2_backend/src/plonk/vanishing/verifier.rs` — h_eval 约束
+  - `vendor/halo2/halo2_backend/src/plonk/evaluation.rs` — coset 求值
+  - `vendor/halo2/halo2_backend/src/polynomial/domain.rs` — extended_k
+- **依赖**: 无（独立于 Phase 1.12）
+- **验证**: `cargo test -p aetheris-zkp` 中 h_eval 约束重新启用且通过
+- **推进条件**: §1.11.5 全部完成 → 恢复 §1.12d3
+
 ### 1.12 In-Circuit IPA Verifier Gadget (trustless blocker, 2-3 个月研发) 🔬 **研究级**
+- **⚠️ 暂停中**: §1.11.5 (IPA-PLONK h_eval 修复) 必须先完成。
+- **当前进度**: §1.12d1 (transcript plumbing) ✅, §1.12d2 (init binding) ✅, §1.12c (wrapping add) ✅
+- **待恢复**: §1.12d3 (Blake2b 12-round mixing), §1.12d4 (Challenge255), §1.12d5 (IpaVerifierCircuit)
 - **目标**: 实现 Pasta 标量域算术 in Pasta Fq 域电路;IPA verifier 可在电路内 verify 一个 IPA proof
 - **基础**: Pasta 2-cycle → `Fp` (Pallas base) = `Fq` (Vesta scalar) → **原生递归,无 NonNativeChip 开销**
 - **范围**:
@@ -483,8 +504,16 @@ Phase 1 (一次性 ZK 重写)
   1.5 ◄──┤  (集成 IPA 到区块 — 依赖 1.4 + 0.1-0.3)
   1.6 ────┤  (VDF 真实实现)
   1.7 ────┘  (恢复调用方)
-          │  Phase 1 全部完成 = MVP
-          ▼
+  1.8 ────┤  (Accumulator 集成测试)
+  1.9 ────┤  (P0 Conservation Soundness Fix)
+  1.10 ───┤  (Signed Accumulator)
+  1.11 ───┤  (P2P Proof Gossip)
+  1.11.5 ◄┤  (IPA-PLONK h_eval 修复 — 当前焦点)
+  1.12 ◄──┤  (In-Circuit IPA Verifier — 依赖 1.11.5)
+  1.13-1.16┤(Recursive Wrapper → Mainnet)
+           │  MVP ≈ Phase 0 + Phase 1.0-1.11 (trusted 模式)
+           │  Full Trustless ≈ Phase 0 + Phase 1.0-1.16 (§1.11.5 + §1.12 完成)
+           ▼
 Phase 2 ──→ Phase 3 ──→ Phase 4
 ```
 
@@ -510,11 +539,11 @@ Week 1-2:   Phase 0        (Node 层修复，不碰 ZK)                         
 Week 3-4:   Phase 1.0-1.1  (ZK trait + IPA 承诺方案底层 — 最大新代码量，从零实现 IPA)
 Week 5-6:   Phase 1.2      (Pasta 电路移植 + 全套测试)
 Week 7:     Phase 1.3-1.4  (清理 aetheris-recursive + IPA 递归积累)
-Week 8:     Phase 1.5-1.7  (集成区块/VDF/恢复调用方)
-Week 9-12:  Phase 2        (钱包隐私)
-Week 13-15: Phase 3        (网络)
-Week 16-17: Phase 4        (文档/清理)
+Week 8:     Phase 1.5-1.11 (集成区块/VDF/P2P/signed accumulator/恢复调用方)
+Week 9-10:  Phase 1.11.5   (🔴 IPA-PLONK h_eval 修复 — 当前焦点)
+Week 11+:   Phase 1.12+    (恢复 In-Circuit IPA Verifier — 2-3 个月研究级)
+Week 12+:   Phase 2+       (推迟至 Phase 1.12 完成后)
 
-MVP (Phase 0+1) ≈ 8 周
-Full Mainnet (Phase 0-4) ≈ 17 周
+MVP (trusted mode) ≈ Phase 0 + Phase 1.0-1.11 ≈ 已到达（8 周）
+Full Trustless ≈ Phase 0 + Phase 1.0-1.16 ≈ 至少再加 3-4 个月
 ```
