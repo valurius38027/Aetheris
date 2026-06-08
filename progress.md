@@ -2832,3 +2832,36 @@ The final multi-agent review approved the multiplication gadget after carry rang
 - Steps 4 and 6 (second half of mixes) are still not constrained — they use the same wrapping_add logic but are in later mixes.
 - The Blake2b 12-round mixing function XOR/rotation/add completes the G-function; feed-forward remains host-expected.
 - Integration with the full verifier transcript (resqueeze, Challenge255) remains deferred.
+
+> ⏸️ **Phase 1.12d3-d5 已暂停以优先修复 IPA-PLONK h_eval 约束。**
+> 参见 Stage 39。
+
+---
+
+## Stage 39 — Reprioritization: IPA-PLONK h_eval Fix Before §1.12 (2026-06-08)
+
+**Scope**: In the 2026-06-08 health assessment, the IPA-PLONK h_eval constraint was identified as the single biggest blocker — all IPA proofs lack full PLONK verification. Decision: pause §1.12d3 (Blake2b 12-round mixing) and fix the integration first.
+
+#### Root Cause (from ISSUE_IPA_PLONK_INTEGRATION.md):
+- `f_prover(x) ≠ f_verifier(x)` — prover's coset-FFT path and verifier's direct expression evaluation produce different f(x).
+- IFFT output has systematic DC artifacts at indices ≥ 4094, causing h_poly to have spurious degree.
+- The h_eval constraint check (`expected_h_eval == transcript_h_eval`) is currently **disabled** — a soundness hole.
+- extended_k=13 (qpd+1) fix retained as correctness improvement but does NOT resolve the mismatch.
+
+#### Plan Change:
+| Before | After |
+|--------|-------|
+| 1.12d3 (Blake2b 混合) → d4 → d5 → 1.13... | **1.11.5 IPA-PLONK h_eval 修复** (当前焦点) |
+| | 1.12d3-d5 (恢复，依赖 1.11.5) |
+| | 1.13+ 不变 |
+
+#### Verification Gate:
+- `cargo test -p aetheris-zkp` must show `expected_h_eval == transcript_h_eval` matching (constraint re-enabled).
+- `test_valid_proof_is_rejected_until_ipa_plonk_quotient_mismatch_is_fixed` must change from "expects failure" to "passes".
+
+#### Key Files:
+- `ISSUE_IPA_PLONK_INTEGRATION.md` — full investigation record
+- `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/vanishing/` — prover.rs + verifier.rs (h_poly, h_eval)
+- `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/evaluation.rs` — evaluate_h (coset path)
+- `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/prover.rs` — fx_direct computation
+- `aetheris-zkp/vendor/halo2/halo2_backend/src/polynomial/domain.rs:49` — extended_k fix (retained)
