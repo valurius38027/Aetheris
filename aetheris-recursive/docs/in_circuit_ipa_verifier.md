@@ -78,10 +78,11 @@ The recursive circuit runs over **Fp** (Vesta scalar field = Pallas base field).
 │  └───────────────────────────────────────────────────────────┘   │
 │         ▲                                                       │
 │         │                                                       │
-│  ┌──────┴──────────────────────────────────────────────────┐    │
-│  │  EccChip (point add, double, select, assert_on_curve)   │    │
-│  │  — FULLY REUSABLE FROM PHASE 1.3                        │    │
-│  └─────────────────────────────────────────────────────────┘    │
+│  ┌──────┴──────────────────────────────────────────────────────────────┐ │
+│  │  Recursive-safe ECC path (fixed-shape add/double/select)           │ │
+│  │  built on top of Phase 1.3 EccChip primitives; this must be        │ │
+│  │  hardened before trusting variable-base scalar mul / G folding     │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
 │                                                                  │
 │  Public inputs: P_combined, v, point, k                          │
 │  Witness: L_i, R_i, a_final, r_prime                             │
@@ -231,43 +232,55 @@ At ~7650 rows per inversion vs ~36 rows per multiply, this saves `(k-1)*(7650-36
 
 Shares EccChip columns for point operations, uses NonNativeFq columns for scalar operations.
 
-### 4.4 IpaTranscript — Fiat-Shamir in Circuit
+### 4.4 IpaTranscript — Exact Halo2 Transcript Equivalence
 
-#### Challenge Derivation
+#### Exact Semantics
 
-The verifier must reproduce the same challenges as the prover:
-1. `theta` from `(k || all commitment points || all evaluation scalars)`
-2. Each `x_i` from `(theta || L_0 || R_0 || ... || L_i || R_i)`
+The recursive verifier must reproduce the real Halo2 Blake2b transcript exactly.
+There is no sound shortcut here. In particular, the circuit transcript must match
+`aetheris-zkp/vendor/halo2/halo2_backend/src/transcript.rs` byte-for-byte and
+state-transition-for-state-transition.
 
-**But**: implementing a full transcript (absorbing 32+ points and squaring ~10 challenges) inside the circuit using Poseidon is expensive but tractable.
+Per transcript operation:
+1. Initialization uses Blake2b with personalization `"Halo2-Transcript"`
+2. `common_point(P)` appends prefix byte `1`, then `x.to_repr()`, then `y.to_repr()`
+3. `common_scalar(s)` appends prefix byte `2`, then `s.to_repr()`
+4. `squeeze_challenge()` appends prefix byte `0`, clones the running state, finalizes the clone to 64 bytes, then maps those 64 bytes through `Challenge255`
+5. Round challenges additionally follow the protocol-level reject/resqueeze loop for `x_i ∈ {0,1}` by appending `common_scalar(reject_count)` and squeezing again
 
-**Alternative**: take challenges as witnesses and verify they hash correctly.
+The transcript also does **not** start at a fresh IPA-local state. The real IPA
+verifier starts from the outer Halo2 transcript state after all pre-IPA common
+inputs have already been absorbed.
 
-**Recommended approach**: Challenge-witness hybrid
-- Challenges `x_i` and `theta` are **witnessed** (private inputs)
-- A Poseidon hash is computed over the inputs that should bind them
-- The circuit constrains that `blake3(...)` or Poseidon hash matches
-- This avoids in-circuit challenge derivation at the cost of making challenges "part of the proof" (which they already are — the prover picks them)
+#### Design Consequence
 
-Actually, the correct approach for a recursive SNARK is to derive challenges in-circuit from a simulated transcript. But for §1.12, we can start with witnessed challenges verified by hash.
+The old Poseidon transcript plan is rejected. `§1.12d` now means exact Halo2
+transcript equivalence, which requires:
+- byte decomposition and byte range plumbing in the recursive circuit
+- an in-circuit Blake2b state gadget
+- exact `Challenge255::from_uniform_bytes([u8; 64])` semantics
+- exact pre-IPA transcript prefix binding
+- exact round reject/resqueeze behavior
 
-```rust
-pub struct IpaTranscriptConfig {
-    poseidon: PoseidonConfig<3, 2>,
-    // Columns for absorbing points and scalars
-    absorb: [Column<Advice>; 2],  // rate columns
-    s_absorb: Selector,
-}
-```
+#### Sub-Phases
 
-**Flow**:
-1. Absorb `k` (as Fp)
-2. Absorb all commitment points (Pallas affine coordinates = 2 Fp each)
-3. Absorb all claimed evaluations (as Fq → Fp converted)
-4. Squeeze `theta` (Poseidon output → Fq via `fp_to_fq` byte rewrap)
-5. For each round: absorb `L_i, R_i`, squeeze `x_i`
+- `§1.12d1`: byte transcript plumbing + host/reference exact transcript semantics
+- `§1.12d2`: circuit byte representation + in-circuit Blake2b compression/state gadget
+  - first map transcript bytes into 64-bit little-endian Blake2b message words
+  - then constrain the Blake2b compression/state transition on those words
+- `§1.12d3`: exact Halo2 transcript gadget (`common_point`, `common_scalar`, `squeeze_challenge`)
+- `§1.12d4`: exact `Challenge255` derivation gadget
+- `§1.12d5`: full IPA verifier integration on top of exact transcript state
 
-**Cost**: ~20 rows per absorb, ~200 rows per squeeze. For k=10: ~20·(1+2m+2k) + 200·(1+k) ≈ `40m + 2640` rows (where m = number of queries).
+#### `§1.12d1` Deliverable
+
+`§1.12d1` establishes the exact byte-level contract before the heavy Blake2b
+gadget work starts:
+- a dedicated transcript module separate from the bounded Poseidon prototype
+- exact host/reference transcript implementation mirroring Halo2 Blake2b behavior
+- explicit byte encodings for scalar and point absorbs
+- explicit reject/resqueeze reference logic for round challenges
+- tests that pin these semantics so later in-circuit gadgets have an oracle
 
 ### 4.5 Main Circuit: IpaVerifierCircuit
 
@@ -355,6 +368,21 @@ At k=6 (n=64): ~55k rows (prototype-friendly).
 
 **Deliverable**: `aetheris-recursive/src/non_native_mul.rs`
 
+### Phase 2.5 (§1.12b.5, blocker-clearing): Recursive-safe ECC Hardening
+
+1. Add a fixed-shape recursive-use point operation path
+2. Remove witness-dependent control flow from the recursive scalar-mul / folding path
+3. Handle exceptional affine cases (`O`, `P + (-P)`, same-point) without relying on host-side branching
+4. Switch `NonNativeFqScalarMul` to this path before building on it in `IpaFoldingChip`
+5. Add regression tests for recursive-path shape stability and exceptional cases
+
+**Why this phase exists**:
+- The original plan assumed the Phase 1.3 `EccChip` was directly reusable.
+- In practice, the current affine `add` / `double` helpers still rely on witness-dependent branching and incomplete exceptional-case handling.
+- `§1.12c` exposed this as the real blocker after non-native Fq arithmetic became sound.
+
+**Deliverable**: recursive-safe ECC helpers in `aetheris-recursive/src/lib.rs` consumed by `non_native_mul.rs`
+
 ### Phase 3 (§1.12c, ~2 weeks): IpaFoldingChip
 
 1. Implement b vector computation (1023 Fq muls)
@@ -364,14 +392,16 @@ At k=6 (n=64): ~55k rows (prototype-friendly).
 
 **Deliverable**: `aetheris-recursive/src/ipa_fold.rs`
 
-### Phase 4 (§1.12d, ~2 weeks): Transcript + Integration
+### Phase 4 (§1.12d, multi-stage): Exact Transcript Equivalence + Integration
 
-1. Implement in-circuit transcript using PoseidonChip
-2. Wire all components into `IpaVerifierCircuit`
-3. Implement the final MSM check
-4. Write end-to-end test: produce IPA proof → verify in-circuit via MockProver
+1. `§1.12d1`: implement byte transcript plumbing and exact host/reference transcript semantics
+2. `§1.12d2`: implement circuit byte representation, then the in-circuit Blake2b state/compression gadget
+3. `§1.12d3`: implement exact Halo2 transcript gadget and pre-IPA prefix binding
+4. `§1.12d4`: implement exact `Challenge255` derivation and round reject/resqueeze constraints
+5. `§1.12d5`: wire all components into `IpaVerifierCircuit` and keep only verifier-equivalent semantics
+6. Write end-to-end tests: real IPA proof transcript flow → in-circuit verification via MockProver
 
-**Deliverable**: `aetheris-recursive/src/ipa_verifier_circuit.rs`
+**Deliverables**: `aetheris-recursive/src/ipa_transcript.rs`, Blake2b transcript gadgets, and the upgraded `aetheris-recursive/src/ipa_verifier_circuit.rs`
 
 ### Phase 5 (§1.12e, ~2 weeks): Optimization + Real Proofs
 
@@ -386,15 +416,17 @@ At k=6 (n=64): ~55k rows (prototype-friendly).
 
 ## 6. Open Questions
 
-1. **Poseidon vs blake3 for in-circuit transcript**: PoseidonChip exists but operates on Fp. Challenges need to be Fq. Option A: use Poseidon, convert output to Fq via `fp_to_fq`. Option B: implement blake3 in-circuit (very expensive). Option C: out-source challenges to witness (cheapest but requires careful soundness argument). **Decision pending: start with Poseidon.**
+1. **Exact transcript hash choice**: no choice remains. The recursive verifier must match Halo2's Blake2b transcript and `Challenge255` exactly. Poseidon and witness-shortcut variants are out of scope for trustless verification.
 
 2. **SRS generator `g` values**: n = 2^k generators are Pallas points. At k=10, n=1024. These can be loaded as fixed-table lookups at configure time. But a table of 1024 Pallas points with 4-bit windows = 1024 × 16 = 16,384 table entries. This fits in a table column.
 
 3. **Full MSM evaluation**: The final check `Σ s_i · P_i == 0` requires evaluating all scalar-point pairs. This is `n + 2k + 4` scalar muls. For k=10, n=1024 → 1048 scalar muls. At ~800 rows each → ~838k rows. **This dominates the circuit.** Optimization: use the MSM structure (many small scalars) to batch into smaller windows.
 
-4. **Rejection sampling**: The verifier rejects `x_i == 0` or `x_i == 1` (verifier.rs:134–140). Probability is `2/|Fq| ≈ 2^-254`, so rejection almost never happens. The circuit can just prove it didn't happen (constant-time).
+4. **Recursive-safe ECC path**: the legacy affine `EccChip` helpers are not sufficient for trustless recursive verification as-is. The recursive verifier needs a fixed-shape point-operation path that does not branch on witness values and does not rely on incomplete exceptional-case handling. **Decision: make this an explicit prerequisite between §1.12b and §1.12c.**
 
-5. **Batch verification**: `AccumulatorStrategyIPA` scales each MSM by a random factor. In-circuit, this would multiply the cost by the batch size. **Decision: defer to §1.13** (recursive proof wrapper).
+5. **Reject/resqueeze semantics**: The verifier rejects `x_i == 0` or `x_i == 1` (verifier.rs:134–140). Even though this is negligible in probability, exact equivalence requires reproducing the retry loop, not just constraining `x_i != 0,1`.
+
+6. **Batch verification**: `AccumulatorStrategyIPA` scales each MSM by a random factor. In-circuit, this would multiply the cost by the batch size. **Decision: defer to §1.13** (recursive proof wrapper).
 
 ---
 
@@ -405,6 +437,12 @@ At k=6 (n=64): ~55k rows (prototype-friendly).
 | `aetheris-recursive/src/non_native_fq.rs` | Fq element representation + arithmetic (add, mul, invert) |
 | `aetheris-recursive/src/non_native_mul.rs` | Fq × PallasPoint scalar multiplication gadget |
 | `aetheris-recursive/src/ipa_fold.rs` | IPA recursive halving circuit (fold G+b) |
+| `aetheris-recursive/src/ipa_transcript.rs` | Exact Halo2 transcript byte semantics and later in-circuit transcript gadgets |
+| `aetheris-recursive/src/transcript_bytes.rs` | Circuit-native byte assignment and 8-bit range checks for transcript gadgets |
+| `aetheris-recursive/src/transcript_blake2b.rs` | Blake2b IV, sigma schedule, and per-block metadata for exact transcript compression |
+| `aetheris-recursive/src/transcript_blake2b_circuit.rs` | Circuit-visible Blake2b state/block shell that will host the exact round constraints |
+| `aetheris-recursive/src/transcript_blake2b_compression.rs` | Host/reference Blake2b compression trace shape for later in-circuit round constraints |
+| `aetheris-recursive/src/transcript_words.rs` | 64-bit Blake2b message-word decoding and assignment over transcript blocks |
 | `aetheris-recursive/src/ipa_verifier_circuit.rs` | Top-level `IpaVerifierCircuit` + tests |
 | `aetheris-recursive/src/lib.rs` | Add `pub mod` for new modules |
 
@@ -417,9 +455,10 @@ At k=6 (n=64): ~55k rows (prototype-friendly).
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
 | Non-native Fq mul too expensive | Medium | High | Use 2 limbs (128-bit) instead of 3; use off-chip reduction hints |
+| Legacy EccChip not recursive-safe | High | High | Insert explicit ECC hardening phase before `IpaFoldingChip`; do not build recursive verifier on witness-branching affine helpers |
 | Circuit doesn't fit in k=11 proving key (2048 rows) | High | High | Multiple proof segments; use k=13 (8192 rows) for single proof |
-| Poseidon Fiat-Shamir incompatible with verifier's blake3 transcript | Medium | Medium | Use same domain separators; verify against real transcript bytes |
-| Challenge-witness hybrid weakens soundness | Low | Medium | Full in-circuit Fiat-Shamir in §1.13 wrap |
+| Exact Blake2b transcript gadget cost is higher than original estimate | High | High | Split transcript work into `§1.12d1`..`§1.12d5`; pin host/reference semantics first |
+| `Challenge255` byte-to-field derivation is mis-modeled | High | High | Reuse exact Halo2 semantics as oracle and test against them before circuit integration |
 
 ---
 
