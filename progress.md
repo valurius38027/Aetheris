@@ -2663,8 +2663,172 @@ The final multi-agent review approved the multiplication gadget after carry rang
 
 - §1.12b: `NonNativeFqScalarMul` — windowed scalar multiplication using non-native Fq scalar.
 - §1.12c: `IpaFoldingChip` — fold G and b vectors across IPA rounds.
-- §1.12d: Poseidon transcript + `IpaVerifierCircuit` integration.
+- §1.12d: exact Halo2 Blake2b transcript equivalence + `IpaVerifierCircuit` integration.
 - §1.12e: optimization and real proof verification benchmark.
 
 **Phase 1.12a scope**: bounded to `aetheris-recursive` non-native Fq arithmetic + design/prototype docs. No node, FFI, wallet, or ZKP verifier behavior changed.
 
+---
+
+## Stage 35 — §1.12b.5 Recursive-Safe ECC Hardening + §1.12c IPA Folding (2026-06-07)
+
+**Scope**: Finish the recursive-safe ECC hardening required between non-native scalar multiplication and IPA folding, then complete the minimal in-circuit IPA fold path with sound identity / exceptional-case handling.
+
+#### Changes Made:
+- `aetheris-recursive/src/lib.rs`: added constrained native field helpers (`is_zero_limb`, `eq_limb`, `select_limb_bit`, `select_projective_bit`), canonical projective identity handling, `projective_double`, `projective_mixed_add`, `projective_to_affine`, and affine-entry on-curve enforcement for all live ECC helper paths.
+- `aetheris-recursive/src/lib.rs`: rewrote legacy affine `add`, `double`, and native `scalar_mul` to use the hardened projective/selector path instead of witness-driven host branching.
+- `aetheris-recursive/src/lib.rs`: removed the stale raw `select` helper after migrating live paths to constrained `select_bit`.
+- `aetheris-recursive/src/non_native_mul.rs`: completed recursive-safe variable-base Pallas point by non-native Fq scalar multiplication with constrained bit-driven window selection, same-point / inverse-point / identity exceptional handling, and on-curve checks on all live affine entry/result points.
+- `aetheris-recursive/src/ipa_fold.rs`: completed minimal `IpaFoldingChip` for `b`-vector generation and generator folding across IPA rounds, with recursive-safe exceptional-case routing and on-curve checks for folded generators.
+- `aetheris-recursive/src/diagnostics.rs`: added macro-gated recursive diagnostics (`AETHERIS_DBG=1`) to support targeted debugging during hardening.
+- `aetheris-recursive/docs/in_circuit_ipa_verifier.md`: plan already updated during implementation to insert explicit `§1.12b.5 Recursive-safe ECC Hardening` before transcript/integration.
+
+#### Issues Resolved:
+- Recursive zero-testing soundness hole: `is_zero_limb` now constrains the zero-product witness instead of discarding it.
+- Projective normalization soundness hole: `projective_to_affine` no longer host-branches and now enforces canonical infinity `(0:1:0)` on the `z = 0` branch.
+- Identity metadata drift: affine/projective conversions, selector outputs, native scalar mul, non-native scalar mul, and IPA folding now preserve constrained identity semantics instead of relying on ghost host flags.
+- Incomplete mixed-add live-path hazards: same-point, inverse-point, and identity exceptional cases are now selector-routed before committing results in native scalar mul, non-native scalar mul, and IPA folding.
+- Off-curve witness admission on recursive live paths: non-identity affine points are now checked on-curve before entering ECC formulas in both recursive and legacy/native helper paths.
+- Unconstrained fixed-base/native scalar selection paths: native `scalar_mul` now uses assigned constrained bits, and `fixed_base_scalar_mul` delegates through the hardened scalar-mul path rather than free window witnesses.
+
+#### Verification:
+- `cargo check --workspace`: ✅ passed with 0 errors and 0 warnings
+- `cargo test --workspace --lib --exclude aetheris-ffi`: ✅ passed
+- `cargo test -p aetheris-ffi --lib -- --test-threads=1`: ✅ passed
+- Final multi-agent review on the merged recursive ECC changes: ✅ approved / ⚠️ only resolved helper-level follow-up during final cleanup
+
+#### Next:
+- `§1.12d1`: byte transcript plumbing + exact host/reference Halo2 transcript semantics
+- `§1.12d2+`: in-circuit Blake2b / `Challenge255` transcript equivalence and verifier integration
+- `§1.12e`: optimization and real proof / benchmark pass
+
+---
+
+## Stage 36 — §1.12d1 Exact Halo2 Transcript Plumbing (2026-06-07)
+
+**Scope**: Start the exact-transcript branch of `§1.12d` by retiring the old Poseidon transcript plan at the design level and introducing a dedicated transcript module for byte-accurate Halo2 Blake2b semantics. This stage does not yet implement the in-circuit Blake2b gadget; it establishes the exact reference contract that later circuit phases must satisfy.
+
+#### Changes Made:
+- `aetheris-recursive/docs/in_circuit_ipa_verifier.md`: rewrote `§1.12d` from "Poseidon transcript + integration" to exact Halo2 Blake2b / `Challenge255` transcript equivalence, with explicit `§1.12d1`..`§1.12d5` sub-phases.
+- `aetheris-recursive/src/ipa_transcript.rs`: new transcript module containing exact host/reference Blake2b transcript scaffolding, exact prefix constants, byte-accurate `common_point` / `common_scalar`, 64-byte challenge squeezing, and protocol-level reject/resqueeze helper logic.
+- `aetheris-recursive/src/transcript_bytes.rs`: new circuit-side byte assignment layer with 8-bit range checks, preparing `§1.12d2` Blake2b/state gadget work.
+- `aetheris-recursive/src/transcript_words.rs`: new 64-bit Blake2b message-word layer decoding assigned transcript blocks into native `u64`-sized field words for later compression constraints.
+- `aetheris-recursive/src/transcript_blake2b.rs`: new Blake2b constant/schedule/block-metadata layer pinning IV, sigma rows, block offsets, and final-block flags for later exact compression constraints.
+- `aetheris-recursive/src/transcript_blake2b_compression.rs`: new host/reference Blake2b compression-trace skeleton fixing the per-block state-transition interface that later in-circuit constraints must implement exactly.
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: new circuit-side Blake2b compression shell assigning transcript word streams plus per-block `state_in/state_out` rows, preparing exact round constraints.
+- `aetheris-recursive/src/lib.rs`: exported `pub mod ipa_transcript;`.
+- `aetheris-recursive/Cargo.toml`: added `blake2b_simd` dependency for exact transcript reference behavior.
+
+#### Issues Resolved:
+- Removed the remaining design ambiguity that suggested Poseidon or witnessed-challenge shortcuts were acceptable for trustless recursive IPA verification.
+- Separated exact transcript work from the older bounded verifier prototype so later stages do not keep accreting incompatible semantics into `ipa_verifier_circuit.rs`.
+
+#### Verification:
+- Pending in this stage after code integration.
+
+#### Next:
+- `§1.12d2`: build the in-circuit byte/state plumbing and Blake2b state gadget on top of the pinned `ipa_transcript.rs` semantics.
+
+---
+
+## Stage 37 — §1.12d2 Blake2b Input/Initialization Binding Hardening (2026-06-07)
+
+**Scope**: Close the first real `§1.12d2` soundness gaps between transcript byte witnesses, Blake2b message-word witnesses, and the exact round-0 Blake2b initialization lanes.
+
+#### Changes Made:
+- `aetheris-recursive/src/transcript_words.rs`: upgraded word decoding from host-side `Value` reconstruction to actual in-circuit byte-cell binding.
+  - `TranscriptWordConfig` now uses 8 per-word byte advice columns instead of a single accumulator witness column.
+  - `transcript_word_decode` now reconstructs each 64-bit little-endian word from copied byte advice cells in-gate.
+  - `constrain_word_from_bytes(...)` now copies each assigned transcript byte into the decode region and equality-binds it back to the original byte witness cell before applying the decode gate.
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: bound transcript words to compression words block-by-block and word-by-word.
+  - added `message` advice columns to the compression/state row shape.
+  - `assign_state_row(...)` now assigns each block's 16 Blake2b message words as explicit circuit cells.
+  - `constrain_message_words(...)` now equality-binds transcript word cells to compression block-word cells and asserts matching block/word counts.
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: fully constrained the exact Blake2b round-0 initialization vector shape.
+  - `constrain_initial_round_state(...)` binds `work_in[0..7]` to the block `state_in` cells.
+  - new fixed-column metadata gate binds `work_in[8..15]` for round 0 to exact Blake2b initialization semantics:
+    - `work_in[8..11] = BLAKE2B_IV[0..3]`
+    - `work_in[12] = BLAKE2B_IV[4] ^ offset_lo`
+    - `work_in[13] = BLAKE2B_IV[5] ^ offset_hi`
+    - `work_in[14] = BLAKE2B_IV[6]` or `!BLAKE2B_IV[6]` on the final block
+    - `work_in[15] = BLAKE2B_IV[7]`
+  - `constrain_initial_round_metadata(...)` copies the real first-round `work_in[8..=15]` cells into the metadata-check region and equality-binds them before applying the gate.
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: added negative tests proving rejection on transcript/compression block-word mismatch, round-0 state-copy mismatch, and round-0 metadata-lane mismatch.
+
+#### Issues Resolved:
+- `§1.12d2`: transcript byte witness and transcript word witness are now actually bound in-circuit instead of only by host-side reconstruction assumptions. ✅
+- `§1.12d2`: compression message words are now bound to the transcript word stream instead of living as a parallel unconstrained witness world. ✅
+- `§1.12d2`: Blake2b round-0 initialization now enforces exact `offset` / `final-block` metadata semantics for lanes `12/13/14`. ✅
+
+#### Review / Iteration:
+- First 2-agent review returned `❌ ISSUES` on two real gaps:
+  - byte→word binding still relied on host `Value`s
+  - round-0 metadata lanes were not bound to the real first-round cells
+- Follow-up patch fixed both issues.
+- Second 2-agent review returned:
+  - Reviewer A: `✅ APPROVED`
+  - Reviewer B: `✅ APPROVED`
+
+#### Verification:
+- Targeted:
+  - `cargo test -p aetheris-recursive --lib transcript_word`: ✅ `3 passed`
+  - `cargo test -p aetheris-recursive --lib transcript_blake2b_circuit`: ✅ `4 passed`
+- Full required pass:
+  - `cargo check --workspace`: ✅ clean, 0 errors, 0 warnings
+  - `cargo test --workspace --lib --exclude aetheris-ffi`: ✅ passed
+  - `cargo test -p aetheris-ffi --lib -- --test-threads=1`: ✅ `3 passed`
+
+#### Remaining for `§1.12d2`:
+- The Blake2b 12-round mixing function is still not constrained in-circuit.
+- Final feed-forward `state_out[i] = state_in[i] ^ v[i] ^ v[i+8]` is still host/reference only.
+- `Challenge255` / reject-resqueeze / top-level verifier integration remain future `§1.12d3`..`§1.12d5` work.
+
+---
+
+## Stage 38 — §1.12c Native Wrapping Addition for Blake2b G-function (2026-06-08)
+
+**Scope**: Add native in-circuit wrapping addition (mod 2^64) for the Blake2b G-function, constraining the `+` steps (0 and 2 in round 0 mix 0) via bit-decomposed full-adder carry chain.
+
+#### Changes Made:
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: added `add_words`, `add_bits`, `s_add_bit`, `s_add_pack` columns and selectors to `Blake2bCompressionCircuitConfig`
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: added two new gates:
+  - `blake2b_wrapping_add_bit` — per-bit boolean range checks on all 5 columns (in_bit, addend_bit, msg_bit, out_bit, carry) + full-adder equation `a+b+m+carry_in - out - 2*carry_out = 0`
+  - `blake2b_wrapping_add_pack` — packs 64 per-bit values back into native words via rotation(bit_idx) + constrains final carry ∈ {0,1,2}
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs`: added `constrain_mix_step_wrapping_add_native` that:
+  - copies `in_word`, `addend_word`, `out_word` from assigned trace cells via `constrain_equal`
+  - unrolls a 64-row bit decomposition with carry chain (stores `carry_in` at each row, then computes `carry_out = sum >> 1`)
+  - enables `s_add_bit` on rows 0..63 and `s_add_pack` on row 0
+
+#### Bugs Fixed During Implementation:
+- **Off-by-one carry assignment**: was assigning `carry_out` (post-update) to column `add_bits[4]`, but gate expects `carry_in` (pre-update). Fixed to assign `carry_in` before updating.
+- **Carry range check too narrow**: boolean `carry*(carry-1)=0` allowed only {0,1}. With 3-operand addition (in+addend+msg_word), carry can reach 2. Relaxed to `carry*(carry-1)*(carry-2)=0` allowing {0,1,2}.
+- **WrappingAddCircuit test data bug**: `corrupt_message`/`input`/`addend` were computing output with corrupted values. Fixed to compute output with original values so the constraint detects the mismatch.
+
+#### Tests Added:
+- `blake2b_circuit_wrapping_add_accepts_valid` — valid trace passes `assert_satisfied()`
+- `blake2b_circuit_wrapping_add_rejects_wrong_output` — corrupted output → verifier rejects
+- `blake2b_circuit_wrapping_add_rejects_wrong_input` — corrupted input → verifier rejects
+- `blake2b_circuit_wrapping_add_rejects_wrong_addend` — corrupted addend → verifier rejects
+- `blake2b_circuit_wrapping_add_rejects_wrong_message` — corrupted msg_word → verifier rejects
+- `blake2b_circuit_wrapping_add_carry_two` — all-ones operands force carry=2 at bit 1+, tests both accept and reject paths for carry=2 regime
+
+#### Review / Iteration:
+- Initial 2-agent review returned:
+  - Reviewer A: ✅ APPROVED
+  - Reviewer B: ✅ APPROVED with ⚠️ WARNING (missing carry=2 rejection test)
+- Added carry=2 rejection test + re-review:
+  - Reviewer A: ✅ APPROVED (no blocking issues)
+  - Reviewer B: ✅ APPROVED (no regressions, selector conflicts, full workspace clean)
+
+#### Verification:
+- Targeted:
+  - `cargo test -p aetheris-recursive --lib transcript_blake2b_circuit`: ✅ **33/33 passed**
+- Full required pass:
+  - `cargo check --workspace`: ✅ clean, 0 errors, 0 warnings
+  - `cargo test --workspace --lib --exclude aetheris-ffi`: ✅ 141 recursive + 21 crypto + all other crates pass
+  - `cargo test -p aetheris-ffi --lib -- --test-threads=1`: ✅ 3/3 passed
+
+#### Remaining:
+- Steps 4 and 6 (second half of mixes) are still not constrained — they use the same wrapping_add logic but are in later mixes.
+- The Blake2b 12-round mixing function XOR/rotation/add completes the G-function; feed-forward remains host-expected.
+- Integration with the full verifier transcript (resqueeze, Challenge255) remains deferred.

@@ -50,6 +50,10 @@ pub struct Blake2bCompressionCircuitConfig {
     pub s_feed_forward_pack: Selector,
     pub s_rotation_bit: Selector,
     pub s_rotation_pack: Selector,
+    pub add_words: [Column<Advice>; 3],
+    pub add_bits: [Column<Advice>; 5],
+    pub s_add_bit: Selector,
+    pub s_add_pack: Selector,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +122,10 @@ impl Blake2bCompressionCircuitChip {
         let s_feed_forward_pack = meta.selector();
         let s_rotation_bit = meta.selector();
         let s_rotation_pack = meta.selector();
+        let add_words = [0; 3].map(|_| meta.advice_column());
+        let add_bits = [0; 5].map(|_| meta.advice_column());
+        let s_add_bit = meta.selector();
+        let s_add_pack = meta.selector();
         state.iter().for_each(|col| meta.enable_equality(*col));
         message.iter().for_each(|col| meta.enable_equality(*col));
         round_message_pair
@@ -139,6 +147,12 @@ impl Blake2bCompressionCircuitChip {
             .iter()
             .for_each(|col| meta.enable_equality(*col));
         rotation_bits
+            .iter()
+            .for_each(|col| meta.enable_equality(*col));
+        add_words
+            .iter()
+            .for_each(|col| meta.enable_equality(*col));
+        add_bits
             .iter()
             .for_each(|col| meta.enable_equality(*col));
         meta.enable_equality(round_lane);
@@ -277,6 +291,50 @@ impl Blake2bCompressionCircuitChip {
             constraints
         });
 
+        meta.create_gate("blake2b_wrapping_add_bit", |meta| {
+            let s = meta.query_selector(s_add_bit);
+            let a_bit = meta.query_advice(add_bits[0], Rotation::cur());
+            let b_bit = meta.query_advice(add_bits[1], Rotation::cur());
+            let m_bit = meta.query_advice(add_bits[2], Rotation::cur());
+            let o_bit = meta.query_advice(add_bits[3], Rotation::cur());
+            let carry = meta.query_advice(add_bits[4], Rotation::cur());
+            let carry_next = meta.query_advice(add_bits[4], Rotation::next());
+            let one = Expression::Constant(Fp::ONE);
+            let two = Expression::Constant(Fp::from(2));
+            vec![
+                s.clone() * a_bit.clone() * (a_bit.clone() - one.clone()),
+                s.clone() * b_bit.clone() * (b_bit.clone() - one.clone()),
+                s.clone() * m_bit.clone() * (m_bit.clone() - one.clone()),
+                s.clone() * o_bit.clone() * (o_bit.clone() - one.clone()),
+                s.clone() * carry.clone() * (carry.clone() - one.clone()) * (carry.clone() - two.clone()),
+                s * (a_bit + b_bit + m_bit + carry - o_bit - two.clone() * carry_next),
+            ]
+        });
+
+        meta.create_gate("blake2b_wrapping_add_pack", |meta| {
+            let s = meta.query_selector(s_add_pack);
+            let mut constraints = Vec::with_capacity(4);
+            let word_cols = [0usize, 1, 2];
+            let bit_cols = [0usize, 1, 3];
+            for pair_idx in 0..3 {
+                let mut packed = Expression::Constant(Fp::ZERO);
+                for bit_idx in 0..64 {
+                    let bit = meta.query_advice(
+                        add_bits[bit_cols[pair_idx]],
+                        Rotation(bit_idx as i32),
+                    );
+                    packed = packed + bit * Expression::Constant(Fp::from(1u64 << bit_idx));
+                }
+                let word = meta.query_advice(add_words[word_cols[pair_idx]], Rotation::cur());
+                constraints.push(s.clone() * (word - packed));
+            }
+            let carry64 = meta.query_advice(add_bits[4], Rotation(64));
+            let one = Expression::Constant(Fp::ONE);
+            let two = Expression::Constant(Fp::from(2));
+            constraints.push(s * carry64.clone() * (carry64.clone() - one) * (carry64 - two));
+            constraints
+        });
+
         Blake2bCompressionCircuitConfig {
             state,
             message,
@@ -300,6 +358,10 @@ impl Blake2bCompressionCircuitChip {
             s_feed_forward_pack,
             s_rotation_bit,
             s_rotation_pack,
+            add_words,
+            add_bits,
+            s_add_bit,
+            s_add_pack,
         }
     }
 
@@ -1075,6 +1137,107 @@ impl Blake2bCompressionCircuitChip {
                     let xor_bit_idx = (out_bit_idx + rotation) % 64;
                     region.constrain_equal(out_cell, xor_cells[xor_bit_idx])?;
                 }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn constrain_mix_step_wrapping_add_native(
+        &self,
+        mut layouter: impl Layouter<Fp>,
+        step_row: &AssignedBlake2bMixStepRow,
+        step: &Blake2bMixStepTrace,
+        mix_index: usize,
+    ) -> Result<(), ErrorFront> {
+        let lane_idx = step.updated_lane;
+        let Some(addend_lane_idx) = step.addend_lane else {
+            return Ok(());
+        };
+        let message_word_value = step.message_word_value.unwrap_or(0);
+        let in_word = step.work_in[lane_idx];
+        let addend_word = step.work_in[addend_lane_idx];
+        let out_word = step.work_out[lane_idx];
+
+        layouter.assign_region(
+            || {
+                format!(
+                    "wrapping_add_mix_{}_step_{}_lane_{}",
+                    mix_index, step.step_index, lane_idx
+                )
+            },
+            |mut region| {
+                self.compression.s_add_pack.enable(&mut region, 0)?;
+                self.compression.s_add_bit.enable(&mut region, 0)?;
+
+                let words = [in_word, addend_word, out_word];
+                let source_cells = [
+                    step_row.work_in[lane_idx]
+                        .cell
+                        .expect("add input lane must be assigned"),
+                    step_row.work_in[addend_lane_idx]
+                        .cell
+                        .expect("add addend lane must be assigned"),
+                    step_row.work_out[lane_idx]
+                        .cell
+                        .expect("add output lane must be assigned"),
+                ];
+
+                for (col_idx, word) in words.iter().copied().enumerate() {
+                    let assigned = region.assign_advice(
+                        || {
+                            format!(
+                                "add_word_{}_{}_{}_{}",
+                                mix_index, step.step_index, lane_idx, col_idx
+                            )
+                        },
+                        self.compression.add_words[col_idx],
+                        0,
+                        || Value::known(Fp::from(word)),
+                    )?;
+                    region.constrain_equal(source_cells[col_idx], assigned.cell())?;
+                }
+
+                let mut carry_in: u64 = 0;
+                for bit_idx in 0..64 {
+                    if bit_idx > 0 {
+                        self.compression.s_add_bit.enable(&mut region, bit_idx)?;
+                    }
+                    let a_bit = (in_word >> bit_idx) & 1;
+                    let b_bit = (addend_word >> bit_idx) & 1;
+                    let m_bit = (message_word_value >> bit_idx) & 1;
+                    let sum = a_bit + b_bit + m_bit + carry_in;
+                    let o_bit = sum & 1;
+                    let carry_out = sum >> 1;
+                    let bits = [a_bit, b_bit, m_bit, o_bit, carry_in];
+                    for (col_idx, bit) in bits.iter().copied().enumerate() {
+                        region.assign_advice(
+                            || {
+                                format!(
+                                    "add_bit_{}_{}_{}_{}_{}",
+                                    mix_index, step.step_index, lane_idx, col_idx, bit_idx
+                                )
+                            },
+                            self.compression.add_bits[col_idx],
+                            bit_idx,
+                            || Value::known(Fp::from(bit)),
+                        )?;
+                    }
+                    carry_in = carry_out;
+                }
+
+                region.assign_advice(
+                    || {
+                        format!(
+                            "add_carry_final_{}_{}_{}",
+                            mix_index, step.step_index, lane_idx
+                        )
+                    },
+                    self.compression.add_bits[4],
+                    64,
+                    || Value::known(Fp::from(carry_in)),
+                )?;
+
                 Ok(())
             },
         )?;
@@ -1947,6 +2110,21 @@ mod tests {
                                         )?;
                                     }
                                 }
+                                if step.addend_lane.is_some() && round.round_index == 0 && mix.mix_index == 0 {
+                                    chip.constrain_mix_step_wrapping_add_native(
+                                        layouter.namespace(|| {
+                                            format!(
+                                                "mix_step_wrapping_add_native_{}_{}_{}",
+                                                round.round_index,
+                                                mix.mix_index,
+                                                step.step_index
+                                            )
+                                        }),
+                                        assigned_step,
+                                        step,
+                                        mix.mix_index,
+                                    )?;
+                                }
                             }
                             if round.round_index == 0 && mix.mix_index == 0 {
                                 chip.constrain_mix_step_delta(
@@ -2180,6 +2358,316 @@ mod tests {
             )?;
             chip.constrain_mix_step_rotation_xor_native(
                 layouter.namespace(|| "rotation_xor_native"),
+                &assigned_step,
+                &step,
+                0,
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct WrappingAddCircuit {
+        corrupt_output: bool,
+        corrupt_input: bool,
+        corrupt_addend: bool,
+        corrupt_message: bool,
+    }
+
+    impl Circuit<Fp> for WrappingAddCircuit {
+        type Config = Blake2bCircuitTestConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                corrupt_output: self.corrupt_output,
+                corrupt_input: self.corrupt_input,
+                corrupt_addend: self.corrupt_addend,
+                corrupt_message: self.corrupt_message,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+            Blake2bCircuitTestConfig {
+                fq: NonNativeFqChip::configure(meta),
+                words: TranscriptWordChip::configure(meta),
+                compression: Blake2bCompressionCircuitChip::configure(meta),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fp>,
+        ) -> Result<(), ErrorFront> {
+            let chip =
+                Blake2bCompressionCircuitChip::new(config.compression, config.words, config.fq);
+            let updated_lane = 0usize;
+            let addend_lane = 4usize;
+            let input_val = 0xFFFF_FFFF_FFFF_FFFEu64;
+            let addend_val = 0x0000_0000_0000_0003u64;
+            let msg_val = 0x0000_0000_0000_0001u64;
+            let mut work_in = [0u64; BLAKE2B_WORK_WORDS];
+            let mut work_out = work_in;
+            work_in[updated_lane] = input_val;
+            work_in[addend_lane] = addend_val;
+
+            let msg = if self.corrupt_message {
+                msg_val.wrapping_add(1)
+            } else {
+                msg_val
+            };
+            let (in_v, addend_v, out_v) = if self.corrupt_output {
+                (input_val, addend_val, input_val.wrapping_add(addend_val).wrapping_add(msg).wrapping_add(1))
+            } else if self.corrupt_input {
+                (input_val.wrapping_add(1), addend_val, input_val.wrapping_add(addend_val).wrapping_add(msg_val))
+            } else if self.corrupt_addend {
+                (input_val, addend_val.wrapping_add(1), input_val.wrapping_add(addend_val).wrapping_add(msg_val))
+            } else if self.corrupt_message {
+                (input_val, addend_val, input_val.wrapping_add(addend_val).wrapping_add(msg_val))
+            } else {
+                (input_val, addend_val, input_val.wrapping_add(addend_val).wrapping_add(msg))
+            };
+            work_out[updated_lane] = out_v;
+            work_in[updated_lane] = in_v;
+            work_in[addend_lane] = addend_v;
+
+            let step = Blake2bMixStepTrace {
+                step_index: 0,
+                updated_lane,
+                source_lane: None,
+                addend_lane: Some(addend_lane),
+                message_word_value: Some(msg),
+                rotation: None,
+                work_in,
+                work_out,
+            };
+            let assigned_step = chip.assign_mix_step_row(
+                layouter.namespace(|| "wrapping_add_step"),
+                &step,
+                "wrapping_add_step",
+            )?;
+            chip.constrain_mix_step_wrapping_add_native(
+                layouter.namespace(|| "wrapping_add_native"),
+                &assigned_step,
+                &step,
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_accepts_valid() {
+        let circuit = WrappingAddCircuit {
+            corrupt_output: false,
+            corrupt_input: false,
+            corrupt_addend: false,
+            corrupt_message: false,
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_rejects_wrong_output() {
+        let circuit = WrappingAddCircuit {
+            corrupt_output: true,
+            corrupt_input: false,
+            corrupt_addend: false,
+            corrupt_message: false,
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add must reject a wrong output word"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_rejects_wrong_input() {
+        let circuit = WrappingAddCircuit {
+            corrupt_output: false,
+            corrupt_input: true,
+            corrupt_addend: false,
+            corrupt_message: false,
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add must reject a wrong input word"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_rejects_wrong_addend() {
+        let circuit = WrappingAddCircuit {
+            corrupt_output: false,
+            corrupt_input: false,
+            corrupt_addend: true,
+            corrupt_message: false,
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add must reject a wrong addend word"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_rejects_wrong_message() {
+        let circuit = WrappingAddCircuit {
+            corrupt_output: false,
+            corrupt_input: false,
+            corrupt_addend: false,
+            corrupt_message: true,
+        };
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add must reject a wrong message word"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_wrapping_add_carry_two() {
+        #[derive(Default)]
+        struct CarryTwoCircuit;
+
+        impl Circuit<Fp> for CarryTwoCircuit {
+            type Config = Blake2bCircuitTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                Self
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+                Blake2bCircuitTestConfig {
+                    fq: NonNativeFqChip::configure(meta),
+                    words: TranscriptWordChip::configure(meta),
+                    compression: Blake2bCompressionCircuitChip::configure(meta),
+                }
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fp>,
+            ) -> Result<(), ErrorFront> {
+                // Three all-ones operands force carry=2 at bit 1+:
+                //   bit 0: 1+1+1+0=3 → o=1, carry=1
+                //   bit 1: 1+1+1+1=4 → o=0, carry=2
+                //   bit 2+: 1+1+1+2=5 → o=1, carry=2 (final carry=2)
+                let input_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+                let addend_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+                let msg_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+                let out_val = input_val.wrapping_add(addend_val).wrapping_add(msg_val);
+
+                let chip = Blake2bCompressionCircuitChip::new(
+                    config.compression,
+                    config.words,
+                    config.fq,
+                );
+                let mut work_in = [0u64; BLAKE2B_WORK_WORDS];
+                let mut work_out = work_in;
+                work_in[0] = input_val;
+                work_in[4] = addend_val;
+                work_out[0] = out_val;
+
+                let step = Blake2bMixStepTrace {
+                    step_index: 0,
+                    updated_lane: 0,
+                    source_lane: None,
+                    addend_lane: Some(4),
+                    message_word_value: Some(msg_val),
+                    rotation: None,
+                    work_in,
+                    work_out,
+                };
+                let assigned_step = chip.assign_mix_step_row(
+                    layouter.namespace(|| "carry_two_step"),
+                    &step,
+                    "carry_two_step",
+                )?;
+                chip.constrain_mix_step_wrapping_add_native(
+                    layouter.namespace(|| "carry_two_native"),
+                    &assigned_step,
+                    &step,
+                    0,
+                )
+            }
+        }
+
+        let circuit = CarryTwoCircuit;
+        let prover = MockProver::run(10, &circuit, vec![]).expect("mock prover should run");
+        prover.assert_satisfied();
+
+        // Also verify the constraint rejects a wrong output in carry=2 regime
+        let reject = CarryTwoCircuitReject;
+        let prover = MockProver::run(10, &reject, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add must reject wrong output with carry=2"
+        );
+    }
+
+    #[derive(Default)]
+    struct CarryTwoCircuitReject;
+
+    impl Circuit<Fp> for CarryTwoCircuitReject {
+        type Config = Blake2bCircuitTestConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+            Blake2bCircuitTestConfig {
+                fq: NonNativeFqChip::configure(meta),
+                words: TranscriptWordChip::configure(meta),
+                compression: Blake2bCompressionCircuitChip::configure(meta),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fp>,
+        ) -> Result<(), ErrorFront> {
+            let input_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+            let addend_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+            let msg_val = 0xFFFF_FFFF_FFFF_FFFFu64;
+            let correct_out = input_val.wrapping_add(addend_val).wrapping_add(msg_val);
+            let wrong_out = correct_out.wrapping_add(1);
+
+            let chip = Blake2bCompressionCircuitChip::new(
+                config.compression,
+                config.words,
+                config.fq,
+            );
+            let mut work_in = [0u64; BLAKE2B_WORK_WORDS];
+            let mut work_out = work_in;
+            work_in[0] = input_val;
+            work_in[4] = addend_val;
+            work_out[0] = wrong_out;
+
+            let step = Blake2bMixStepTrace {
+                step_index: 0,
+                updated_lane: 0,
+                source_lane: None,
+                addend_lane: Some(4),
+                message_word_value: Some(msg_val),
+                rotation: None,
+                work_in,
+                work_out,
+            };
+            let assigned_step = chip.assign_mix_step_row(
+                layouter.namespace(|| "carry_two_reject_step"),
+                &step,
+                "carry_two_reject_step",
+            )?;
+            chip.constrain_mix_step_wrapping_add_native(
+                layouter.namespace(|| "carry_two_reject_native"),
                 &assigned_step,
                 &step,
                 0,
