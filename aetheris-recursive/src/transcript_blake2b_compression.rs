@@ -194,7 +194,7 @@ fn initialize_work_vector(
     v
 }
 
-fn compress_block(
+pub(crate) fn compress_block(
     state: &[u64; BLAKE2B_STATE_WORDS],
     block: &Blake2bBlockTrace,
 ) -> ([u64; BLAKE2B_STATE_WORDS], Vec<Blake2bRoundTrace>) {

@@ -108,7 +108,11 @@ impl<C: CurveAffine> PartiallyEvaluated<C> {
             eprintln!("[VERIFIER] h_eval_from_transcript={:?}", h_eval_from_transcript);
         }
         let expected_fx_no_div = expr_vec.iter().fold(C::Scalar::ZERO, |h_eval, v| h_eval * *y + v);
-        let expected_h_eval = expected_fx_no_div * ((xn - C::Scalar::ONE).invert().unwrap());
+        let expected_h_eval = expected_fx_no_div
+            * ((xn - C::Scalar::ONE).invert().unwrap_or(C::Scalar::ZERO));
+        if xn == C::Scalar::ONE {
+            return Err(Error::ConstraintSystemFailure);
+        }
         if crate::diagnostics::dbg_enabled() {
             eprintln!("[VERIFIER-DETAIL] expected_h_eval={:?} expected_fx={:?}", expected_h_eval, expected_fx_no_div);
         }
