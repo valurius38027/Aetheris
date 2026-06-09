@@ -7,20 +7,87 @@
 > 1. Phase 0 不碰 ZK 电路代码（避免在 BN254 上修废弃代码）
 > 2. Phase 1 一次性完成 Pasta 迁移 + 所有 ZK 修复（不重复劳动）
 > 3. 不声称未实现的功能；每步有明确验证标准
+> 4. **P0 安全修复优先于任何架构升级**（终裁 §4）
 
 ---
 
 ## 总览
 
 ```
-Phase 0   Node 救命    ─→  链终于能跑（不碰 ZK）
-Phase 1   ZK 重写      ─→  Pasta + 真实 IPA + 所有电路修复（一次性）
-Phase 2   钱包+隐私    ─→  真正的隐私
-Phase 3   网络健壮     ─→  多节点
-Phase 4   生产就绪     ─→  文档/清理
+P0       协议安全    ─→  堵 soundness hole（当前执行）
+Phase 0  Node 救命   ─→  链终于能跑
+Phase 1  ZK 重写     ─→  Pasta + 真实 IPA + 所有电路修复（一次性）
+Phase 2  钱包+隐私   ─→  真正的隐私
+Phase 3  网络健壮    ─→  多节点
+Phase 4  生产就绪    ─→  文档/清理
 ```
 
-**MVP 门槛** = Phase 0 + Phase 1
+**当前阶段** = P0 协议安全修复
+**MVP 门槛** = P0 + Phase 0 + Phase 1
+
+---
+
+---
+
+## P0 — 协议安全修复（当前执行，所有 Phase 暂停）
+
+> 终裁 §4 定义 P0 为"不修则协议不安全"。以下 5 项必须在 Phase 1 继续前完成。
+> B-2（原生 IPA 积累电路）已完成作为架构前提，P0 修复与之正交。
+> 严格按 小→中→大 顺序执行，每项有独立测试验证。
+
+### P0.1 🔴 A-1: running_sum z_64 = 0 约束（小型）
+
+| 维度 | 值 |
+|------|-----|
+| **文件** | `aetheris-zkp/src/halo2_pasta.rs:198-269` |
+| **问题** | `ValueConservationCircuit` 的 64 位 range 分解未强制 `z_64 = 0`。证明者可编码任意大金额（`amount > 2^64`），完全破坏 range check。 |
+| **修复** | 在 range 循环后新增一行，用 `s_running_sum` 门约束 `z_64 = 0`。或在 `synthesize` 末尾添加新 gate `s_running_sum_final * z_prev = 0`。 |
+| **测试** | `test_range_rejects_overflow_amount` — 用 `amount = u64::MAX + 1` 验证 mock prover 拒绝。 |
+| **估算** | ~30 行，半天 |
+
+### P0.2 🟡 H-1: state_root 负测试（小型）
+
+| 维度 | 值 |
+|------|-----|
+| **文件** | `aetheris-node/src/state.rs:373-380` |
+| **问题** | 检查逻辑正确，但无负测试——没有测试验证**错误** state_root 会被拒绝。 |
+| **修复** | 在 `state.rs` 测试中新增 `test_state_root_mismatch_rejected`：手动篡改 `block.header.state_root` 后调用 `apply_block`，验证返回 `Err`。 |
+| **估算** | ~20 行，半天 |
+
+### P0.3 🟡 C-5: nullifier 双花端到端测试（小型）
+
+| 维度 | 值 |
+|------|-----|
+| **文件** | `aetheris-node/src/state.rs:364-371` |
+| **问题** | Nullifier 重复检查逻辑正确，但现有 `test_double_spend_rejected` 绕过 VDF/ZK 验证。 |
+| **修复** | 在 `test_double_spend_rejected` 中直接测试 nullifier 集合语义（跳过 VDF/ZK 预检），或构造两个具有相同 nullifier 的区块做端到端测试。 |
+| **估算** | ~30 行，半天 |
+
+### P0.4 🟠 A-3: 统一 viewing key 派生（中大型）
+
+| 维度 | 值 |
+|------|-----|
+| **文件** | `aetheris-ffi/src/lib.rs:1190-1193, 1475-1476, 2109-2110, 2185-2188` |
+| **问题** | 3 个子问题：(1) 目标查看密钥从**公开地址**派生（`lib.rs:2185-2188`），完全破坏隐私；(2) nullifier 索引使用 Keccak 而非 blake3（`lib.rs:1506-1510, 2124-2128`）；(3) 缺失 DH 共享密钥建立。 |
+| **修复** | **分 3 阶段**：(a) 引入 DH 共享密钥（Curve25519 或类似）用于目标查看密钥派生；(b) 用 blake3 + 域分离替换 Keccak；(c) 统一所有查看密钥派生路径，添加 HKDF 包装。 |
+| **测试** | `test_viewing_key_unified` — 同一助记词在所有路径产出相同 vk；`test_target_viewing_key_privacy` — 仅拥有地址的人不能派生目标 vk。 |
+| **估算** | ~200 行，2-3 天 |
+
+### P0.5 🔴 C-2: Input membership + nullifier 证明（大型）
+
+| 维度 | 值 |
+|------|-----|
+| **文件** | `aetheris-zkp/src/halo2_pasta.rs:147-318`（`ValueConservationCircuit`） |
+| **问题** | 电路中完全没有：(a) Merkle 路径验证（验证 input 存在于承诺树）；(b) Nullifier 派生约束（blake3(sk, record_id)）；(c) 花费密钥与 note 所有权的关联。 |
+| **修复** | 在 `Circuit<Fq>` 中新增：(a) Poseidon 或 Blake3 Merkle 路径验证门；(b) Nullifier 派生约束门；(c) 实例绑定到 public input。此电路运行在 **Pallas**（外电路），与 B-2 的 Vesta 递归电路正交。 |
+| **测试** | `test_membership_proof_rejects_fake_input`、`test_nullifier_correctness_mismatch_rejected` |
+| **估算** | ~500-1000 行，1-2 周 |
+
+> **P0 完成标准**: 以下全部通过 ——
+> - `cargo test -p aetheris-zkp` 新增测试全部通过（A-1 堵住 + C-2 电路约束活跃）
+> - `cargo test -p aetheris-node` 新增测试全部通过（C-5 双花拒绝 + H-1 state_root 拒绝）
+> - `cargo test -p aetheris-ffi -- --test-threads=1` 全部通过（A-3 统一 vk 派生）
+> - `cargo check --workspace` 零错误零警告
 
 ---
 
@@ -251,18 +318,19 @@ Phase 4   生产就绪     ─→  文档/清理
    - **ISSUE-1.3.B on-curve gate 曲率不匹配** — `EccConfig` 配置的 `on_curve_check` gate 硬编码 `y² = x³ + 3` (Grumpkin),但 `chip.generator()` 返回 Vesta 点 (Vesta 曲线 `y² = x³ + 5`)。任何对 Vesta real 点的 `assert_on_curve` 会触发 gate 失败。1.3 不动这个 (属于 1.4 Pasta 迁移范围),但 `test_ecc_identity_propagation` 已显式仅对 identity 调 `assert_on_curve`,对 Vesta real 点只检查 `is_identity` flag。
 - **当前 diff**: -802 net LoC in `aetheris-recursive/src/lib.rs` (2380→1578), +152 new `grain.rs`, +90 new test function. 范围 bounded 到 `aetheris-recursive/` only.
 
-### 1.4 实现真实 IPA 积累（递归层）
-- **来源**: B-2, A-11 ~ A-15（原是 1.3）
-- **前置**: 1.1（IPA 承诺方案）+ 1.3（清理后可用原生电路）
+### ⏳ 1.4 B-3: aggregate_proofs IPA 化（P1，P0 后执行）
+- **来源**: B-3，终裁 §4 P1
+- **当前**: `halo2_pasta.rs:460-495` 仍用 Merkle 哈希 + O(n) 逐 proof replay
+- **前置**: P0 全部完成
 - **动作**:
-   1. `AccumulatorIPA` struct: `Q: Ep`, `transcript: [u8; 32]`
-   2. `accumulate()` 函数: 验证单个 proof → Poseidon challenge → Q_new = Q + challenge · π_commitment
-   3. `CircuitAccumulate`: Halo2 电路验证累积关系（递归验证）
-   4. 适配 `ZkProverSystem::aggregate_proofs` 用 IPA accumulator 替代 Merkle 哈希
-- **验证**: 递归积累 3+ 层端到端测试
+   1. 用 `AccumulatorStrategyIPA`（已实现，`aetheris-zkp/src/ipa/strategy.rs:109-144`）批量验证所有 tx proof
+   2. 用 `aetheris-recursive/src/accumulator.rs::AccumulatorIPA` 作为状态累加器
+   3. 输出不再是 Merkle 根，而是 IPA 批量验证 accumulator 状态
+   4. `verify_aggregate` 从 O(n) 逐个 verify → O(1) accumulator MSM check
+- **验证**: `aggregate_proofs(10 txs)` 在常数时间验证，非 O(n)；端到端 3+ 层积累链通过
 
-### 1.5 集成 IPA 到区块生产
-- **来源**: B-3（原是 1.4）
+### ⏳ 1.5 集成 IPA 到区块生产（依赖 1.4）
+- **来源**: B-3
 - **前置**: 1.4
 - **动作**: 替换区块生产中的 Merkle 哈希 aggregate 为 IPA accumulator
 - **文件**: `aetheris-node/src/state.rs`、`aetheris-node/src/main.rs`
@@ -342,38 +410,26 @@ Phase 4   生产就绪     ─→  文档/清理
 - **未触及**: 递归 SNARK (仍 trusted)
 - **预估**: 400 行
 
-### 1.11.5 🔴 IPA-PLONK h_eval 约束修复（当前焦点，1-2 周）
+### 1.11.5 ✅ IPA-PLONK h_eval 约束修复（Stage 40，已完成）
 - **来源**: `ISSUE_IPA_PLONK_INTEGRATION.md`
-- **问题**: Prover 的 coset-FFT 路径和 verifier 的直接表达式求值产生不同的 `f(x)`。`expected_h_eval != transcript_h_eval` 约束检查被绕过 —— 所有 IPA 证明缺少完整 PLONK 验证。
-- **根因**: IFFT 在索引 ≥4094 处产生系统性 DC 伪影，h_poly 含虚假度数。extended_k=13 已保留为正确性改进但未解决 mismatch。
-- **动作**:
-  1. 修复 IFFT DC 伪影：调查 `extended_to_coeff` / `distribute_powers_zeta` 相位因子
-  2. 修复 `divide_by_vanishing_poly` 归一化误差（若存在）
-  3. 重新启用 h_eval 约束检查
-  4. 更新 `test_valid_proof_is_rejected_until_ipa_plonk_quotient_mismatch_is_fixed` 从 "expects failure" → "passes"
-- **文件**:
-  - `vendor/halo2/halo2_backend/src/plonk/vanishing/prover.rs` — h_poly 构造
-  - `vendor/halo2/halo2_backend/src/plonk/vanishing/verifier.rs` — h_eval 约束
-  - `vendor/halo2/halo2_backend/src/plonk/evaluation.rs` — coset 求值
-  - `vendor/halo2/halo2_backend/src/polynomial/domain.rs` — extended_k
-- **依赖**: 无（独立于 Phase 1.12）
-- **验证**: `cargo test -p aetheris-zkp` 中 h_eval 约束重新启用且通过
-- **推进条件**: §1.11.5 全部完成 → 恢复 §1.12d3
+- **诊断**: IFFT DC 伪影在索引 ≥4094 处，`extended_k=13` 解决了问题
+- **结果**: `expected_h_eval == transcript_h_eval` = true，约束在 `vanishing/verifier.rs:142-144` 活跃
+- **验证**: `cargo test -p aetheris-zkp` 69/69 ✅
+- **关闭**: `ISSUE_IPA_PLONK_INTEGRATION.md` 已过时，不再反映实际
 
-### 1.12 In-Circuit IPA Verifier Gadget (trustless blocker, 2-3 个月研发) 🔬 **研究级**
-- **⚠️ 暂停中**: §1.11.5 (IPA-PLONK h_eval 修复) 必须先完成。
-- **当前进度**: §1.12d1 (transcript plumbing) ✅, §1.12d2 (init binding) ✅, §1.12c (wrapping add) ✅
-- **待恢复**: §1.12d3 (Blake2b 12-round mixing), §1.12d4 (Challenge255), §1.12d5 (IpaVerifierCircuit)
-- **目标**: 实现 Pasta 标量域算术 in Pasta Fq 域电路;IPA verifier 可在电路内 verify 一个 IPA proof
-- **基础**: Pasta 2-cycle → `Fp` (Pallas base) = `Fq` (Vesta scalar) → **原生递归,无 NonNativeChip 开销**
-- **范围**:
-  - IPA verifier 电路: 接受 IPA proof bytes + claim (Pallas point), 产生 single bit (valid/invalid)
-  - Pasta scalar field chip: Fp operations in Fq circuit
-  - Multi-open / quotient polynomial verification
-  - Fiat-Shamir transcript verification (sha/poseidon)
-- **当前位置**: `aetheris-recursive/src/lib.rs` 有 `PoseidonChip` (line 150) + `EccChip` (line 378) + `GrainLFSR` (grain.rs);**缺 IPA verifier gadget** (`NonNativeChip` / `AccumulatorChip` / `KzgChip` 不存在或已删,见 `AGENTS.md` known-buggy 备注)
-- **预估**: 1000-2000 行 gadget + 大量测试;**2-3 个月** (需熟悉 halo2_proofs + Pasta 2-cycle)
-- **依赖**: halo2_proofs PSE fork (当前 vendor) + 可能的 pasta/zk-sdk 升级
+### 1.12 ✅ B-2: In-Circuit IPA Verifier Gadget（已完成，commit 59cd2c9）
+- **范围**: 原生 Vesta IPA accumulation circuit，完全在 `Circuit<Fq>` 上，消除 NonNativeChip
+- **子步骤**: S0-S11（详见 `aetheris-recursive/B-2_plan.md`）
+- **产出**:
+  - `vesta_ecc.rs` — 原生 Vesta EC ops（on_curve, add, double, select, scalar_mul, constrain_equal）
+  - `vesta_fq.rs` — 原生 Fq 算术（add, mul, invert 门）
+  - `vesta_range.rs` — 8-bit Fq 范围检查
+  - `vesta_transcript.rs` — Vesta Blake2b transcript chip（compress → squeeze → challenge）
+  - `vesta_ipa.rs` — IPA folding round（b-vector + offset 点展平）
+  - `vesta_accumulate.rs` — 完整 IPA verifier circuit（transcript + folding）
+- **验证**: `cargo test -p aetheris-recursive --lib` 155/155 ✅
+- **移除**: `ipa_fold.rs`, `ipa_verifier_circuit.rs`, `non_native_mul.rs`（被原生代码取代）
+- **保留**: `non_native_fq.rs`（转录 gadget 需要，Phase 6 替换）
 
 ### 1.13 Recursive Proof Wrapper (依赖 §1.12, ~1 周)
 - **目标**: Halo2 电路 wrapping 整个 accumulator chain → 输出 constant-size proof
@@ -477,43 +533,37 @@ Phase 4   生产就绪     ─→  文档/清理
 ## 依赖图
 
 ```
-Phase 0 (Node 救命，不碰 ZK 代码)
-  0.1 ────┐
-  0.2 ────┤
-  0.3 ────┤
-  0.4 ────┤ (0.5 依赖 0.4)
-  0.5 ◄──┤
-  0.6 ────┤
-  0.7 ────┤
-  0.8 ────┘
-          │  Phase 0 全部完成
-          ▼
-Phase 1 (一次性 ZK 重写)
-  1.0 ────┐  (ZK trait — 已完成)
-  1.1 ────┤  (IPA 承诺方案 — 新底层)
-   ├─1.1.0  (ParamsIPA + MSMIPA + GuardIPA)
-   ├─1.1.1  (CommitmentSchemeIPA + ProverIPA + VerifierIPA)
-   ├─1.1.2  (验证策略)
-   └─1.1.3  (集成 + 基本测试)
-   1.2 ────┤  (Pasta 电路 — 接线层，无新 trait)
-   ├─1.2.0  (halo2_pasta.rs 接线)
-   ├─1.2.1  (Halo2PastaBackend + 全套测试)
-   └─1.2.2  (lib.rs 导出 + ZKProofSystem 切换)
-  1.3 ────┤  (清理 aetheris-recursive)
-  1.4 ◄──┤  (IPA 递归积累 — 依赖 1.1 + 1.3)
-  1.5 ◄──┤  (集成 IPA 到区块 — 依赖 1.4 + 0.1-0.3)
-  1.6 ────┤  (VDF 真实实现)
-  1.7 ────┘  (恢复调用方)
-  1.8 ────┤  (Accumulator 集成测试)
-  1.9 ────┤  (P0 Conservation Soundness Fix)
-  1.10 ───┤  (Signed Accumulator)
-  1.11 ───┤  (P2P Proof Gossip)
-  1.11.5 ◄┤  (IPA-PLONK h_eval 修复 — 当前焦点)
-  1.12 ◄──┤  (In-Circuit IPA Verifier — 依赖 1.11.5)
-  1.13-1.16┤(Recursive Wrapper → Mainnet)
-           │  MVP ≈ Phase 0 + Phase 1.0-1.11 (trusted 模式)
-           │  Full Trustless ≈ Phase 0 + Phase 1.0-1.16 (§1.11.5 + §1.12 完成)
-           ▼
+P0 (协议安全 — 当前执行，所有 Phase 暂停)
+  P0.1 ──┐  A-1: running_sum z_64=0  (小)
+  P0.2 ──┤  H-1: state_root 负测试    (小)
+  P0.3 ──┤  C-5: nullifier 端到端测试 (小)
+  P0.4 ──┤  A-3: viewing key 统一     (中)
+  P0.5 ──┘  C-2: membership+nullifier (大)
+         │  P0 全部完成 → 恢复 Phase 1
+         ▼
+Phase 0-1 (Node + ZK — 大部分已完成，等待 P0)
+  0.1-0.8 ──── Phase 0 全部 ✅完成
+  1.0 ──────── ZK trait ✅
+  1.1 ──────── IPA 承诺方案 ✅
+    ├─1.1.0-1.1.3 (ParamsIPA, ProverIPA, VerifierIPA, 验证策略)
+  1.2 ──────── Pasta 电路 ✅ (Halo2PastaBackend)
+  1.3 ──────── 清理 aetheris-recursive ✅
+  1.6 ──────── VDF 真实实现 ✅
+  1.8 ──────── Accumulator 测试 ✅
+  1.9 ──────── Conservation soundness fix ✅ (但 A-1 z_64=0 仍需修复 = P0.1)
+  1.11.5 ───── IPA-PLONK h_eval ✅
+  1.12 ─────── B-2: In-Circuit IPA Verifier ✅
+         │  P0 完成后继续
+         ▼
+Phase 1 剩余 (P0 后执行)
+  1.4  B-3 ── aggregate_proofs IPA 化
+  1.5  ────── IPA 区块集成
+  1.7  ────── 恢复调用方
+  1.10 ────── Signed Accumulator
+  1.11 ────── P2P Proof Gossip
+  1.13-1.16 ─ Recursive Wrapper → Mainnet
+         │
+         ▼
 Phase 2 ──→ Phase 3 ──→ Phase 4
 ```
 
@@ -535,15 +585,32 @@ Phase 2 ──→ Phase 3 ──→ Phase 4
 ## 时间估算
 
 ```
-Week 1-2:   Phase 0        (Node 层修复，不碰 ZK)                                                     ✅已完
-Week 3-4:   Phase 1.0-1.1  (ZK trait + IPA 承诺方案底层 — 最大新代码量，从零实现 IPA)
-Week 5-6:   Phase 1.2      (Pasta 电路移植 + 全套测试)
-Week 7:     Phase 1.3-1.4  (清理 aetheris-recursive + IPA 递归积累)
-Week 8:     Phase 1.5-1.11 (集成区块/VDF/P2P/signed accumulator/恢复调用方)
-Week 9-10:  Phase 1.11.5   (🔴 IPA-PLONK h_eval 修复 — 当前焦点)
-Week 11+:   Phase 1.12+    (恢复 In-Circuit IPA Verifier — 2-3 个月研究级)
-Week 12+:   Phase 2+       (推迟至 Phase 1.12 完成后)
+已完成 (Prior):
+  Phase 0.0-0.8    Node 救命                                                 ✅
+  Phase 1.0-1.2    ZK trait + IPA 承诺方案 + Pasta 电路                      ✅
+  Phase 1.3        清理 aetheris-recursive                                   ✅
+  Phase 1.6        VDF 真实实现                                               ✅
+  Phase 1.8        Accumulator 集成测试                                       ✅
+  Phase 1.9        Conservation soundness fix (partial)                      ✅
+  Phase 1.11.5     IPA-PLONK h_eval 修复                                     ✅
+  Phase 1.12       B-2: In-Circuit IPA Verifier (Vesta native)               ✅
+  ─────────────────────────────────────────────────────────────────
 
-MVP (trusted mode) ≈ Phase 0 + Phase 1.0-1.11 ≈ 已到达（8 周）
-Full Trustless ≈ Phase 0 + Phase 1.0-1.16 ≈ 至少再加 3-4 个月
+P0 Sprint (当前):
+  P0.1  A-1 running_sum z_64=0     ~1 天    正在执行
+  P0.2  H-1 state_root 负测试      ~1 天
+  P0.3  C-5 nullifier 端到端测试   ~1 天
+  P0.4  A-3 viewing key 统一       ~3 天
+  P0.5  C-2 membership+nullifier   ~2 周
+  ─────────────────────────────────────────────────────────────────
+
+P0 后继续:
+  Phase 1.4  B-3: aggregate_proofs IPA 化    ~1 周
+  Phase 1.5  IPA 区块集成                    ~3 天
+  Phase 1.7  恢复调用方                      ~2 天
+  Phase 1.10 Signed Accumulator              ~1 周
+  Phase 1.11 P2P Proof Gossip                ~2 周
+  Phase 1.13-1.16 Recursive Wrapper→Mainnet  ~2 周
+
+Full Trustless Mainnet ≈ P0 + Phase 1 剩余 + Phase 2-4 ≈ 2-3 个月
 ```
