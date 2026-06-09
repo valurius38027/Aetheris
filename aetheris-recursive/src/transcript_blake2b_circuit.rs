@@ -63,39 +63,39 @@ pub struct Blake2bCompressionCircuitConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct AssignedBlake2bStateRow {
-    pub state_in: Vec<Limb>,
-    pub state_out: Vec<Limb>,
-    pub block_words: Vec<Limb>,
+pub struct AssignedBlake2bStateRow<F: Field> {
+    pub state_in: Vec<Limb<F>>,
+    pub state_out: Vec<Limb<F>>,
+    pub block_words: Vec<Limb<F>>,
     pub block_index: usize,
 }
 
 #[derive(Clone, Debug)]
-pub struct AssignedBlake2bRoundRow {
+pub struct AssignedBlake2bRoundRow<F: Field> {
     pub round_index: usize,
-    pub message_pair: Vec<Limb>,
-    pub work_in: Vec<Limb>,
-    pub work_out: Vec<Limb>,
+    pub message_pair: Vec<Limb<F>>,
+    pub work_in: Vec<Limb<F>>,
+    pub work_out: Vec<Limb<F>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct AssignedBlake2bMixRow {
+pub struct AssignedBlake2bMixRow<F: Field> {
     pub mix_index: usize,
-    pub message_pair: Vec<Limb>,
-    pub work_in: Vec<Limb>,
-    pub work_out: Vec<Limb>,
+    pub message_pair: Vec<Limb<F>>,
+    pub work_in: Vec<Limb<F>>,
+    pub work_out: Vec<Limb<F>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct AssignedBlake2bMixStepRow {
+pub struct AssignedBlake2bMixStepRow<F: Field> {
     pub step_index: usize,
-    pub work_in: Vec<Limb>,
-    pub work_out: Vec<Limb>,
+    pub work_in: Vec<Limb<F>>,
+    pub work_out: Vec<Limb<F>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct AssignedBlake2bTrace {
-    pub rows: Vec<AssignedBlake2bStateRow>,
+pub struct AssignedBlake2bTrace<F: Field> {
+    pub rows: Vec<AssignedBlake2bStateRow<F>>,
 }
 
 #[derive(Clone)]
@@ -106,7 +106,9 @@ pub struct Blake2bCompressionCircuitChip {
 }
 
 impl Blake2bCompressionCircuitChip {
-    pub fn configure(meta: &mut ConstraintSystem<Fp>) -> Blake2bCompressionCircuitConfig {
+    pub fn configure<F: PrimeField + From<u64>>(
+        meta: &mut ConstraintSystem<F>,
+    ) -> Blake2bCompressionCircuitConfig {
         let state = [0; BLAKE2B_STATE_WORDS].map(|_| meta.advice_column());
         let message = [0; BLAKE2B_BLOCK_WORDS].map(|_| meta.advice_column());
         let round_message_pair = [0; 2].map(|_| meta.advice_column());
@@ -174,8 +176,6 @@ impl Blake2bCompressionCircuitChip {
             .for_each(|col| meta.enable_equality(*col));
         meta.enable_equality(round_lane);
 
-        // Placeholder gate for the upcoming exact round constraints. For now it
-        // pins a stable round-lane row shape without adding false semantics.
         meta.create_gate("blake2b_round_placeholder", |meta| {
             let s = meta.query_selector(s_round_placeholder);
             let lane_cur = meta.query_advice(round_lane, Rotation::cur());
@@ -191,21 +191,21 @@ impl Blake2bCompressionCircuitChip {
             vec![
                 s.clone()
                     * (meta.query_advice(work[8], Rotation::cur())
-                        - Expression::Constant(Fp::from(BLAKE2B_IV[0]))),
+                        - Expression::Constant(F::from(BLAKE2B_IV[0]))),
                 s.clone()
                     * (meta.query_advice(work[9], Rotation::cur())
-                        - Expression::Constant(Fp::from(BLAKE2B_IV[1]))),
+                        - Expression::Constant(F::from(BLAKE2B_IV[1]))),
                 s.clone()
                     * (meta.query_advice(work[10], Rotation::cur())
-                        - Expression::Constant(Fp::from(BLAKE2B_IV[2]))),
+                        - Expression::Constant(F::from(BLAKE2B_IV[2]))),
                 s.clone()
                     * (meta.query_advice(work[11], Rotation::cur())
-                        - Expression::Constant(Fp::from(BLAKE2B_IV[3]))),
+                        - Expression::Constant(F::from(BLAKE2B_IV[3]))),
                 s.clone() * (meta.query_advice(work[12], Rotation::cur()) - expected_v12),
                 s.clone() * (meta.query_advice(work[13], Rotation::cur()) - expected_v13),
                 s.clone() * (meta.query_advice(work[14], Rotation::cur()) - expected_v14),
                 s * (meta.query_advice(work[15], Rotation::cur())
-                    - Expression::Constant(Fp::from(BLAKE2B_IV[7]))),
+                    - Expression::Constant(F::from(BLAKE2B_IV[7]))),
             ]
         });
 
@@ -240,8 +240,8 @@ impl Blake2bCompressionCircuitChip {
             let c = meta.query_advice(feed_forward_bits[2], Rotation::cur());
             let tmp = meta.query_advice(feed_forward_bits[3], Rotation::cur());
             let out = meta.query_advice(feed_forward_bits[4], Rotation::cur());
-            let one = Expression::Constant(Fp::ONE);
-            let two = Expression::Constant(Fp::from(2));
+            let one = Expression::Constant(F::ONE);
+            let two = Expression::Constant(F::from(2));
             vec![
                 s.clone() * a.clone() * (a.clone() - one.clone()),
                 s.clone() * b.clone() * (b.clone() - one.clone()),
@@ -258,13 +258,13 @@ impl Blake2bCompressionCircuitChip {
             let mut constraints = Vec::with_capacity(4);
             let bit_columns = [0usize, 1, 2, 4];
             for word_idx in 0..4 {
-                let mut packed = Expression::Constant(Fp::ZERO);
+                let mut packed = Expression::Constant(F::ZERO);
                 for bit_idx in 0..64 {
                     let bit = meta.query_advice(
                         feed_forward_bits[bit_columns[word_idx]],
                         Rotation(bit_idx as i32),
                     );
-                    packed = packed + bit * Expression::Constant(Fp::from(1u64 << bit_idx));
+                    packed = packed + bit * Expression::Constant(F::from(1u64 << bit_idx));
                 }
                 let word = meta.query_advice(feed_forward_words[word_idx], Rotation::cur());
                 constraints.push(s.clone() * (word - packed));
@@ -278,8 +278,8 @@ impl Blake2bCompressionCircuitChip {
             let b = meta.query_advice(rotation_bits[1], Rotation::cur());
             let xor = meta.query_advice(rotation_bits[2], Rotation::cur());
             let out = meta.query_advice(rotation_bits[3], Rotation::cur());
-            let one = Expression::Constant(Fp::ONE);
-            let two = Expression::Constant(Fp::from(2));
+            let one = Expression::Constant(F::ONE);
+            let two = Expression::Constant(F::from(2));
             vec![
                 s.clone() * a.clone() * (a.clone() - one.clone()),
                 s.clone() * b.clone() * (b.clone() - one.clone()),
@@ -294,13 +294,13 @@ impl Blake2bCompressionCircuitChip {
             let mut constraints = Vec::with_capacity(3);
             let bit_columns = [0usize, 1, 3];
             for word_idx in 0..3 {
-                let mut packed = Expression::Constant(Fp::ZERO);
+                let mut packed = Expression::Constant(F::ZERO);
                 for bit_idx in 0..64 {
                     let bit = meta.query_advice(
                         rotation_bits[bit_columns[word_idx]],
                         Rotation(bit_idx as i32),
                     );
-                    packed = packed + bit * Expression::Constant(Fp::from(1u64 << bit_idx));
+                    packed = packed + bit * Expression::Constant(F::from(1u64 << bit_idx));
                 }
                 let word = meta.query_advice(rotation_words[word_idx], Rotation::cur());
                 constraints.push(s.clone() * (word - packed));
@@ -316,8 +316,8 @@ impl Blake2bCompressionCircuitChip {
             let o_bit = meta.query_advice(add_bits[3], Rotation::cur());
             let carry = meta.query_advice(add_bits[4], Rotation::cur());
             let carry_next = meta.query_advice(add_bits[4], Rotation::next());
-            let one = Expression::Constant(Fp::ONE);
-            let two = Expression::Constant(Fp::from(2));
+            let one = Expression::Constant(F::ONE);
+            let two = Expression::Constant(F::from(2));
             vec![
                 s.clone() * a_bit.clone() * (a_bit.clone() - one.clone()),
                 s.clone() * b_bit.clone() * (b_bit.clone() - one.clone()),
@@ -334,20 +334,20 @@ impl Blake2bCompressionCircuitChip {
             let word_cols = [0usize, 1, 2];
             let bit_cols = [0usize, 1, 3];
             for pair_idx in 0..3 {
-                let mut packed = Expression::Constant(Fp::ZERO);
+                let mut packed = Expression::Constant(F::ZERO);
                 for bit_idx in 0..64 {
                     let bit = meta.query_advice(
                         add_bits[bit_cols[pair_idx]],
                         Rotation(bit_idx as i32),
                     );
-                    packed = packed + bit * Expression::Constant(Fp::from(1u64 << bit_idx));
+                    packed = packed + bit * Expression::Constant(F::from(1u64 << bit_idx));
                 }
                 let word = meta.query_advice(add_words[word_cols[pair_idx]], Rotation::cur());
                 constraints.push(s.clone() * (word - packed));
             }
             let carry64 = meta.query_advice(add_bits[4], Rotation(64));
-            let one = Expression::Constant(Fp::ONE);
-            let two = Expression::Constant(Fp::from(2));
+            let one = Expression::Constant(F::ONE);
+            let two = Expression::Constant(F::from(2));
             constraints.push(s * carry64.clone() * (carry64.clone() - one) * (carry64 - two));
             constraints
         });
@@ -416,15 +416,18 @@ impl Blake2bCompressionCircuitChip {
     ) -> Result<AssignedTranscriptWordStream, ErrorFront> {
         self.words.assign_stream(layouter, stream, label)
     }
+}
 
-    pub fn assign_state_row(
+impl Blake2bCompressionCircuitChip {
+
+    pub fn assign_state_row<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         block: &Blake2bBlockTrace,
         state_in: &[u64; BLAKE2B_STATE_WORDS],
         state_out: &[u64; BLAKE2B_STATE_WORDS],
         label: &str,
-    ) -> Result<AssignedBlake2bStateRow, ErrorFront> {
+    ) -> Result<AssignedBlake2bStateRow<F>, ErrorFront> {
         let (state_in_limbs, state_out_limbs, block_word_limbs) = layouter.assign_region(
             || format!("assign_blake2b_state_{}", label),
             |mut region| {
@@ -437,20 +440,20 @@ impl Blake2bCompressionCircuitChip {
                         || format!("state_in_{}_{}", label, i),
                         self.compression.state[i],
                         0,
-                        || Value::known(Fp::from(state_in[i])),
+                        || Value::known(F::from(state_in[i])),
                     )?;
                     let out_assigned = region.assign_advice(
                         || format!("state_out_{}_{}", label, i),
                         self.compression.state[i],
                         1,
-                        || Value::known(Fp::from(state_out[i])),
+                        || Value::known(F::from(state_out[i])),
                     )?;
                     ins.push(Limb {
-                        value: Value::known(Fp::from(state_in[i])),
+                        value: Value::known(F::from(state_in[i])),
                         cell: Some(in_assigned.cell()),
                     });
                     outs.push(Limb {
-                        value: Value::known(Fp::from(state_out[i])),
+                        value: Value::known(F::from(state_out[i])),
                         cell: Some(out_assigned.cell()),
                     });
                 }
@@ -460,10 +463,10 @@ impl Blake2bCompressionCircuitChip {
                         || format!("block_word_{}_{}", label, i),
                         self.compression.message[i],
                         0,
-                        || Value::known(Fp::from(block.words[i])),
+                        || Value::known(F::from(block.words[i])),
                     )?;
                     block_words.push(Limb {
-                        value: Value::known(Fp::from(block.words[i])),
+                        value: Value::known(F::from(block.words[i])),
                         cell: Some(word_assigned.cell()),
                     });
                 }
@@ -480,11 +483,11 @@ impl Blake2bCompressionCircuitChip {
         })
     }
 
-    pub fn constrain_message_words(
+    pub fn constrain_message_words<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         assigned_words: &AssignedTranscriptWordStream,
-        trace: &AssignedBlake2bTrace,
+        trace: &AssignedBlake2bTrace<F>,
     ) -> Result<(), ErrorFront> {
         assert_eq!(
             assigned_words.blocks.len(),
@@ -515,10 +518,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_chaining(
+    pub fn constrain_chaining<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        trace: &AssignedBlake2bTrace,
+        mut layouter: impl Layouter<F>,
+        trace: &AssignedBlake2bTrace<F>,
     ) -> Result<(), ErrorFront> {
         for i in 0..trace.rows.len().saturating_sub(1) {
             for word_idx in 0..BLAKE2B_STATE_WORDS {
@@ -536,10 +539,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_initial_state(
+    pub fn constrain_initial_state<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        first_row: &AssignedBlake2bStateRow,
+        mut layouter: impl Layouter<F>,
+        first_row: &AssignedBlake2bStateRow<F>,
     ) -> Result<(), ErrorFront> {
         let initial_state = halo2_blake2b_transcript_initial_state();
 
@@ -559,7 +562,7 @@ impl Blake2bCompressionCircuitChip {
                             || format!("initial_state_expected_{}", word_idx),
                             self.compression.step_expected[1],
                             0,
-                            || Value::known(Fp::from(expected_word)),
+                            || Value::known(F::from(expected_word)),
                         )?;
                         region.constrain_equal(state_in_cell, actual.cell())
                     },
@@ -569,10 +572,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_round_chaining(
+    pub fn constrain_round_chaining<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        rounds: &[AssignedBlake2bRoundRow],
+        mut layouter: impl Layouter<F>,
+        rounds: &[AssignedBlake2bRoundRow<F>],
     ) -> Result<(), ErrorFront> {
         for i in 0..rounds.len().saturating_sub(1) {
             for word_idx in 0..BLAKE2B_WORK_WORDS {
@@ -590,11 +593,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_round_message_pair(
+    pub fn constrain_round_message_pair<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        state_row: &AssignedBlake2bStateRow,
-        round_row: &AssignedBlake2bRoundRow,
+        mut layouter: impl Layouter<F>,
+        state_row: &AssignedBlake2bStateRow<F>,
+        round_row: &AssignedBlake2bRoundRow<F>,
         round: &Blake2bRoundTrace,
     ) -> Result<(), ErrorFront> {
         for pair_idx in 0..2 {
@@ -617,11 +620,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_message_pair(
+    pub fn constrain_mix_message_pair<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        state_row: &AssignedBlake2bStateRow,
-        mix_row: &AssignedBlake2bMixRow,
+        mut layouter: impl Layouter<F>,
+        state_row: &AssignedBlake2bStateRow<F>,
+        mix_row: &AssignedBlake2bMixRow<F>,
         mix: &Blake2bMixTrace,
         round_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -645,11 +648,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_to_round_boundary(
+    pub fn constrain_mix_to_round_boundary<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        round_row: &AssignedBlake2bRoundRow,
-        mix_row: &AssignedBlake2bMixRow,
+        mut layouter: impl Layouter<F>,
+        round_row: &AssignedBlake2bRoundRow<F>,
+        mix_row: &AssignedBlake2bMixRow<F>,
         bind_to_round_in: bool,
     ) -> Result<(), ErrorFront> {
         let round_words = if bind_to_round_in {
@@ -683,10 +686,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_chaining(
+    pub fn constrain_mix_chaining<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        mixes: &[AssignedBlake2bMixRow],
+        mut layouter: impl Layouter<F>,
+        mixes: &[AssignedBlake2bMixRow<F>],
     ) -> Result<(), ErrorFront> {
         for i in 0..mixes.len().saturating_sub(1) {
             for word_idx in 0..BLAKE2B_WORK_WORDS {
@@ -704,10 +707,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_chaining(
+    pub fn constrain_mix_step_chaining<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        steps: &[AssignedBlake2bMixStepRow],
+        mut layouter: impl Layouter<F>,
+        steps: &[AssignedBlake2bMixStepRow<F>],
     ) -> Result<(), ErrorFront> {
         for i in 0..steps.len().saturating_sub(1) {
             for word_idx in 0..BLAKE2B_WORK_WORDS {
@@ -725,10 +728,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_unchanged_lanes(
+    pub fn constrain_mix_step_unchanged_lanes<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -754,10 +757,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_delta(
+    pub fn constrain_mix_step_delta<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
         lane_idx: usize,
@@ -768,7 +771,7 @@ impl Blake2bCompressionCircuitChip {
         );
         if step_row.work_in[lane_idx].cell.is_some() && step_row.work_out[lane_idx].cell.is_some() {
             let expected_delta =
-                Fp::from(step.work_out[lane_idx]) - Fp::from(step.work_in[lane_idx]);
+                F::from(step.work_out[lane_idx]) - F::from(step.work_in[lane_idx]);
             layouter.assign_region(
                 || {
                     format!(
@@ -824,10 +827,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_sum(
+    pub fn constrain_mix_step_sum<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -882,7 +885,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.step_sum[2],
                         0,
-                        || Value::known(Fp::from(message_word_value)),
+                        || Value::known(F::from(message_word_value)),
                     )?;
                     let out_copy = region.assign_advice(
                         || {
@@ -911,10 +914,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_add_only(
+    pub fn constrain_mix_step_add_only<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -969,7 +972,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.step_sum[2],
                         0,
-                        || Value::known(Fp::ZERO),
+                        || Value::known(F::ZERO),
                     )?;
                     let out_copy = region.assign_advice(
                         || {
@@ -998,10 +1001,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_rotation(
+    pub fn constrain_mix_step_rotation<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -1055,7 +1058,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.step_expected[1],
                         0,
-                        || Value::known(Fp::from(expected)),
+                        || Value::known(F::from(expected)),
                     )?;
                     if let Some(source_out) = step_row.work_out[lane_idx].cell {
                         region.constrain_equal(source_out, out_copy.cell())?;
@@ -1067,10 +1070,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_rotation_xor_native(
+    pub fn constrain_mix_step_rotation_xor_native<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -1129,7 +1132,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.rotation_words[col_idx],
                         0,
-                        || Value::known(Fp::from(word)),
+                        || Value::known(F::from(word)),
                     )?;
                     region.constrain_equal(source_cells[col_idx], assigned.cell())?;
                 }
@@ -1155,7 +1158,7 @@ impl Blake2bCompressionCircuitChip {
                             },
                             self.compression.rotation_bits[col_idx],
                             bit_idx,
-                            || Value::known(Fp::from(bit)),
+                            || Value::known(F::from(bit)),
                         )?;
                         if col_idx == 2 {
                             xor_cells.push(assigned.cell());
@@ -1175,10 +1178,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_wrapping_add_native(
+    pub fn constrain_mix_step_wrapping_add_native<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -1225,7 +1228,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.add_words[col_idx],
                         0,
-                        || Value::known(Fp::from(word)),
+                        || Value::known(F::from(word)),
                     )?;
                     region.constrain_equal(source_cells[col_idx], assigned.cell())?;
                 }
@@ -1252,7 +1255,7 @@ impl Blake2bCompressionCircuitChip {
                             },
                             self.compression.add_bits[col_idx],
                             bit_idx,
-                            || Value::known(Fp::from(bit)),
+                            || Value::known(F::from(bit)),
                         )?;
                     }
                     carry_in = carry_out;
@@ -1267,7 +1270,7 @@ impl Blake2bCompressionCircuitChip {
                     },
                     self.compression.add_bits[4],
                     64,
-                    || Value::known(Fp::from(carry_in)),
+                    || Value::known(F::from(carry_in)),
                 )?;
 
                 Ok(())
@@ -1276,10 +1279,10 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_step_expected_output(
+    pub fn constrain_mix_step_expected_output<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         step: &Blake2bMixStepTrace,
         mix_index: usize,
     ) -> Result<(), ErrorFront> {
@@ -1314,7 +1317,7 @@ impl Blake2bCompressionCircuitChip {
                         },
                         self.compression.step_expected[1],
                         0,
-                        || Value::known(Fp::from(step.work_out[lane_idx])),
+                        || Value::known(F::from(step.work_out[lane_idx])),
                     )?;
                     if let Some(source_out) = step_row.work_out[lane_idx].cell {
                         region.constrain_equal(source_out, out_copy.cell())?;
@@ -1326,11 +1329,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_mix_boundary(
+    pub fn constrain_mix_boundary<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        mix_row: &AssignedBlake2bMixRow,
-        step_row: &AssignedBlake2bMixStepRow,
+        mut layouter: impl Layouter<F>,
+        mix_row: &AssignedBlake2bMixRow<F>,
+        step_row: &AssignedBlake2bMixStepRow<F>,
         bind_to_mix_in: bool,
     ) -> Result<(), ErrorFront> {
         let mix_words = if bind_to_mix_in {
@@ -1364,11 +1367,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_initial_round_state(
+    pub fn constrain_initial_round_state<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        state_row: &AssignedBlake2bStateRow,
-        first_round: &AssignedBlake2bRoundRow,
+        mut layouter: impl Layouter<F>,
+        state_row: &AssignedBlake2bStateRow<F>,
+        first_round: &AssignedBlake2bRoundRow<F>,
     ) -> Result<(), ErrorFront> {
         for word_idx in 0..BLAKE2B_STATE_WORDS {
             if let (Some(state_cell), Some(work_cell)) = (
@@ -1389,11 +1392,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_initial_round_metadata(
+    pub fn constrain_initial_round_metadata<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         block: &Blake2bBlockTrace,
-        first_round: &AssignedBlake2bRoundRow,
+        first_round: &AssignedBlake2bRoundRow<F>,
         label: &str,
     ) -> Result<(), ErrorFront> {
         let offset_lo = block.meta.offset as u64;
@@ -1414,19 +1417,19 @@ impl Blake2bCompressionCircuitChip {
                     || format!("metadata_v12_{}", label),
                     self.compression.metadata[0],
                     0,
-                    || Value::known(Fp::from(BLAKE2B_IV[4] ^ offset_lo)),
+                    || Value::known(F::from(BLAKE2B_IV[4] ^ offset_lo)),
                 )?;
                 region.assign_fixed(
                     || format!("metadata_v13_{}", label),
                     self.compression.metadata[1],
                     0,
-                    || Value::known(Fp::from(BLAKE2B_IV[5] ^ offset_hi)),
+                    || Value::known(F::from(BLAKE2B_IV[5] ^ offset_hi)),
                 )?;
                 region.assign_fixed(
                     || format!("metadata_v14_{}", label),
                     self.compression.metadata[2],
                     0,
-                    || Value::known(Fp::from(final_lane)),
+                    || Value::known(F::from(final_lane)),
                 )?;
 
                 for lane_idx in 8..=15 {
@@ -1445,10 +1448,10 @@ impl Blake2bCompressionCircuitChip {
         )
     }
 
-    pub fn constrain_feed_forward_expected(
+    pub fn constrain_feed_forward_expected<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        state_row: &AssignedBlake2bStateRow,
+        mut layouter: impl Layouter<F>,
+        state_row: &AssignedBlake2bStateRow<F>,
         expected_state_out: &[u64; BLAKE2B_STATE_WORDS],
     ) -> Result<(), ErrorFront> {
         for word_idx in 0..BLAKE2B_STATE_WORDS {
@@ -1482,7 +1485,7 @@ impl Blake2bCompressionCircuitChip {
                             },
                             self.compression.step_expected[1],
                             0,
-                            || Value::known(Fp::from(expected_state_out[word_idx])),
+                            || Value::known(F::from(expected_state_out[word_idx])),
                         )?;
                         region.constrain_equal(state_out_cell, actual.cell())
                     },
@@ -1492,11 +1495,11 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn constrain_feed_forward_xor(
+    pub fn constrain_feed_forward_xor<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
-        state_row: &AssignedBlake2bStateRow,
-        final_round: &AssignedBlake2bRoundRow,
+        mut layouter: impl Layouter<F>,
+        state_row: &AssignedBlake2bStateRow<F>,
+        final_round: &AssignedBlake2bRoundRow<F>,
         state_in: &[u64; BLAKE2B_STATE_WORDS],
         final_work: &[u64; BLAKE2B_WORK_WORDS],
         state_out: &[u64; BLAKE2B_STATE_WORDS],
@@ -1536,7 +1539,7 @@ impl Blake2bCompressionCircuitChip {
                             },
                             self.compression.feed_forward_words[col_idx],
                             0,
-                            || Value::known(Fp::from(word)),
+                            || Value::known(F::from(word)),
                         )?;
                         if let Some(source_cell) = source_cells[col_idx] {
                             region.constrain_equal(source_cell, assigned.cell())?;
@@ -1563,7 +1566,7 @@ impl Blake2bCompressionCircuitChip {
                                 },
                                 self.compression.feed_forward_bits[col_idx],
                                 bit_idx,
-                                || Value::known(Fp::from(bit)),
+                                || Value::known(F::from(bit)),
                             )?;
                         }
                     }
@@ -1574,12 +1577,12 @@ impl Blake2bCompressionCircuitChip {
         Ok(())
     }
 
-    pub fn assign_trace(
+    pub fn assign_trace<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         compression_trace: &Blake2bCompressionTrace,
         label: &str,
-    ) -> Result<AssignedBlake2bTrace, ErrorFront> {
+    ) -> Result<AssignedBlake2bTrace<F>, ErrorFront> {
         let mut rows = Vec::with_capacity(compression_trace.rows.len());
         for (i, row) in compression_trace.rows.iter().enumerate() {
             rows.push(self.assign_state_row(
@@ -1593,9 +1596,9 @@ impl Blake2bCompressionCircuitChip {
         Ok(AssignedBlake2bTrace { rows })
     }
 
-    pub fn assign_round_placeholder(
+    pub fn assign_round_placeholder<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         block_index: usize,
         label: &str,
     ) -> Result<(), ErrorFront> {
@@ -1605,7 +1608,7 @@ impl Blake2bCompressionCircuitChip {
                 self.compression
                     .s_round_placeholder
                     .enable(&mut region, 0)?;
-                let lane = Fp::from(block_index as u64);
+                let lane = F::from(block_index as u64);
                 region.assign_advice(
                     || format!("round_lane_cur_{}", label),
                     self.compression.round_lane,
@@ -1623,13 +1626,13 @@ impl Blake2bCompressionCircuitChip {
         )
     }
 
-    pub fn assign_round_trace_row(
+    pub fn assign_round_trace_row<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         block: &Blake2bBlockTrace,
         round: &Blake2bRoundTrace,
         label: &str,
-    ) -> Result<AssignedBlake2bRoundRow, ErrorFront> {
+    ) -> Result<AssignedBlake2bRoundRow<F>, ErrorFront> {
         let (message_pair, work_in, work_out) = layouter.assign_region(
             || format!("assign_blake2b_round_{}", label),
             |mut region| {
@@ -1642,10 +1645,10 @@ impl Blake2bCompressionCircuitChip {
                         || format!("round_message_pair_{}_{}", label, i),
                         self.compression.round_message_pair[i],
                         0,
-                        || Value::known(Fp::from(selected_word)),
+                        || Value::known(F::from(selected_word)),
                     )?;
                     pair.push(Limb {
-                        value: Value::known(Fp::from(selected_word)),
+                        value: Value::known(F::from(selected_word)),
                         cell: Some(assigned.cell()),
                     });
                 }
@@ -1654,20 +1657,20 @@ impl Blake2bCompressionCircuitChip {
                         || format!("work_in_{}_{}", label, i),
                         self.compression.work[i],
                         0,
-                        || Value::known(Fp::from(round.work_in[i])),
+                        || Value::known(F::from(round.work_in[i])),
                     )?;
                     let out_assigned = region.assign_advice(
                         || format!("work_out_{}_{}", label, i),
                         self.compression.work[i],
                         1,
-                        || Value::known(Fp::from(round.work_out[i])),
+                        || Value::known(F::from(round.work_out[i])),
                     )?;
                     ins.push(Limb {
-                        value: Value::known(Fp::from(round.work_in[i])),
+                        value: Value::known(F::from(round.work_in[i])),
                         cell: Some(in_assigned.cell()),
                     });
                     outs.push(Limb {
-                        value: Value::known(Fp::from(round.work_out[i])),
+                        value: Value::known(F::from(round.work_out[i])),
                         cell: Some(out_assigned.cell()),
                     });
                 }
@@ -1683,12 +1686,12 @@ impl Blake2bCompressionCircuitChip {
         })
     }
 
-    pub fn assign_mix_trace_row(
+    pub fn assign_mix_trace_row<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         mix: &Blake2bMixTrace,
         label: &str,
-    ) -> Result<AssignedBlake2bMixRow, ErrorFront> {
+    ) -> Result<AssignedBlake2bMixRow<F>, ErrorFront> {
         let (message_pair, work_in, work_out) = layouter.assign_region(
             || format!("assign_blake2b_mix_{}", label),
             |mut region| {
@@ -1700,10 +1703,10 @@ impl Blake2bCompressionCircuitChip {
                         || format!("mix_message_pair_{}_{}", label, i),
                         self.compression.round_message_pair[i],
                         0,
-                        || Value::known(Fp::from(mix.message_word_values[i])),
+                        || Value::known(F::from(mix.message_word_values[i])),
                     )?;
                     pair.push(Limb {
-                        value: Value::known(Fp::from(mix.message_word_values[i])),
+                        value: Value::known(F::from(mix.message_word_values[i])),
                         cell: Some(assigned.cell()),
                     });
                 }
@@ -1712,20 +1715,20 @@ impl Blake2bCompressionCircuitChip {
                         || format!("mix_work_in_{}_{}", label, i),
                         self.compression.work[i],
                         0,
-                        || Value::known(Fp::from(mix.work_in[i])),
+                        || Value::known(F::from(mix.work_in[i])),
                     )?;
                     let out_assigned = region.assign_advice(
                         || format!("mix_work_out_{}_{}", label, i),
                         self.compression.work[i],
                         1,
-                        || Value::known(Fp::from(mix.work_out[i])),
+                        || Value::known(F::from(mix.work_out[i])),
                     )?;
                     ins.push(Limb {
-                        value: Value::known(Fp::from(mix.work_in[i])),
+                        value: Value::known(F::from(mix.work_in[i])),
                         cell: Some(in_assigned.cell()),
                     });
                     outs.push(Limb {
-                        value: Value::known(Fp::from(mix.work_out[i])),
+                        value: Value::known(F::from(mix.work_out[i])),
                         cell: Some(out_assigned.cell()),
                     });
                 }
@@ -1741,12 +1744,12 @@ impl Blake2bCompressionCircuitChip {
         })
     }
 
-    pub fn assign_mix_step_row(
+    pub fn assign_mix_step_row<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         step: &Blake2bMixStepTrace,
         label: &str,
-    ) -> Result<AssignedBlake2bMixStepRow, ErrorFront> {
+    ) -> Result<AssignedBlake2bMixStepRow<F>, ErrorFront> {
         let (work_in, work_out) = layouter.assign_region(
             || format!("assign_blake2b_mix_step_{}", label),
             |mut region| {
@@ -1757,20 +1760,20 @@ impl Blake2bCompressionCircuitChip {
                         || format!("mix_step_in_{}_{}", label, i),
                         self.compression.work[i],
                         0,
-                        || Value::known(Fp::from(step.work_in[i])),
+                        || Value::known(F::from(step.work_in[i])),
                     )?;
                     let out_assigned = region.assign_advice(
                         || format!("mix_step_out_{}_{}", label, i),
                         self.compression.work[i],
                         1,
-                        || Value::known(Fp::from(step.work_out[i])),
+                        || Value::known(F::from(step.work_out[i])),
                     )?;
                     ins.push(Limb {
-                        value: Value::known(Fp::from(step.work_in[i])),
+                        value: Value::known(F::from(step.work_in[i])),
                         cell: Some(in_assigned.cell()),
                     });
                     outs.push(Limb {
-                        value: Value::known(Fp::from(step.work_out[i])),
+                        value: Value::known(F::from(step.work_out[i])),
                         cell: Some(out_assigned.cell()),
                     });
                 }
@@ -1789,14 +1792,14 @@ impl Blake2bCompressionCircuitChip {
     /// with an explicit equality gate, then assign the squeeze block's padded
     /// final block compression, returning the assigned state row whose
     /// state_out cells hold the 64-byte squeeze digest.
-    pub fn assign_and_constrain_squeeze_block(
+    pub fn assign_and_constrain_squeeze_block<F: PrimeField + From<u64>>(
         &self,
-        mut layouter: impl Layouter<Fp>,
+        mut layouter: impl Layouter<F>,
         squeeze_state_in: &[u64; BLAKE2B_STATE_WORDS],
         squeeze_block: &Blake2bBlockTrace,
-        main_state_out_cells: &[Limb; BLAKE2B_STATE_WORDS],
+        main_state_out_cells: &[Limb<F>; BLAKE2B_STATE_WORDS],
         label: &str,
-    ) -> Result<AssignedBlake2bStateRow, ErrorFront> {
+    ) -> Result<AssignedBlake2bStateRow<F>, ErrorFront> {
         // 1) Copy main state to squeeze_state columns via constrain_equal.
         let squeeze_state_cells = layouter.assign_region(
             || format!("squeeze_state_copy_{}", label),
@@ -1807,7 +1810,7 @@ impl Blake2bCompressionCircuitChip {
                         || format!("squeeze_state_{}_{}", label, i),
                         self.compression.squeeze_state[i],
                         0,
-                        || Value::known(Fp::from(squeeze_state_in[i])),
+                        || Value::known(F::from(squeeze_state_in[i])),
                     )?;
                     if let Some(main_cell) = main_state_out_cells[i].cell {
                         region.constrain_equal(main_cell, squeeze_cell.cell())?;
@@ -2035,6 +2038,9 @@ impl Blake2bCompressionCircuitChip {
 
         Ok(assigned_squeeze)
     }
+}
+
+impl Blake2bCompressionCircuitChip {
 
     /// Constrain `target = term1 + term2 * shift` via the `s_decompose` gate.
     /// Links term cells via `constrain_equal`. If `equal_to` is Some, also
@@ -2043,11 +2049,11 @@ impl Blake2bCompressionCircuitChip {
         &self,
         mut layouter: impl Layouter<Fp>,
         target_value: Fp,
-        term1: &Limb,
-        term2: &Limb,
+        term1: &Limb<Fp>,
+        term2: &Limb<Fp>,
         shift: Fp,
         equal_to: Option<Cell>,
-    ) -> Result<Limb, ErrorFront> {
+    ) -> Result<Limb<Fp>, ErrorFront> {
         layouter.assign_region(
             || "decompose",
             |mut region| {
@@ -2108,7 +2114,7 @@ impl Blake2bCompressionCircuitChip {
     pub fn constrain_challenge_scalar(
         &self,
         mut layouter: impl Layouter<Fp>,
-        squeeze_state_row: &AssignedBlake2bStateRow,
+        squeeze_state_row: &AssignedBlake2bStateRow<Fp>,
         output_words_u64: &[u64; 8],
         challenge_limb_values: &[Fp; FQ_NUM_LIMBS],
         label: &str,
@@ -2141,8 +2147,8 @@ impl Blake2bCompressionCircuitChip {
         ];
 
         // ── Witness sub-word components ──
-        let mut low: Vec<Limb> = Vec::with_capacity(6);
-        let mut high: Vec<Limb> = Vec::with_capacity(6);
+        let mut low: Vec<Limb<Fp>> = Vec::with_capacity(6);
+        let mut high: Vec<Limb<Fp>> = Vec::with_capacity(6);
 
         for bd in &boundaries {
             let wi_val = output_words_u64[bd.wi];
@@ -2280,10 +2286,17 @@ impl Blake2bCompressionCircuitChip {
             })),
         )?;
 
-        // ── Challenge = B_lo + B_hi * r (mod Fq) ──
+        // ── Challenge = (B_lo + B_hi * r + top2 * r^2) mod Fq ──
+        // where r = 2^255 mod Fq, top2 = bits 510-511 of the digest.
+        // This matches Fq::from_uniform_bytes(&64-byte-digest).
         let r_limbs = compute_r_limbs();
         let r_el = FqElement::new(array::from_fn(|i| Limb {
             value: Value::known(r_limbs[i]),
+            cell: None,
+        }));
+        let r2_limbs = compute_r2_limbs();
+        let r2_el = FqElement::new(array::from_fn(|i| Limb {
+            value: Value::known(r2_limbs[i]),
             cell: None,
         }));
         let product = self.fq.mul(
@@ -2291,11 +2304,29 @@ impl Blake2bCompressionCircuitChip {
             &b_hi,
             &r_el,
         )?;
-        let result = self.fq.add(
+        let mut result = self.fq.add(
             layouter.namespace(|| "add_b_lo_product"),
             &b_lo,
             &product,
         )?;
+        // Add top2 * r^2 correction
+        let top2_val = digest_top2_bits(output_words_u64);
+        if top2_val != 0 {
+            let top2_el = FqElement::new(array::from_fn(|i| Limb {
+                value: Value::known(if i == 0 { Fp::from(top2_val) } else { Fp::ZERO }),
+                cell: None,
+            }));
+            let correction = self.fq.mul(
+                layouter.namespace(|| "mul_top2_r2"),
+                &top2_el,
+                &r2_el,
+            )?;
+            result = self.fq.add(
+                layouter.namespace(|| "add_correction"),
+                &result,
+                &correction,
+            )?;
+        }
         self.fq.constrain_equal(
             layouter.namespace(|| "constrain_challenge"),
             &result,
@@ -2342,19 +2373,39 @@ fn split_512_at_255(words: &[u64; 8]) -> ([Fp; FQ_NUM_LIMBS], [Fp; FQ_NUM_LIMBS]
 fn compute_r_limbs() -> [Fp; FQ_NUM_LIMBS] {
     use num_bigint::BigUint;
 
-    // Pallas Fq in little-endian bytes
+    let fq = pallas_fq_modulus();
+    let two_pow_255 = BigUint::from(1u64) << 255;
+    let r_big = two_pow_255 % &fq;
+
+    biguint_to_fq_limbs(r_big)
+}
+
+/// Compute r^2 = 2^510 mod Fq as 3 × 85-bit Fp limbs.
+fn compute_r2_limbs() -> [Fp; FQ_NUM_LIMBS] {
+    use num_bigint::BigUint;
+
+    let fq = pallas_fq_modulus();
+    let two_pow_510 = BigUint::from(1u64) << 510;
+    let r2_big = two_pow_510 % &fq;
+
+    biguint_to_fq_limbs(r2_big)
+}
+
+fn pallas_fq_modulus() -> num_bigint::BigUint {
+    use num_bigint::BigUint;
     let fq_bytes: [u8; 32] = [
         0x01, 0x00, 0x00, 0x00, 0x21, 0xEB, 0x46, 0x8C,
         0xDD, 0xA8, 0x94, 0x09, 0xFC, 0x98, 0x46, 0x22,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
     ];
-    let fq = BigUint::from_bytes_le(&fq_bytes);
-    let two_pow_255 = BigUint::from(1u64) << 255;
-    let r_big = two_pow_255 % fq;
+    BigUint::from_bytes_le(&fq_bytes)
+}
 
+fn biguint_to_fq_limbs(val: num_bigint::BigUint) -> [Fp; FQ_NUM_LIMBS] {
+    use num_bigint::BigUint;
     let mask = (BigUint::from(1u64) << 85) - 1u64;
-    let mut remaining = r_big;
+    let mut remaining = val;
     array::from_fn(|_| {
         let limb_val: BigUint = &remaining & &mask;
         remaining >>= 85;
@@ -2363,6 +2414,24 @@ fn compute_r_limbs() -> [Fp; FQ_NUM_LIMBS] {
         repr.as_mut()[..bytes.len()].copy_from_slice(&bytes);
         Fp::from_repr(repr).unwrap()
     })
+}
+
+/// Extract the top 2 bits (bits 510-511) from a 512-bit digest as 8 × u64 LE.
+fn digest_top2_bits(words: &[u64; 8]) -> u64 {
+    (words[7] >> 62) & 0x3
+}
+
+/// Convert a 64-byte Blake2b digest (as 8 × u64 LE) to an Fq challenge scalar
+/// in 3 × 85-bit limbs: compute `(words_as_biguint % pallas_fq_modulus)` then split.
+pub fn challenge_from_words(words: &[u64; 8]) -> [Fp; FQ_NUM_LIMBS] {
+    use num_bigint::BigUint;
+    let fq = pallas_fq_modulus();
+    let mut full = BigUint::from(0u32);
+    for (i, w) in words.iter().copied().enumerate() {
+        full += BigUint::from(w) << (64 * i);
+    }
+    let challenge = full % fq;
+    biguint_to_fq_limbs(challenge)
 }
 
 #[cfg(test)]
@@ -4087,43 +4156,6 @@ mod tests {
     }
 
     // ── Squeeze + Challenge test helpers ──
-
-    fn challenge_from_words(words: &[u64; 8]) -> [Fp; FQ_NUM_LIMBS] {
-        let (b_lo, b_hi) = split_512_at_255(words);
-        let r = compute_r_limbs();
-        use num_bigint::BigUint;
-        let mask = (BigUint::from(1u64) << 85) - 1u64;
-        let base: BigUint = BigUint::from(1u64) << 85;
-        let fq_bytes: [u8; 32] = [
-            0x01, 0x00, 0x00, 0x00, 0x21, 0xEB, 0x46, 0x8C,
-            0xDD, 0xA8, 0x94, 0x09, 0xFC, 0x98, 0x46, 0x22,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
-        ];
-        let fq = BigUint::from_bytes_le(&fq_bytes);
-        let limb_to_big = |limbs: &[Fp; 3]| -> BigUint {
-            let mut val = BigUint::from(0u32);
-            for (i, limb) in limbs.iter().enumerate() {
-                let bytes = limb.to_repr();
-                let lv = BigUint::from_bytes_le(bytes.as_ref());
-                val = val + lv * base.pow(i as u32);
-            }
-            val
-        };
-        let lo_big = limb_to_big(&b_lo);
-        let hi_big = limb_to_big(&b_hi);
-        let r_big = limb_to_big(&r);
-        let challenge = (lo_big + hi_big * r_big) % fq;
-        let mut remaining = challenge;
-        array::from_fn(|_| {
-            let limb_val: BigUint = &remaining & &mask;
-            remaining >>= 85;
-            let bytes = limb_val.to_bytes_le();
-            let mut repr = <Fp as PrimeField>::Repr::default();
-            repr.as_mut()[..bytes.len()].copy_from_slice(&bytes);
-            Fp::from_repr(repr).unwrap()
-        })
-    }
 
     #[derive(Default)]
     struct SqueezeChallengeCircuit {

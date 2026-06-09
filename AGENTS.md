@@ -46,12 +46,13 @@ The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[p
 
 ### Known Limitations (read before working)
 - **IPA + PLONK multiopen integration** is broken. See `ISSUE_IPA_PLONK_INTEGRATION.md` for root cause and attempted fixes. Any vanishing argument or permutation work touches this.
-- **`aetheris-recursive`** (`NonNativeChip`, `AccumulatorChip`, `KzgChip`) has known correctness bugs — not a real recursive SNARK. Cross-crate fixes touching this crate's types may need additional care.
+- **`aetheris-recursive`** — B-2 migration **COMPLETE**. The native Vesta IPA accumulation circuit is implemented (see `aetheris-recursive/B-2_plan.md`). Old files `ipa_fold.rs`, `non_native_mul.rs`, `ipa_verifier_circuit.rs` deleted. `non_native_fq.rs` retained for transcript gadget (Phase 6). **IPA + PLONK multiopen integration** remains broken (`ISSUE_IPA_PLONK_INTEGRATION.md`).
 - **Coq proofs** in `formal_proof/` are stubs/placeholders, not verified.
 - **Wallet encryption/send/scan** has placeholder-simulated paths.
 
 ### Key Architecture References
 - `protocol_design_ruling.md` — final design decisions (Pasta curves, IPA accumulation, ZK abstraction)
+- `aetheris-recursive/B-2_plan.md` — active implementation plan for native IPA accumulation on Vesta
 - `math_spec.md` — VDF, class group, record model math
 - `genesis.json` — genesis config (network, VDF difficulty, allocations)
 - `gen_crs.ps1` — CRS generation for Halo2 params

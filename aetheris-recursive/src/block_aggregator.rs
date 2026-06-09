@@ -131,7 +131,10 @@ pub fn verify_accumulator_chain(
     let mut acc = match AccumulatorIPA::from_bytes(prev_accumulator) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[verify_accumulator_chain] prev deserialize failed: {:?}", e);
+            eprintln!(
+                "[verify_accumulator_chain] prev deserialize failed: {:?}",
+                e
+            );
             return false;
         }
     };
@@ -151,7 +154,10 @@ pub fn verify_accumulator_chain(
     let claimed = match AccumulatorIPA::from_bytes(claimed_accumulator) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[verify_accumulator_chain] claimed deserialize failed: {:?}", e);
+            eprintln!(
+                "[verify_accumulator_chain] claimed deserialize failed: {:?}",
+                e
+            );
             return false;
         }
     };
@@ -236,9 +242,13 @@ mod tests {
     // Phase 1.8: end-to-end exercise of `accumulate_proof` +
     // `verify_accumulator_chain` with REAL ZK proofs (not synthetic bytes).
 
-    use aetheris_zkp::{ZkProverSystem, ZKProofSystem, create_commitment};
+    use aetheris_zkp::{create_commitment, ZKProofSystem, ZkProverSystem};
 
-    fn make_tx_proof(amount: u64, blinding_seed: u8, public_amount: i64) -> (Vec<u8>, Vec<[u8; 32]>) {
+    fn make_tx_proof(
+        amount: u64,
+        blinding_seed: u8,
+        public_amount: i64,
+    ) -> (Vec<u8>, Vec<[u8; 32]>) {
         let blinding = [blinding_seed; 32];
         let commitment = create_commitment(amount, &blinding);
         let proof = ZKProofSystem::prove_conservation(
@@ -261,14 +271,7 @@ mod tests {
         let claimed = accumulate_proof(&prev, &proof, &commitments, 0)
             .expect("single-tx accumulate must succeed");
 
-        let ok = verify_accumulator_chain(
-            &claimed,
-            &prev,
-            &[proof],
-            &[commitments],
-            &[0],
-            None,
-        );
+        let ok = verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], None);
         assert!(ok, "single-tx chain must self-validate");
     }
 
@@ -285,14 +288,8 @@ mod tests {
         let acc2 = accumulate_proof(&acc1, &p2, &c2, 0).expect("acc2");
         let acc3 = accumulate_proof(&acc2, &p3, &c3, 0).expect("acc3");
 
-        let ok = verify_accumulator_chain(
-            &acc3,
-            &prev,
-            &[p1, p2, p3],
-            &[c1, c2, c3],
-            &[0, 0, 0],
-            None,
-        );
+        let ok =
+            verify_accumulator_chain(&acc3, &prev, &[p1, p2, p3], &[c1, c2, c3], &[0, 0, 0], None);
         assert!(ok, "three-tx chain must self-validate (depth=3)");
     }
 
@@ -337,8 +334,10 @@ mod tests {
         );
 
         let full_replay_acc1 = accumulate_proof(&block1_prev, &p1a, &c1a, 0).expect("full acc1");
-        let full_replay_acc2 = accumulate_proof(&full_replay_acc1, &p1b, &c1b, 0).expect("full acc2");
-        let full_replay_acc3 = accumulate_proof(&full_replay_acc2, &p2a, &c2a, 0).expect("full acc3");
+        let full_replay_acc2 =
+            accumulate_proof(&full_replay_acc1, &p1b, &c1b, 0).expect("full acc2");
+        let full_replay_acc3 =
+            accumulate_proof(&full_replay_acc2, &p2a, &c2a, 0).expect("full acc3");
         let full_replay = accumulate_proof(&full_replay_acc3, &p2b, &c2b, 0).expect("full acc4");
         assert_eq!(
             full_replay, block2_claimed,
@@ -365,14 +364,8 @@ mod tests {
         let prev = empty_accumulator();
         let claimed_result = accumulate_proof(&prev, &proof, &commitments, 0);
         if let Ok(claimed) = claimed_result {
-            let ok = verify_accumulator_chain(
-                &claimed,
-                &prev,
-                &[proof],
-                &[commitments],
-                &[0],
-                None,
-            );
+            let ok =
+                verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], None);
             assert!(!ok, "tampered proof must cause chain verify to reject");
         }
     }
@@ -392,14 +385,8 @@ mod tests {
         let claimed = signed_accumulate_proof(&prev, &proof, &commitments, 0, &sk)
             .expect("signed accumulate must succeed");
 
-        let ok = verify_accumulator_chain(
-            &claimed,
-            &prev,
-            &[proof],
-            &[commitments],
-            &[0],
-            Some(&vk),
-        );
+        let ok =
+            verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], Some(&vk));
         assert!(ok, "signed single-tx chain must validate in O(1)");
     }
 
@@ -418,14 +405,28 @@ mod tests {
 
         // Correct pubkey → O(1) passes
         assert!(
-            verify_accumulator_chain(&claimed, &prev, &[proof.clone()], &[commitments.clone()], &[0], Some(&correct_vk)),
+            verify_accumulator_chain(
+                &claimed,
+                &prev,
+                &[proof.clone()],
+                &[commitments.clone()],
+                &[0],
+                Some(&correct_vk)
+            ),
             "correct pubkey must pass O(1)"
         );
 
         // Wrong pubkey → O(1) fails, falls through to O(n) replay which
         // still passes because the accumulator is honestly accumulated.
         assert!(
-            verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], Some(&wrong_vk)),
+            verify_accumulator_chain(
+                &claimed,
+                &prev,
+                &[proof],
+                &[commitments],
+                &[0],
+                Some(&wrong_vk)
+            ),
             "wrong pubkey falls through to O(n) replay (accumulator is valid)"
         );
     }
@@ -437,17 +438,11 @@ mod tests {
         let (proof, commitments) = make_tx_proof(100, 1, 0);
         let prev = empty_accumulator();
 
-        let claimed = accumulate_proof(&prev, &proof, &commitments, 0)
-            .expect("unsigned accumulate");
+        let claimed =
+            accumulate_proof(&prev, &proof, &commitments, 0).expect("unsigned accumulate");
 
-        let ok = verify_accumulator_chain(
-            &claimed,
-            &prev,
-            &[proof],
-            &[commitments],
-            &[0],
-            Some(&vk),
-        );
+        let ok =
+            verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], Some(&vk));
         assert!(ok, "unsigned input must fall back to O(n) and pass");
     }
 
@@ -494,14 +489,8 @@ mod tests {
         assert!(!ok_fast, "tampered claimed must fail O(1) sig check");
 
         // O(n) replay: also fails (corrupt Q doesn't match replayed state)
-        let ok_replay = verify_accumulator_chain(
-            &claimed,
-            &prev,
-            &[proof],
-            &[commitments],
-            &[0],
-            None,
-        );
+        let ok_replay =
+            verify_accumulator_chain(&claimed, &prev, &[proof], &[commitments], &[0], None);
         assert!(!ok_replay, "tampered claimed must also fail O(n) replay");
     }
 

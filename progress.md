@@ -2865,3 +2865,113 @@ The final multi-agent review approved the multiplication gadget after carry rang
 - `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/evaluation.rs` — evaluate_h (coset path)
 - `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/prover.rs` — fx_direct computation
 - `aetheris-zkp/vendor/halo2/halo2_backend/src/polynomial/domain.rs:49` — extended_k fix (retained)
+
+---
+
+## Stage 40 — §1.11.5 IPA-PLONK h_eval 约束激活 + §1.12d3 全轮混合原生约束 (2026-06-08)
+
+### §1.11.5 IPA-PLONK h_eval 修复 (COMPLETED)
+
+**Scope**: 确认 h_eval 约束已激活、验证 extended_k=13 消除 IFFT DC 伪影、修复 `invert().unwrap()` 风险、通过所有测试。
+
+#### 诊断结果:
+- `extended_k=13` 确保扩展域 `8192` 个点，覆盖 `n*(qpd+1)`，索引 ≥ 4094 处无 DC 伪影
+- `AETHERIS_DBG=1`：`h[4094..]` 全零，`expected_h_eval == transcript_h_eval` = true
+- 69/69 ZKP 测试全部通过，h_eval 约束在 `verifier.rs:138-140` 激活且无门控
+
+#### 变动:
+- `aetheris-zkp/vendor/halo2/halo2_backend/src/plonk/vanishing/verifier.rs:111`: `.invert().unwrap()` → `unwrap_or(ZERO)` + 显式 `xn == 1` 守卫（多智能体审计发现）
+
+#### 审计:
+- 2 个并行子智能体：两个均 ✅ APPROVED，无阻塞问题
+
+---
+
+### §1.12d3 全轮混合原生约束 (COMPLETED)
+
+**Scope**: 扩展 §1.12c 原生约束（回绕加法 + 旋转 XOR），使其应用于全部 12 轮 × 8 混合，而非仅轮 0 混合 0。
+
+#### 变动:
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs:2097`：移除了 `constrain_mix_step_rotation_xor_native` 上的 `round.round_index == 0 && mix.mix_index == 0` 守卫——现在应用于所有 384 个旋转步骤
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs:2113`：移除了 `constrain_mix_step_wrapping_add_native` 上的守卫——现在应用于所有 384 个加法步骤
+- `aetheris-recursive/src/transcript_blake2b_circuit.rs:2129`：保留了 `constrain_mix_step_delta/sum/add_only` 守卫（在回绕情况下主机期望值检查可能不正确）
+- 新增字段：`corrupt_native_add_round_2_mix_3`、`corrupt_native_rotation_round_2_mix_3`
+- 新增测试：`blake2b_circuit_rejects_native_add_in_mid_round`、`blake2b_circuit_rejects_native_rotation_in_mid_round`
+- 所有 Blake2bCircuit 测试的 K 值从 12 提升至 17（以适应 ~55K 行，用于 12 轮 × 8 混合 × 64 位本地区域）
+
+#### 验证:
+| 目标 | 结果 |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive --lib transcript_blake2b_circuit` | ✅ **35/35**（原 33 项 + 2 项新增） |
+| `cargo test --workspace --lib` | ✅ 全部 crate 通过（FFI 已知 sled 锁问题不受影响） |
+
+#### 审计（2 个并行子智能体）:
+- Reviewer 1：✅ APPROVED（5 个方面：守卫移除、k 值一致性、新测试、破坏注入、结构体完整性）
+- Reviewer 2：✅ APPROVED（5 个方面：原生约束上无守卫、剩余守卫正确、列隔离、门度数/行边界、`without_witnesses` 转发）
+
+#### 剩余工作:
+- **§1.12d4**（Challenge255 派生电路）——下一步
+- **§1.12d5**（IpaVerifierCircuit 集成）
+- **§1.12e**（优化与基准测试）
+
+---
+
+## Stage 41 — B-2: Native IPA Accumulation Circuit on Vesta (Circuit\<Fq\>) (2026-06-09)
+
+**Scope**: 构建完整的 native IPA accumulation circuit，完全在 `Circuit<Fq>` 上，消除 NonNativeChip 架构。将 `protocol_design_ruling.md` §1.1 决策付诸实践——递归电路在 Vesta 上，Fq 标量原生。
+
+### 阶段划分
+
+| 阶段 | 内容 | 文件 |
+|------|------|------|
+| 预置 | Vesta EC ops（assert_on_curve, add, double, select, scalar_mul） | `vesta_ecc.rs` |
+| 预置 | Vesta Fq 算术（add, mul, invert 门） | `vesta_fq.rs` |
+| 预置 | Fq 范围检查（8-bit） | `vesta_range.rs` |
+| S0 | Blake2b 压缩电路上的泛型方法（28 个 assign/constrain 方法字段无关） | `transcript_blake2b_circuit.rs` |
+| S1–S2 | FqByteAssigner + FqWordDecoder（字节→Limb\<Fq\> 重构） | `vesta_transcript.rs` |
+| S3 | Fq 压缩块（Blake2b 在 Circuit\<Fq\> 上的完整压缩） | `vesta_transcript.rs` |
+| S4 | Native Fq 挑战标量（s_decompose 门链 × 7） | `vesta_transcript.rs` |
+| S5 | VestaTranscriptChip E2E（压缩→挤压→挑战，4 测试） | `vesta_transcript.rs` |
+| S6 | VestaIpaChip（单轮 IPA folding，b-vector + offset 点展平） | `vesta_ipa.rs` |
+| S7 | VestaAccumulateChip（完整 IPA 验证器电路，布线转录 + folding） | `vesta_accumulate.rs` |
+| S8 | scalar_mul 恒等处理（`s_scalar_mul_result` 门：x·(y²−x³−5)=0） | `vesta_ecc.rs` |
+| S9 | VestaPointEq（`constrain_equal_points`，坐标方向单元格相等） | `vesta_ecc.rs` |
+| S11 | 清理，删除 old IPA 验证器文件 | `ipa_fold.rs`❌, `ipa_verifier_circuit.rs`❌, `non_native_mul.rs`❌ |
+
+### 新增文件（6 个）
+- `vesta_range.rs` — FqRangeCheckChip（8-bit 范围门）
+- `vesta_fq.rs` — VestaFqChip（add, mul, invert 门，4 测试）
+- `vesta_ecc.rs` — VestaEccChip（on_curve, add, double, select, scalar_mul，8 测试）
+- `vesta_transcript.rs` — VestaTranscriptChip（S1–S5，9 测试）
+- `vesta_ipa.rs` — VestaIpaChip（单轮 folding，2 测试）
+- `vesta_accumulate.rs` — VestaAccumulateChip（完整 IPA 验证器电路，2 测试）
+
+### 已删除文件（3 个）
+- `ipa_fold.rs` — 被 `vesta_ipa.rs` 取代
+- `ipa_verifier_circuit.rs` — 被 `vesta_accumulate.rs` 取代
+- `non_native_mul.rs` — 被 `vesta_ecc.rs` 取代
+
+### 保留文件（仍需）
+- `non_native_fq.rs` — 为转录小工具保留（第 6 阶段替换）
+
+### 关键设计决策
+1. **S5 设计**：使用 `assign_and_constrain_squeeze_block` 链接区块，精确匹配 IPA 验证器电路模式。避免 `TranscriptWordStream`（Fp 类型）。
+2. **Offset 点展平**：`fold_to_final` 接受展平的 `&[VestaPoint]` offset 点，索引为轮 0: n, 轮 1: n/2, ...，总计 = 2n−1。在主机端预计算。
+3. **Fq→Fp 转换以用于主机点乘法**：`BigUint::from_bytes_le(Fq::to_repr())` → `Fp::from_repr()`——匹配 VestaEccChip 的位提取模型。
+4. **S7 测试见证 native Fq IPA 证明** 在 Vesta 生成器（EqAffine）上，而非 Pallas。所有标量（eval, challenges, a_final）均为 Fq，原生处理。
+5. **scalar_mul result 门**：`x·(y²−x³−5)=0`，允许恒等（x=0）或有效曲线点。避免在验证器分配时对见证值进行分支。
+6. **IpaVerifierCircuit 的 s_decompose 门识别**：在测试的 Blake2b 压缩电路中，列 h（第 8 列，索引 7）被 s_decompose 门覆盖。添加了 `configure_no_gates` 以在需要时创建虚拟 Fq 配置，避免了门冲突。
+
+### 验证
+
+| 目标 | 结果 |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive --lib vesta` | ✅ **27/27**（所有新的 vesta 测试） |
+| `cargo test -p aetheris-recursive --lib` | ✅ **155/155**（0 失败，12 个旧的 ipa_verifier_circuit 错误已被删除） |
+| `cargo test --workspace --lib` | ✅ 所有 crate 通过 |
+
+### 剩余工作
+- **IPA + PLONK multiopen 集成** — 已知问题（`ISSUE_IPA_PLONK_INTEGRATION.md`）
+- **第 6 阶段**：用 `VestaFqChip` 替换 `NonNativeFqChip` 在转录小工具中的使用，删除 `non_native_fq.rs`

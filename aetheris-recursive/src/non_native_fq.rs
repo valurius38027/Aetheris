@@ -95,11 +95,11 @@ fn big_to_fp(big: &num_bigint::BigUint) -> Fp {
 
 #[derive(Clone, Debug)]
 pub struct FqElement {
-    pub limbs: [Limb; FQ_NUM_LIMBS],
+    pub limbs: [Limb<Fp>; FQ_NUM_LIMBS],
 }
 
 impl FqElement {
-    pub fn new(limbs: [Limb; FQ_NUM_LIMBS]) -> Self {
+    pub fn new(limbs: [Limb<Fp>; FQ_NUM_LIMBS]) -> Self {
         FqElement { limbs }
     }
 
@@ -152,6 +152,25 @@ pub struct NonNativeFqConfig {
 #[derive(Clone)]
 pub struct NonNativeFqChip {
     config: NonNativeFqConfig,
+}
+
+impl NonNativeFqConfig {
+    /// Create a NonNativeFqConfig for any field without enabling gates.
+    /// Used only to satisfy constructor requirements when NonNativeFqChip
+    /// is never called (e.g., Vesta transcript on Circuit<Fq>).
+    pub fn configure_no_gates<F: ff::Field>(meta: &mut ConstraintSystem<F>) -> Self {
+        Self {
+            a: meta.advice_column(),
+            b: meta.advice_column(),
+            c: meta.advice_column(),
+            aux: meta.advice_column(),
+            fq_const: meta.fixed_column(),
+            s_add: meta.complex_selector(),
+            s_mul: meta.complex_selector(),
+            s_range: meta.complex_selector(),
+            s_reduce: meta.complex_selector(),
+        }
+    }
 }
 
 impl NonNativeFqChip {
@@ -272,7 +291,7 @@ impl NonNativeFqChip {
             |mut region| {
                 // ── Pass 1: Carry-chain (unreduced addition S = a + b) ──
                 let mut prev_carry_fp = Fp::ZERO;
-                let mut raw_limbs: [Limb; FQ_NUM_LIMBS] = core::array::from_fn(|_| Limb {
+                let mut raw_limbs: [Limb<Fp>; FQ_NUM_LIMBS] = core::array::from_fn(|_| Limb {
                     value: Value::known(Fp::ZERO),
                     cell: None,
                 });
@@ -551,7 +570,7 @@ impl NonNativeFqChip {
             |mut region| {
                 let neg_val = a.to_big().map(|a_int| &fq_mod_big - &a_int);
 
-                let mut result_limbs: [Limb; FQ_NUM_LIMBS] = array::from_fn(|i| {
+                let mut result_limbs: [Limb<Fp>; FQ_NUM_LIMBS] = array::from_fn(|i| {
                     let lv = neg_val.clone().map(|r| {
                         let l = &r / &limb_base_big.pow(i as u32);
                         big_to_fp(&(&l % &limb_base_big))
@@ -1233,7 +1252,7 @@ impl NonNativeFqChip {
                 }
 
                 // ── Return result ──
-                let result_limbs: [Limb; FQ_NUM_LIMBS] = array::from_fn(|i| Limb {
+                let result_limbs: [Limb<Fp>; FQ_NUM_LIMBS] = array::from_fn(|i| Limb {
                     value: r_limb_vals[i],
                     cell: r_cells[i],
                 });
@@ -1267,7 +1286,7 @@ impl NonNativeFqChip {
         });
 
         let limb_base_big = big_limb_base();
-        let inv_limbs: [Limb; FQ_NUM_LIMBS] = array::from_fn(|i| {
+        let inv_limbs: [Limb<Fp>; FQ_NUM_LIMBS] = array::from_fn(|i| {
             let lv = inv_big
                 .clone()
                 .map(|r| big_to_fp(&(&r / &limb_base_big.pow(i as u32) % &limb_base_big)));
@@ -1362,7 +1381,7 @@ impl NonNativeFqChip {
         &self,
         mut layouter: impl Layouter<Fp>,
         value: &FqElement,
-    ) -> Result<Vec<Limb>, ErrorFront> {
+    ) -> Result<Vec<Limb<Fp>>, ErrorFront> {
         layouter.assign_region(
             || "fq_decompose_bits",
             |mut region| {
@@ -1438,7 +1457,7 @@ impl NonNativeFqChip {
     pub fn range_check(
         &self,
         mut layouter: impl Layouter<Fp>,
-        value: &Limb,
+        value: &Limb<Fp>,
         num_bits: usize,
     ) -> Result<(), ErrorFront> {
         assert!(

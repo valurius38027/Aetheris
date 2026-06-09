@@ -70,8 +70,14 @@ impl std::fmt::Display for AccumulatorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadPrefix => write!(f, "inner proof has wrong wire-format prefix"),
-            Self::InnerProofInvalid(h) => write!(f, "inner proof verify_conservation failed (blake3: {})", h),
-            Self::DepthOverflow => write!(f, "accumulator depth would exceed {}", MAX_ACCUMULATOR_DEPTH),
+            Self::InnerProofInvalid(h) => {
+                write!(f, "inner proof verify_conservation failed (blake3: {})", h)
+            }
+            Self::DepthOverflow => write!(
+                f,
+                "accumulator depth would exceed {}",
+                MAX_ACCUMULATOR_DEPTH
+            ),
             Self::BadWireFormat(s) => write!(f, "malformed accumulator wire bytes: {}", s),
         }
     }
@@ -180,9 +186,7 @@ impl AccumulatorIPA {
         if in_len + out_len > MAX_PROOF_IOPS {
             return Err(AccumulatorError::InnerProofInvalid(format!(
                 "proof shape too large: in={} out={} (max {} total)",
-                in_len,
-                out_len,
-                MAX_PROOF_IOPS
+                in_len, out_len, MAX_PROOF_IOPS
             )));
         }
 
@@ -193,9 +197,9 @@ impl AccumulatorIPA {
         //    additionally folds commitments into `inner_proof_hash_eff`
         //    (step 5) for defense-in-depth (Phase 1.5 / ISSUE-1.4.E).
         if !Halo2PastaBackend::verify_conservation(proof, output_commitments, public_amount) {
-            return Err(AccumulatorError::InnerProofInvalid(
-                hex::encode(blake3::hash(proof).as_bytes()),
-            ));
+            return Err(AccumulatorError::InnerProofInvalid(hex::encode(
+                blake3::hash(proof).as_bytes(),
+            )));
         }
 
         // 5. inner_proof_hash_eff = blake3(proof || commitment_hash || public_amount_le)
@@ -215,7 +219,8 @@ impl AccumulatorIPA {
         // Mix the two 32-byte hashes via XOR (preserves preimage resistance;
         // both inputs are uniformly random 32-byte strings).
         for i in 0..32 {
-            inner_proof_hash_eff[i] = inner_proof_hash.as_bytes()[i] ^ commitment_hasher.as_bytes()[i];
+            inner_proof_hash_eff[i] =
+                inner_proof_hash.as_bytes()[i] ^ commitment_hasher.as_bytes()[i];
         }
 
         // 6. pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)
@@ -357,9 +362,9 @@ impl AccumulatorIPA {
     ///
     /// Returns `Err` if no signature is attached.
     pub fn to_signed_bytes(&self) -> Result<Vec<u8>, AccumulatorError> {
-        let sig = self.signature.ok_or_else(|| {
-            AccumulatorError::BadWireFormat("no signature attached".to_string())
-        })?;
+        let sig = self
+            .signature
+            .ok_or_else(|| AccumulatorError::BadWireFormat("no signature attached".to_string()))?;
         let mut out = Vec::with_capacity(SIGNED_ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 64 + 4);
         out.extend_from_slice(SIGNED_ACCUMULATOR_WIRE_PREFIX);
         if bool::from(self.Q.is_identity()) {
@@ -386,18 +391,19 @@ impl AccumulatorIPA {
         let signed_len = SIGNED_ACCUMULATOR_WIRE_PREFIX.len() + 32 + 32 + 64 + 4; // 160
 
         // Determine format
-        let (prefix, is_signed) = if bytes.len() == signed_len && bytes.starts_with(SIGNED_ACCUMULATOR_WIRE_PREFIX) {
-            (SIGNED_ACCUMULATOR_WIRE_PREFIX, true)
-        } else if bytes.len() == unsigned_len && bytes.starts_with(ACCUMULATOR_WIRE_PREFIX) {
-            (ACCUMULATOR_WIRE_PREFIX, false)
-        } else {
-            return Err(AccumulatorError::BadWireFormat(format!(
-                "expected {}B (unsigned) or {}B (signed) with correct prefix, got {}B",
-                unsigned_len,
-                signed_len,
-                bytes.len()
-            )));
-        };
+        let (prefix, is_signed) =
+            if bytes.len() == signed_len && bytes.starts_with(SIGNED_ACCUMULATOR_WIRE_PREFIX) {
+                (SIGNED_ACCUMULATOR_WIRE_PREFIX, true)
+            } else if bytes.len() == unsigned_len && bytes.starts_with(ACCUMULATOR_WIRE_PREFIX) {
+                (ACCUMULATOR_WIRE_PREFIX, false)
+            } else {
+                return Err(AccumulatorError::BadWireFormat(format!(
+                    "expected {}B (unsigned) or {}B (signed) with correct prefix, got {}B",
+                    unsigned_len,
+                    signed_len,
+                    bytes.len()
+                )));
+            };
 
         let q_start = prefix.len();
         let mut q_bytes = [0u8; 32];
@@ -406,7 +412,10 @@ impl AccumulatorIPA {
         let Q = if q_bytes == [0u8; 32] {
             EpAffine::identity()
         } else {
-            ct_option_to_err(EpAffine::from_bytes(&q_bytes), "Q is not a valid Pallas point")?
+            ct_option_to_err(
+                EpAffine::from_bytes(&q_bytes),
+                "Q is not a valid Pallas point",
+            )?
         };
 
         let t_start = q_start + 32;
@@ -433,7 +442,12 @@ impl AccumulatorIPA {
         depth_bytes.copy_from_slice(&bytes[d_start..d_start + 4]);
         let depth = u32::from_le_bytes(depth_bytes);
 
-        Ok(Self { Q, transcript, depth, signature })
+        Ok(Self {
+            Q,
+            transcript,
+            depth,
+            signature,
+        })
     }
 }
 
@@ -487,7 +501,10 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
         let mut input64 = [0u8; 64];
         input64[..32].copy_from_slice(&mixed32);
         let c = Fp::from_uniform_bytes(&input64);
-        debug_assert!(!bool::from(c.is_zero()), "uniform sample is zero (impossible)");
+        debug_assert!(
+            !bool::from(c.is_zero()),
+            "uniform sample is zero (impossible)"
+        );
         let c_q = fp_to_fq(&c);
         debug_assert!(!bool::from(c_q.is_zero()), "Fq bridge produced zero");
         let p_proj = EpAffine::generator() * c_q;
@@ -588,7 +605,10 @@ mod tests {
         bad_proof.extend_from_slice(&0u16.to_le_bytes());
         bad_proof.extend_from_slice(&[0xFFu8; 32]);
         let result = acc.accumulate(&bad_proof, &[], 0);
-        assert!(matches!(result, Err(AccumulatorError::InnerProofInvalid(_))));
+        assert!(matches!(
+            result,
+            Err(AccumulatorError::InnerProofInvalid(_))
+        ));
     }
 
     #[test]

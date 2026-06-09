@@ -56,7 +56,10 @@ impl GrainLFSR {
         set_bits(30, 10, r_f);
         set_bits(40, 10, r_p);
 
-        let mut grain = Self { state, next_bit: STATE_BITS };
+        let mut grain = Self {
+            state,
+            next_bit: STATE_BITS,
+        };
         for _ in 0..20 {
             grain.load_next_8_bits();
             grain.next_bit = STATE_BITS;

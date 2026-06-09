@@ -17,7 +17,7 @@ pub const BLAKE2B_BLOCK_BYTES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct TranscriptByte {
-    pub limb: Limb,
+    pub limb: Limb<Fp>,
 }
 
 #[derive(Clone, Debug)]
