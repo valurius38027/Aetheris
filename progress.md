@@ -2911,9 +2911,61 @@ The final multi-agent review approved the multiplication gadget after carry rang
 - Reviewer 2：✅ APPROVED（5 个方面：原生约束上无守卫、剩余守卫正确、列隔离、门度数/行边界、`without_witnesses` 转发）
 
 #### 剩余工作:
-- **§1.12d4**（Challenge255 派生电路）——下一步
-- **§1.12d5**（IpaVerifierCircuit 集成）
-- **§1.12e**（优化与基准测试）
+- B-2 完成后，**P0 协议安全修复** 成为最高优先级（详见 `mainnet_execution_plan.md` P0 章节）
+- §1.12d4/d5 已在 B-2 中以原生 Vesta 方式实现，无需单独步骤
+
+---
+
+## Stage 42 — P0 协议安全修复 + 路线重整（2026-06-09）
+
+**Scope**: 终裁 §4 重排优先级 —— P0（协议完整性）优先于 P1（架构升级）。B-2（IPA 积累电路）已完成作为架构前提，现在回到协议安全。
+
+**触发条件**: B-2 完成 + ISSUE_IPA_PLONK_INTEGRATION 关闭（h_eval 约束已激活）+
+`protocol_design_ruling.md` §4 优先级裁定
+
+### 已完成（B-2 前置）
+
+| 项 | 状态 | 说明 |
+|---|--------|--------|
+| IPA-PLONK h_eval 约束 | ✅ Stage 40 | `vanishing/verifier.rs:142-144` 活跃，69/69 ZKP 测试通过 |
+| B-2: Native IPA 积累电路 | ✅ Stage 41 | S0-S11 完整，155/155 递归测试通过 |
+| B-2 清理: 删除旧文件 | ✅ | `ipa_fold.rs`, `ipa_verifier_circuit.rs`, `non_native_mul.rs` 已删除 |
+
+### P0 Sprint（当前执行）
+
+按 小→中→大 顺序：
+
+| # | 项目 | 范围 | 文件 | 优先级 |
+|---|------|------|------|--------|
+| P0.1 | A-1: running_sum z_64=0 约束 | **小型** ~30 行 | `aetheris-zkp/src/halo2_pasta.rs:198-269` | 🔴 **最高** — 当前 soundness hole |
+| P0.2 | H-1: state_root 拒绝负测试 | **小型** ~20 行 | `aetheris-node/src/state.rs:373-380` | 🟡 |
+| P0.3 | C-5: nullifier 双花端到端测试 | **小型** ~30 行 | `aetheris-node/src/state.rs:364-371` | 🟡 |
+| P0.4 | A-3: 统一 viewing key 派生 | **中大型** ~200 行 | `aetheris-ffi/src/lib.rs:1190-2188` | 🟠 隐私漏洞 |
+| P0.5 | C-2: membership + nullifier 电路 | **大型** ~500-1000 行 | `aetheris-zkp/src/halo2_pasta.rs` | 🔴 协议完备性 |
+
+### 路线变更
+
+| 变更 | 旧 | 新 |
+|------|-----|-----|
+| 优先级 | Phase 1.12+ 研究级 → B-2 → 下一阶段 | **P0 → B-3 → 剩余 Phase 1** |
+| ISSUE_IPA_PLONK_INTEGRATION.md | 活跃跟踪 | 已关闭（过时，h_eval 已修复） |
+| B-2_plan.md | 执行中 | ✅ 完成，标记为历史 |
+
+### 验证门禁（P0 完成后）
+
+```
+cargo check --workspace                                ✅ 零错误零警告
+cargo test -p aetheris-zkp --lib                       新增范围拒绝测试通过
+cargo test -p aetheris-recursive --lib                 155/155 回归通过
+cargo test -p aetheris-node --lib                      新增 state_root/nullifier 测试通过
+cargo test -p aetheris-ffi --lib -- --test-threads=1   新增 viewing key 测试通过
+```
+
+### 下一步
+
+P0 完成后恢复 Phase 1 剩余：
+1. **B-3**: `aggregate_proofs` IPA 化（替换 Merkle 哈希为 AccumulatorStrategyIPA）
+2. **Phase 1.5-1.16**: IPA 区块集成、Signed Accumulator、P2P Gossip、Recursive Wrapper
 
 ---
 

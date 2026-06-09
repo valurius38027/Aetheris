@@ -1,4 +1,7 @@
-# B-2: Native IPA Accumulation on Vesta
+# B-2: Native IPA Accumulation on Vesta — ✅ COMPLETE
+
+> **Status**: <span style="color:green">Complete</span> (commit 59cd2c9)
+> **Test result**: 155/155 passed, workspace clean
 
 **Binding document**: `protocol_design_ruling.md` §1.1, §4 P1
 **Supersedes**: `docs/in_circuit_ipa_verifier.md` (§1.12 NonNativeChip-based design)
