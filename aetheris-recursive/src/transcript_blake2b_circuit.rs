@@ -6,15 +6,17 @@
 //! feed-forward are still host-expected consistency checks unless explicitly
 //! constrained below.
 
-use ff::Field;
+use std::array;
+
+use ff::{Field, PrimeField};
 use halo2_proofs::{
-    circuit::{Layouter, Value},
+    circuit::{Cell, Layouter, Value},
     halo2curves::pasta::Fp,
     plonk::{Advice, Column, ConstraintSystem, ErrorFront, Expression, Fixed, Selector},
     poly::Rotation,
 };
 
-use crate::non_native_fq::NonNativeFqConfig;
+use crate::non_native_fq::{FqElement, NonNativeFqChip, NonNativeFqConfig, FQ_NUM_LIMBS};
 use crate::transcript_blake2b::BLAKE2B_WORK_WORDS;
 use crate::transcript_blake2b::{Blake2bBlockTrace, BLAKE2B_IV, BLAKE2B_STATE_WORDS};
 use crate::transcript_blake2b_compression::{
@@ -54,6 +56,10 @@ pub struct Blake2bCompressionCircuitConfig {
     pub add_bits: [Column<Advice>; 5],
     pub s_add_bit: Selector,
     pub s_add_pack: Selector,
+    pub squeeze_state: [Column<Advice>; BLAKE2B_STATE_WORDS],
+    pub challenge_limbs: [Column<Advice>; FQ_NUM_LIMBS],
+    pub s_decompose: Selector,
+    pub decompose_shift: Column<Fixed>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +102,7 @@ pub struct AssignedBlake2bTrace {
 pub struct Blake2bCompressionCircuitChip {
     pub compression: Blake2bCompressionCircuitConfig,
     pub words: TranscriptWordChip,
+    pub fq: NonNativeFqChip,
 }
 
 impl Blake2bCompressionCircuitChip {
@@ -126,6 +133,10 @@ impl Blake2bCompressionCircuitChip {
         let add_bits = [0; 5].map(|_| meta.advice_column());
         let s_add_bit = meta.selector();
         let s_add_pack = meta.selector();
+        let squeeze_state = [0; BLAKE2B_STATE_WORDS].map(|_| meta.advice_column());
+        let challenge_limbs = [0; FQ_NUM_LIMBS].map(|_| meta.advice_column());
+        let s_decompose = meta.selector();
+        let decompose_shift = meta.fixed_column();
         state.iter().for_each(|col| meta.enable_equality(*col));
         message.iter().for_each(|col| meta.enable_equality(*col));
         round_message_pair
@@ -153,6 +164,12 @@ impl Blake2bCompressionCircuitChip {
             .iter()
             .for_each(|col| meta.enable_equality(*col));
         add_bits
+            .iter()
+            .for_each(|col| meta.enable_equality(*col));
+        squeeze_state
+            .iter()
+            .for_each(|col| meta.enable_equality(*col));
+        challenge_limbs
             .iter()
             .for_each(|col| meta.enable_equality(*col));
         meta.enable_equality(round_lane);
@@ -335,6 +352,15 @@ impl Blake2bCompressionCircuitChip {
             constraints
         });
 
+        meta.create_gate("blake2b_decompose", |meta| {
+            let s = meta.query_selector(s_decompose);
+            let target = meta.query_advice(step_expected[0], Rotation::cur());
+            let t1 = meta.query_advice(challenge_limbs[0], Rotation::cur());
+            let t2 = meta.query_advice(challenge_limbs[1], Rotation::cur());
+            let shift = meta.query_fixed(decompose_shift, Rotation::cur());
+            vec![s * (target - t1 - t2 * shift)]
+        });
+
         Blake2bCompressionCircuitConfig {
             state,
             message,
@@ -362,6 +388,10 @@ impl Blake2bCompressionCircuitChip {
             add_bits,
             s_add_bit,
             s_add_pack,
+            squeeze_state,
+            challenge_limbs,
+            s_decompose,
+            decompose_shift,
         }
     }
 
@@ -370,8 +400,10 @@ impl Blake2bCompressionCircuitChip {
         word_config: TranscriptWordConfig,
         fq_config: NonNativeFqConfig,
     ) -> Self {
+        let fq = NonNativeFqChip::new(fq_config.clone());
         Self {
             compression,
+            fq,
             words: TranscriptWordChip::new(word_config, fq_config),
         }
     }
@@ -1752,12 +1784,592 @@ impl Blake2bCompressionCircuitChip {
             work_out,
         })
     }
+
+    /// Copy the main chain state at `squeeze_point` to squeeze_state columns
+    /// with an explicit equality gate, then assign the squeeze block's padded
+    /// final block compression, returning the assigned state row whose
+    /// state_out cells hold the 64-byte squeeze digest.
+    pub fn assign_and_constrain_squeeze_block(
+        &self,
+        mut layouter: impl Layouter<Fp>,
+        squeeze_state_in: &[u64; BLAKE2B_STATE_WORDS],
+        squeeze_block: &Blake2bBlockTrace,
+        main_state_out_cells: &[Limb; BLAKE2B_STATE_WORDS],
+        label: &str,
+    ) -> Result<AssignedBlake2bStateRow, ErrorFront> {
+        // 1) Copy main state to squeeze_state columns via constrain_equal.
+        let squeeze_state_cells = layouter.assign_region(
+            || format!("squeeze_state_copy_{}", label),
+            |mut region| {
+                let mut cells = Vec::with_capacity(BLAKE2B_STATE_WORDS);
+                for i in 0..BLAKE2B_STATE_WORDS {
+                    let squeeze_cell = region.assign_advice(
+                        || format!("squeeze_state_{}_{}", label, i),
+                        self.compression.squeeze_state[i],
+                        0,
+                        || Value::known(Fp::from(squeeze_state_in[i])),
+                    )?;
+                    if let Some(main_cell) = main_state_out_cells[i].cell {
+                        region.constrain_equal(main_cell, squeeze_cell.cell())?;
+                    }
+                    cells.push(squeeze_cell.cell());
+                }
+                Ok(cells)
+            },
+        )?;
+
+        // 2) Compute the squeeze block compression trace.
+        let (squeeze_state_out, squeeze_rounds) =
+            crate::transcript_blake2b_compression::compress_block(
+                squeeze_state_in, squeeze_block,
+            );
+
+        // 3) Assign a state row for the squeeze block using the MAIN state
+        //    columns (reused since regions are independent).
+        let assigned_squeeze = self.assign_state_row(
+            layouter.namespace(|| format!("squeeze_state_row_{}", label)),
+            squeeze_block,
+            squeeze_state_in,
+            &squeeze_state_out,
+            &format!("squeeze_state_row_{}", label),
+        )?;
+
+        // 4) Link the squeeze_state cells to the state_in cells.
+        for i in 0..BLAKE2B_STATE_WORDS {
+            let sq_cell = squeeze_state_cells[i];
+            if let Some(st_cell) = assigned_squeeze.state_in[i].cell {
+                layouter.assign_region(
+                    || format!("link_sq_state_to_row_{}_{}", label, i),
+                    |mut region| region.constrain_equal(sq_cell, st_cell),
+                )?;
+            }
+        }
+
+        // 5) Assign round / mix / step trace for the squeeze block.
+        self.assign_round_placeholder(
+            layouter.namespace(|| format!("squeeze_placeholder_{}", label)),
+            0,
+            &format!("squeeze_placeholder_{}", label),
+        )?;
+
+        let mut assigned_rounds = Vec::new();
+        for round in &squeeze_rounds {
+            let assigned_round = self.assign_round_trace_row(
+                layouter.namespace(|| {
+                    format!("squeeze_round_{}_{}", label, round.round_index)
+                }),
+                squeeze_block,
+                round,
+                &format!("squeeze_round_{}_{}", label, round.round_index),
+            )?;
+
+            self.constrain_round_message_pair(
+                layouter.namespace(|| {
+                    format!("squeeze_round_msg_{}_{}", label, round.round_index)
+                }),
+                &assigned_squeeze,
+                &assigned_round,
+                round,
+            )?;
+
+            let mut assigned_mixes = Vec::new();
+            for mix in &round.mixes {
+                let assigned_mix = self.assign_mix_trace_row(
+                    layouter.namespace(|| {
+                        format!("squeeze_mix_{}_{}_{}", label, round.round_index, mix.mix_index)
+                    }),
+                    mix,
+                    &format!("squeeze_mix_{}_{}_{}", label, round.round_index, mix.mix_index),
+                )?;
+
+                self.constrain_mix_message_pair(
+                    layouter.namespace(|| {
+                        format!("squeeze_mix_msg_{}_{}_{}", label, round.round_index, mix.mix_index)
+                    }),
+                    &assigned_squeeze,
+                    &assigned_mix,
+                    mix,
+                    round.round_index,
+                )?;
+
+                assigned_mixes.push(assigned_mix);
+            }
+
+            // Link first/last mix to round boundary.
+            if let Some(first_mix) = assigned_mixes.first() {
+                self.constrain_mix_to_round_boundary(
+                    layouter.namespace(|| format!("squeeze_mix_round_in_{}", label)),
+                    &assigned_round,
+                    first_mix,
+                    true,
+                )?;
+            }
+            if let Some(last_mix) = assigned_mixes.last() {
+                self.constrain_mix_to_round_boundary(
+                    layouter.namespace(|| format!("squeeze_mix_round_out_{}", label)),
+                    &assigned_round,
+                    last_mix,
+                    false,
+                )?;
+            }
+            if !assigned_mixes.is_empty() {
+                self.constrain_mix_chaining(
+                    layouter.namespace(|| format!("squeeze_mix_chain_{}", label)),
+                    &assigned_mixes,
+                )?;
+            }
+
+            // Within each mix, assign and constrain steps.
+            for (mix, assigned_mix) in round.mixes.iter().zip(&assigned_mixes) {
+                let mut assigned_steps = Vec::new();
+                for step in &mix.steps {
+                    let assigned_step = self.assign_mix_step_row(
+                        layouter.namespace(|| {
+                            format!("squeeze_step_{}_{}_{}", label, mix.mix_index, step.step_index)
+                        }),
+                        step,
+                        &format!("squeeze_step_{}_{}_{}", label, mix.mix_index, step.step_index),
+                    )?;
+                    assigned_steps.push(assigned_step);
+                }
+                if let Some(first_step) = assigned_steps.first() {
+                    self.constrain_mix_boundary(
+                        layouter.namespace(|| format!("squeeze_step_boundary_in_{}", label)),
+                        assigned_mix,
+                        first_step,
+                        true,
+                    )?;
+                }
+                if let Some(last_step) = assigned_steps.last() {
+                    self.constrain_mix_boundary(
+                        layouter.namespace(|| format!("squeeze_step_boundary_out_{}", label)),
+                        assigned_mix,
+                        last_step,
+                        false,
+                    )?;
+                }
+                if !assigned_steps.is_empty() {
+                    self.constrain_mix_step_chaining(
+                        layouter.namespace(|| format!("squeeze_step_chain_{}", label)),
+                        &assigned_steps,
+                    )?;
+                }
+                for (assigned_step, step) in assigned_steps.iter().zip(&mix.steps) {
+                    self.constrain_mix_step_unchanged_lanes(
+                        layouter.namespace(|| {
+                            format!("squeeze_unchanged_{}_{}", mix.mix_index, step.step_index)
+                        }),
+                        assigned_step,
+                        step,
+                        mix.mix_index,
+                    )?;
+                    self.constrain_mix_step_expected_output(
+                        layouter.namespace(|| {
+                            format!("squeeze_expected_{}_{}", mix.mix_index, step.step_index)
+                        }),
+                        assigned_step,
+                        step,
+                        mix.mix_index,
+                    )?;
+                    if step.rotation.is_some() {
+                        self.constrain_mix_step_rotation(
+                            layouter.namespace(|| {
+                                format!("squeeze_rotate_{}_{}", mix.mix_index, step.step_index)
+                            }),
+                            assigned_step,
+                            step,
+                            mix.mix_index,
+                        )?;
+                        self.constrain_mix_step_rotation_xor_native(
+                            layouter.namespace(|| {
+                                format!("squeeze_rotate_native_{}_{}", mix.mix_index, step.step_index)
+                            }),
+                            assigned_step,
+                            step,
+                            mix.mix_index,
+                        )?;
+                    }
+                    if step.addend_lane.is_some() {
+                        self.constrain_mix_step_wrapping_add_native(
+                            layouter.namespace(|| {
+                                format!("squeeze_wrapping_add_{}_{}", mix.mix_index, step.step_index)
+                            }),
+                            assigned_step,
+                            step,
+                            mix.mix_index,
+                        )?;
+                    }
+                }
+            }
+
+            assigned_rounds.push(assigned_round);
+        }
+
+        // 6) Link round chaining.
+        self.constrain_round_chaining(
+            layouter.namespace(|| format!("squeeze_round_chain_{}", label)),
+            &assigned_rounds,
+        )?;
+
+        // 7) Constrain feed-forward XOR for the squeeze block.
+        self.constrain_feed_forward_xor(
+            layouter.namespace(|| format!("squeeze_feed_forward_{}", label)),
+            &assigned_squeeze,
+            assigned_rounds.last().expect("squeeze must have rounds"),
+            squeeze_state_in,
+            &squeeze_rounds.last().expect("squeeze must have rounds").work_out,
+            &squeeze_state_out,
+        )?;
+
+        self.constrain_initial_round_state(
+            layouter.namespace(|| format!("squeeze_init_round_{}", label)),
+            &assigned_squeeze,
+            &assigned_rounds[0],
+        )?;
+        self.constrain_initial_round_metadata(
+            layouter.namespace(|| format!("squeeze_init_meta_{}", label)),
+            squeeze_block,
+            &assigned_rounds[0],
+            &format!("squeeze_init_meta_{}", label),
+        )?;
+
+        Ok(assigned_squeeze)
+    }
+
+    /// Constrain `target = term1 + term2 * shift` via the `s_decompose` gate.
+    /// Links term cells via `constrain_equal`. If `equal_to` is Some, also
+    /// constrains the target cell equal to it.
+    fn decompose_2terms(
+        &self,
+        mut layouter: impl Layouter<Fp>,
+        target_value: Fp,
+        term1: &Limb,
+        term2: &Limb,
+        shift: Fp,
+        equal_to: Option<Cell>,
+    ) -> Result<Limb, ErrorFront> {
+        layouter.assign_region(
+            || "decompose",
+            |mut region| {
+                self.compression.s_decompose.enable(&mut region, 0)?;
+
+                let target = region.assign_advice(
+                    || "t",
+                    self.compression.step_expected[0],
+                    0,
+                    || Value::known(target_value),
+                )?;
+
+                let t1 = region.assign_advice(
+                    || "a",
+                    self.compression.challenge_limbs[0],
+                    0,
+                    || term1.value,
+                )?;
+                if let Some(c) = term1.cell {
+                    region.constrain_equal(t1.cell(), c)?;
+                }
+
+                let t2 = region.assign_advice(
+                    || "b",
+                    self.compression.challenge_limbs[1],
+                    0,
+                    || term2.value,
+                )?;
+                if let Some(c) = term2.cell {
+                    region.constrain_equal(t2.cell(), c)?;
+                }
+
+                region.assign_fixed(
+                    || "s",
+                    self.compression.decompose_shift,
+                    0,
+                    || Value::known(shift),
+                )?;
+
+                if let Some(c) = equal_to {
+                    region.constrain_equal(target.cell(), c)?;
+                }
+
+                Ok(Limb {
+                    value: Value::known(target_value),
+                    cell: Some(target.cell()),
+                })
+            },
+        )
+    }
+
+    /// Constrain that the challenge scalar is correctly derived from the
+    /// squeeze block's 64-byte output via from_uniform_bytes.
+    ///
+    /// Links the 8 state_out words (held in `squeeze_state_row`) to the
+    /// B_lo / B_hi limb witnesses using range-checked sub-word decomposition,
+    /// then computes `challenge = B_lo + B_hi * r (mod Fq)` where r = 2^255 mod Fq.
+    pub fn constrain_challenge_scalar(
+        &self,
+        mut layouter: impl Layouter<Fp>,
+        squeeze_state_row: &AssignedBlake2bStateRow,
+        output_words_u64: &[u64; 8],
+        challenge_limb_values: &[Fp; FQ_NUM_LIMBS],
+        label: &str,
+    ) -> Result<FqElement, ErrorFront> {
+        let (b_lo_limbs, b_hi_limbs) = split_512_at_255(output_words_u64);
+
+        let _ = label;
+        let pow2_1 = Fp::from(2u64);
+        let pow2_20 = Fp::from(1u64 << 20);
+        let pow2_21 = Fp::from(1u64 << 21);
+        let pow2_22 = Fp::from(1u64 << 22);
+        let pow2_23 = Fp::from(1u64 << 23);
+        let pow2_41 = Fp::from(1u64 << 41);
+        let pow2_42 = Fp::from(1u64 << 42);
+        let pow2_43 = Fp::from(1u64 << 43);
+        let pow2_44 = Fp::from(1u64 << 44);
+        let pow2_62 = Fp::from(1u64 << 62);
+        let pow2_63 = Fp::from(1u64 << 63);
+        let pow2_64 = Fp::from(1u64 << 32).square();
+
+        // ── Boundary word descriptors ──
+        struct Bd { wi: usize, mask: u64, low_bits: usize, high_bits: usize, shift: Fp }
+        let boundaries = [
+            Bd { wi: 1, mask: 0x1F_FFFF, low_bits: 21, high_bits: 43, shift: pow2_21 },
+            Bd { wi: 2, mask: 0x3FF_FFFF_FFFF, low_bits: 42, high_bits: 22, shift: pow2_42 },
+            Bd { wi: 3, mask: 0x7FFF_FFFF_FFFF_FFFF, low_bits: 63, high_bits: 1, shift: pow2_63 },
+            Bd { wi: 5, mask: 0xF_FFFF, low_bits: 20, high_bits: 44, shift: pow2_20 },
+            Bd { wi: 6, mask: 0x1FF_FFFF_FFFF, low_bits: 41, high_bits: 23, shift: pow2_41 },
+            Bd { wi: 7, mask: 0x3FFF_FFFF_FFFF_FFFF, low_bits: 62, high_bits: 2, shift: pow2_62 },
+        ];
+
+        // ── Witness sub-word components ──
+        let mut low: Vec<Limb> = Vec::with_capacity(6);
+        let mut high: Vec<Limb> = Vec::with_capacity(6);
+
+        for bd in &boundaries {
+            let wi_val = output_words_u64[bd.wi];
+            let low_val = wi_val & bd.mask;
+            let high_val = wi_val >> bd.low_bits;
+
+            let low_limb = layouter.assign_region(
+                || "low",
+                |mut region| {
+                    let c = region.assign_advice(
+                        || "v",
+                        self.compression.challenge_limbs[0],
+                        0,
+                        || Value::known(Fp::from(low_val)),
+                    )?;
+                    Ok(Limb { value: Value::known(Fp::from(low_val)), cell: Some(c.cell()) })
+                },
+            )?;
+            self.fq.range_check(layouter.namespace(|| "rc_l"), &low_limb, bd.low_bits)?;
+
+            let high_limb = layouter.assign_region(
+                || "high",
+                |mut region| {
+                    let c = region.assign_advice(
+                        || "v",
+                        self.compression.challenge_limbs[1],
+                        0,
+                        || Value::known(Fp::from(high_val)),
+                    )?;
+                    Ok(Limb { value: Value::known(Fp::from(high_val)), cell: Some(c.cell()) })
+                },
+            )?;
+            self.fq.range_check(layouter.namespace(|| "rc_h"), &high_limb, bd.high_bits)?;
+
+            self.decompose_2terms(
+                layouter.namespace(|| "dec"),
+                Fp::from(wi_val),
+                &low_limb,
+                &high_limb,
+                bd.shift,
+                squeeze_state_row.state_out[bd.wi].cell,
+            )?;
+
+            low.push(low_limb);
+            high.push(high_limb);
+        }
+
+        // ── B_lo limbs via decompose gate ──
+        // B_lo[0] = w0 + low21(w1) * 2^64
+        let b_lo_0 = self.decompose_2terms(
+            layouter.namespace(|| "b_lo_0"),
+            b_lo_limbs[0],
+            &Limb { value: squeeze_state_row.state_out[0].value, cell: squeeze_state_row.state_out[0].cell },
+            &low[0],
+            pow2_64,
+            None,
+        )?;
+
+        // B_lo[1] = high43(w1) + low42(w2) * 2^43
+        let b_lo_1 = self.decompose_2terms(
+            layouter.namespace(|| "b_lo_1"),
+            b_lo_limbs[1],
+            &high[0],
+            &low[1],
+            pow2_43,
+            None,
+        )?;
+
+        // B_lo[2] = high22(w2) + low63(w3) * 2^22
+        let b_lo_2 = self.decompose_2terms(
+            layouter.namespace(|| "b_lo_2"),
+            b_lo_limbs[2],
+            &high[1],
+            &low[2],
+            pow2_22,
+            None,
+        )?;
+
+        // ── B_hi limbs via decompose gate ──
+        // B_hi[0] = high1(w3) + w4 * 2^1 + low20(w5) * 2^65
+        // Chain: tmp = w4 + low20 * 2^64
+        let tmp_val = Fp::from(output_words_u64[4]) + Fp::from(output_words_u64[5] & 0xF_FFFF) * pow2_64;
+        let tmp = self.decompose_2terms(
+            layouter.namespace(|| "b_hi_0_tmp"),
+            tmp_val,
+            &Limb { value: squeeze_state_row.state_out[4].value, cell: squeeze_state_row.state_out[4].cell },
+            &low[3],
+            pow2_64,
+            None,
+        )?;
+        // B_hi[0] = high1(w3) + tmp * 2^1
+        let b_hi_0 = self.decompose_2terms(
+            layouter.namespace(|| "b_hi_0"),
+            b_hi_limbs[0],
+            &high[2],
+            &tmp,
+            pow2_1,
+            None,
+        )?;
+
+        // B_hi[1] = high44(w5) + low41(w6) * 2^44
+        let b_hi_1 = self.decompose_2terms(
+            layouter.namespace(|| "b_hi_1"),
+            b_hi_limbs[1],
+            &high[3],
+            &low[4],
+            pow2_44,
+            None,
+        )?;
+
+        // B_hi[2] = high23(w6) + low62(w7) * 2^23
+        let b_hi_2 = self.decompose_2terms(
+            layouter.namespace(|| "b_hi_2"),
+            b_hi_limbs[2],
+            &high[4],
+            &low[5],
+            pow2_23,
+            None,
+        )?;
+
+        // ── Build FqElements ──
+        let b_lo = FqElement::new([b_lo_0, b_lo_1, b_lo_2]);
+        let b_hi = FqElement::new([b_hi_0, b_hi_1, b_hi_2]);
+
+        // ── Witness challenge scalar ──
+        let challenge = self.fq.add(
+            layouter.namespace(|| "challenge_id"),
+            &FqElement::new(array::from_fn(|i| Limb {
+                value: Value::known(challenge_limb_values[i]),
+                cell: None,
+            })),
+            &FqElement::new(array::from_fn(|_i| Limb {
+                value: Value::known(Fp::ZERO),
+                cell: None,
+            })),
+        )?;
+
+        // ── Challenge = B_lo + B_hi * r (mod Fq) ──
+        let r_limbs = compute_r_limbs();
+        let r_el = FqElement::new(array::from_fn(|i| Limb {
+            value: Value::known(r_limbs[i]),
+            cell: None,
+        }));
+        let product = self.fq.mul(
+            layouter.namespace(|| "mul_b_hi_r"),
+            &b_hi,
+            &r_el,
+        )?;
+        let result = self.fq.add(
+            layouter.namespace(|| "add_b_lo_product"),
+            &b_lo,
+            &product,
+        )?;
+        self.fq.constrain_equal(
+            layouter.namespace(|| "constrain_challenge"),
+            &result,
+            &challenge,
+        )?;
+
+        Ok(challenge)
+    }
+}
+
+/// Split a 512-bit value (8 × u64 LE) into low (bits 0..254) and high
+/// (bits 255..509) halves, each decomposed into 3 × 85-bit Fp limbs.
+fn split_512_at_255(words: &[u64; 8]) -> ([Fp; FQ_NUM_LIMBS], [Fp; FQ_NUM_LIMBS]) {
+    use num_bigint::BigUint;
+    use num_traits::Zero;
+
+    let mut full = BigUint::zero();
+    for (i, w) in words.iter().copied().enumerate() {
+        full += BigUint::from(w) << (64 * i);
+    }
+
+    let mask = (BigUint::from(1u64) << 85) - 1u64;
+
+    let lo = &full & ((BigUint::from(1u64) << 255) - 1u64);
+    let hi = (&full >> 255) & ((BigUint::from(1u64) << 255) - 1u64);
+
+    let to_limbs = |val: BigUint| -> [Fp; FQ_NUM_LIMBS] {
+        let mut remaining = val;
+        array::from_fn(|_| {
+            let limb_val: BigUint = &remaining & &mask;
+            remaining >>= 85;
+            let bytes = limb_val.to_bytes_le();
+            let mut repr = <Fp as PrimeField>::Repr::default();
+            repr.as_mut()[..bytes.len()].copy_from_slice(&bytes);
+            Fp::from_repr(repr).unwrap()
+        })
+    };
+
+    (to_limbs(lo), to_limbs(hi))
+}
+
+/// Compute r = 2^255 mod Fq as 3 × 85-bit Fp limbs.
+/// Pallas Fq = 0x40000000000000000000000000000000224698FC0994A8DD8C46EB2100000001
+fn compute_r_limbs() -> [Fp; FQ_NUM_LIMBS] {
+    use num_bigint::BigUint;
+
+    // Pallas Fq in little-endian bytes
+    let fq_bytes: [u8; 32] = [
+        0x01, 0x00, 0x00, 0x00, 0x21, 0xEB, 0x46, 0x8C,
+        0xDD, 0xA8, 0x94, 0x09, 0xFC, 0x98, 0x46, 0x22,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+    ];
+    let fq = BigUint::from_bytes_le(&fq_bytes);
+    let two_pow_255 = BigUint::from(1u64) << 255;
+    let r_big = two_pow_255 % fq;
+
+    let mask = (BigUint::from(1u64) << 85) - 1u64;
+    let mut remaining = r_big;
+    array::from_fn(|_| {
+        let limb_val: BigUint = &remaining & &mask;
+        remaining >>= 85;
+        let bytes = limb_val.to_bytes_le();
+        let mut repr = <Fp as PrimeField>::Repr::default();
+        repr.as_mut()[..bytes.len()].copy_from_slice(&bytes);
+        Fp::from_repr(repr).unwrap()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::non_native_fq::NonNativeFqChip;
+    use crate::transcript_blake2b::blake2b_block_trace;
     use crate::transcript_blake2b_compression::blake2b_compression_trace_skeleton;
     use crate::transcript_bytes::TranscriptByteStream;
     use halo2_proofs::{
@@ -1793,6 +2405,8 @@ mod tests {
         corrupt_first_mix_step_rotation16: bool,
         corrupt_first_mix_step_rotation63: bool,
         corrupt_first_feed_forward_state_out: bool,
+        corrupt_native_add_round_2_mix_3: bool,
+        corrupt_native_rotation_round_2_mix_3: bool,
     }
 
     impl Circuit<Fp> for Blake2bCircuit {
@@ -1820,6 +2434,8 @@ mod tests {
                 corrupt_first_mix_step_rotation16: self.corrupt_first_mix_step_rotation16,
                 corrupt_first_mix_step_rotation63: self.corrupt_first_mix_step_rotation63,
                 corrupt_first_feed_forward_state_out: self.corrupt_first_feed_forward_state_out,
+                corrupt_native_add_round_2_mix_3: self.corrupt_native_add_round_2_mix_3,
+                corrupt_native_rotation_round_2_mix_3: self.corrupt_native_rotation_round_2_mix_3,
             }
         }
 
@@ -2027,6 +2643,22 @@ mod tests {
                                             step_override.work_out[4].wrapping_add(1);
                                     }
                                 }
+                                if i == 0 && round.round_index == 2 && mix.mix_index == 3 {
+                                    if self.corrupt_native_add_round_2_mix_3
+                                        && step.step_index == 0
+                                    {
+                                        step_override.work_out[step.updated_lane] =
+                                            step_override.work_out[step.updated_lane]
+                                                .wrapping_add(1);
+                                    }
+                                    if self.corrupt_native_rotation_round_2_mix_3
+                                        && step.step_index == 1
+                                    {
+                                        step_override.work_out[step.updated_lane] =
+                                            step_override.work_out[step.updated_lane]
+                                                .wrapping_add(1);
+                                    }
+                                }
                                 assigned_steps.push(chip.assign_mix_step_row(
                                     layouter.namespace(|| {
                                         format!(
@@ -2094,23 +2726,21 @@ mod tests {
                                         step,
                                         mix.mix_index,
                                     )?;
-                                    if round.round_index == 0 && mix.mix_index == 0 {
-                                        chip.constrain_mix_step_rotation_xor_native(
-                                            layouter.namespace(|| {
-                                                format!(
-                                                    "mix_step_rotate_native_{}_{}_{}",
-                                                    round.round_index,
-                                                    mix.mix_index,
-                                                    step.step_index
-                                                )
-                                            }),
-                                            assigned_step,
-                                            step,
-                                            mix.mix_index,
-                                        )?;
-                                    }
+                                    chip.constrain_mix_step_rotation_xor_native(
+                                        layouter.namespace(|| {
+                                            format!(
+                                                "mix_step_rotate_native_{}_{}_{}",
+                                                round.round_index,
+                                                mix.mix_index,
+                                                step.step_index
+                                            )
+                                        }),
+                                        assigned_step,
+                                        step,
+                                        mix.mix_index,
+                                    )?;
                                 }
-                                if step.addend_lane.is_some() && round.round_index == 0 && mix.mix_index == 0 {
+                                if step.addend_lane.is_some() {
                                     chip.constrain_mix_step_wrapping_add_native(
                                         layouter.namespace(|| {
                                             format!(
@@ -2696,8 +3326,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         prover.assert_satisfied();
     }
 
@@ -2824,8 +3456,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "mismatched transcript/compression words must fail"
@@ -2853,8 +3487,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "initial Blake2b state must match the parameterized IV"
@@ -2882,8 +3518,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "initial round metadata lanes must fail on mismatch"
@@ -2911,8 +3549,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "round-0 offset_hi lane must fail on mismatch"
@@ -2940,8 +3580,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "round-0 final-block lane must fail on mismatch"
@@ -2969,8 +3611,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "round message schedule witnesses must fail on mismatch"
@@ -2998,8 +3642,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "mix message schedule witnesses must fail on mismatch"
@@ -3027,8 +3673,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "mix-step chain witnesses must fail on mismatch"
@@ -3056,8 +3704,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "unchanged mix-step lanes must fail on mismatch"
@@ -3085,8 +3735,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "updated mix-step lane delta must fail on mismatch"
@@ -3114,8 +3766,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "first G-step sum relation must fail on mismatch"
@@ -3143,8 +3797,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "add-only G-step relation must fail on mismatch"
@@ -3172,8 +3828,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "rotate32 G-step relation must fail on mismatch"
@@ -3201,8 +3859,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "rotate24 G-step relation must fail on mismatch"
@@ -3230,8 +3890,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "second-half sum G-step relation must fail on mismatch"
@@ -3259,8 +3921,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: true,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "rotate16 G-step relation must fail on mismatch"
@@ -3288,8 +3952,10 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "second-half add-only G-step relation must fail on mismatch"
@@ -3317,11 +3983,75 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: true,
             corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "rotate63 G-step relation must fail on mismatch"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_rejects_native_add_in_mid_round() {
+        let circuit = Blake2bCircuit {
+            bytes: vec![1, 2, 3, 4, 5],
+            corrupt_first_trace_word: false,
+            corrupt_first_round_state_binding: false,
+            corrupt_first_round_metadata_binding: None,
+            corrupt_first_round_message_pair: false,
+            corrupt_first_mix_message_pair: false,
+            corrupt_first_mix_step_chain: false,
+            corrupt_first_mix_step_unchanged_lane: false,
+            corrupt_first_mix_step_delta: false,
+            corrupt_first_mix_step_sum: false,
+            corrupt_first_mix_step_add_only: false,
+            corrupt_first_mix_step_rotation32: false,
+            corrupt_first_mix_step_rotation24: false,
+            corrupt_first_mix_step_sum_second_half: false,
+            corrupt_first_mix_step_add_only_second_half: false,
+            corrupt_first_mix_step_rotation16: false,
+            corrupt_first_mix_step_rotation63: false,
+            corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: true,
+            corrupt_native_rotation_round_2_mix_3: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native wrapping add constraint must reject corrupted output in round 2 mix 3"
+        );
+    }
+
+    #[test]
+    fn blake2b_circuit_rejects_native_rotation_in_mid_round() {
+        let circuit = Blake2bCircuit {
+            bytes: vec![1, 2, 3, 4, 5],
+            corrupt_first_trace_word: false,
+            corrupt_first_round_state_binding: false,
+            corrupt_first_round_metadata_binding: None,
+            corrupt_first_round_message_pair: false,
+            corrupt_first_mix_message_pair: false,
+            corrupt_first_mix_step_chain: false,
+            corrupt_first_mix_step_unchanged_lane: false,
+            corrupt_first_mix_step_delta: false,
+            corrupt_first_mix_step_sum: false,
+            corrupt_first_mix_step_add_only: false,
+            corrupt_first_mix_step_rotation32: false,
+            corrupt_first_mix_step_rotation24: false,
+            corrupt_first_mix_step_sum_second_half: false,
+            corrupt_first_mix_step_add_only_second_half: false,
+            corrupt_first_mix_step_rotation16: false,
+            corrupt_first_mix_step_rotation63: false,
+            corrupt_first_feed_forward_state_out: false,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: true,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "native rotation/XOR constraint must reject corrupted output in round 2 mix 3"
         );
     }
 
@@ -3346,11 +4076,168 @@ mod tests {
             corrupt_first_mix_step_rotation16: false,
             corrupt_first_mix_step_rotation63: false,
             corrupt_first_feed_forward_state_out: true,
+            corrupt_native_add_round_2_mix_3: false,
+            corrupt_native_rotation_round_2_mix_3: false,
         };
-        let prover = MockProver::run(12, &circuit, vec![]).expect("mock prover should run");
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
         assert!(
             prover.verify().is_err(),
             "feed-forward state_out must fail on mismatch"
+        );
+    }
+
+    // ── Squeeze + Challenge test helpers ──
+
+    fn challenge_from_words(words: &[u64; 8]) -> [Fp; FQ_NUM_LIMBS] {
+        let (b_lo, b_hi) = split_512_at_255(words);
+        let r = compute_r_limbs();
+        use num_bigint::BigUint;
+        let mask = (BigUint::from(1u64) << 85) - 1u64;
+        let base: BigUint = BigUint::from(1u64) << 85;
+        let fq_bytes: [u8; 32] = [
+            0x01, 0x00, 0x00, 0x00, 0x21, 0xEB, 0x46, 0x8C,
+            0xDD, 0xA8, 0x94, 0x09, 0xFC, 0x98, 0x46, 0x22,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+        ];
+        let fq = BigUint::from_bytes_le(&fq_bytes);
+        let limb_to_big = |limbs: &[Fp; 3]| -> BigUint {
+            let mut val = BigUint::from(0u32);
+            for (i, limb) in limbs.iter().enumerate() {
+                let bytes = limb.to_repr();
+                let lv = BigUint::from_bytes_le(bytes.as_ref());
+                val = val + lv * base.pow(i as u32);
+            }
+            val
+        };
+        let lo_big = limb_to_big(&b_lo);
+        let hi_big = limb_to_big(&b_hi);
+        let r_big = limb_to_big(&r);
+        let challenge = (lo_big + hi_big * r_big) % fq;
+        let mut remaining = challenge;
+        array::from_fn(|_| {
+            let limb_val: BigUint = &remaining & &mask;
+            remaining >>= 85;
+            let bytes = limb_val.to_bytes_le();
+            let mut repr = <Fp as PrimeField>::Repr::default();
+            repr.as_mut()[..bytes.len()].copy_from_slice(&bytes);
+            Fp::from_repr(repr).unwrap()
+        })
+    }
+
+    #[derive(Default)]
+    struct SqueezeChallengeCircuit {
+        bytes: Vec<u8>,
+        corrupt_limb: Option<usize>,
+    }
+
+    impl Circuit<Fp> for SqueezeChallengeCircuit {
+        type Config = Blake2bCircuitTestConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                bytes: vec![0; self.bytes.len()],
+                corrupt_limb: self.corrupt_limb,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+            Blake2bCircuitTestConfig {
+                fq: NonNativeFqChip::configure(meta),
+                words: TranscriptWordChip::configure(meta),
+                compression: Blake2bCompressionCircuitChip::configure(meta),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fp>,
+        ) -> Result<(), ErrorFront> {
+            let chip = Blake2bCompressionCircuitChip::new(config.compression, config.words, config.fq);
+
+            // Main chain: process one block
+            let mut stream = TranscriptByteStream::new();
+            stream.extend_bytes(&self.bytes);
+            let ref_trace = blake2b_compression_trace_skeleton(&stream);
+            let trace = ref_trace.clone();
+            let assigned_trace = chip.assign_trace(
+                layouter.namespace(|| "trace"), &trace, "trace",
+            )?;
+            let last_row = assigned_trace.rows.last().expect("trace must have rows");
+
+            // Squeeze state = main chain's last state_out
+            let squeeze_state_in = trace.rows.last().expect("trace rows").state_out;
+
+            // Squeeze block: padded final block of empty transcript
+            let empty_stream = TranscriptByteStream::new();
+            let empty_blocks = blake2b_block_trace(&empty_stream);
+            let squeeze_block = empty_blocks.last().expect("empty stream produces a block");
+
+            // Constrain initial state for the main chain's first row
+            if let Some(first) = assigned_trace.rows.first() {
+                chip.constrain_initial_state(
+                    layouter.namespace(|| "initial"), first,
+                )?;
+            }
+
+            // Assign the squeeze block
+            let squeeze_row = chip.assign_and_constrain_squeeze_block(
+                layouter.namespace(|| "squeeze"),
+                &squeeze_state_in,
+                squeeze_block,
+                &array::from_fn(|i| last_row.state_out[i].clone()),
+                "sq",
+            )?;
+
+            // Host-compute squeeze output and challenge
+            let (squeeze_state_out, _) = crate::transcript_blake2b_compression::compress_block(
+                &squeeze_state_in, squeeze_block,
+            );
+            let squeeze_digest: [u64; 8] = array::from_fn(|i| squeeze_state_out[i]);
+            let mut challenge_limbs = challenge_from_words(&squeeze_digest);
+            if let Some(idx) = self.corrupt_limb {
+                if idx < FQ_NUM_LIMBS {
+                    challenge_limbs[idx] += Fp::ONE;
+                }
+            }
+
+            chip.constrain_challenge_scalar(
+                layouter.namespace(|| "challenge"),
+                &squeeze_row,
+                &squeeze_digest,
+                &challenge_limbs,
+                "ch",
+            )?;
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blake2b_squeeze_challenge_accepts_correct() {
+        let circuit = SqueezeChallengeCircuit {
+            bytes: vec![1, 2, 3, 4, 5],
+            corrupt_limb: None,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
+        let result = prover.verify();
+        if let Err(e) = &result {
+            panic!("correct squeeze+challenge must pass: {:?}", e);
+        }
+    }
+
+    #[test]
+    fn blake2b_squeeze_challenge_rejects_wrong_limb() {
+        let circuit = SqueezeChallengeCircuit {
+            bytes: vec![1, 2, 3, 4, 5],
+            corrupt_limb: Some(0),
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).expect("mock prover should run");
+        assert!(
+            prover.verify().is_err(),
+            "corrupted challenge limb must fail"
         );
     }
 }
