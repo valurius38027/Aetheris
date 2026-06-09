@@ -555,6 +555,32 @@ impl Halo2PastaBackend {
         )
     }
 
+    /// A-3: Sender-side DH encryption using recipient's public key (pk_d).
+    /// Generates ephemeral keypair, computes DH(esk, pk_d), derives AES key.
+    pub fn encrypt_for_recipient(
+        pk_d: &[u8; 32],
+        amount: u64,
+        blinding: &[u8; 32],
+    ) -> ([u8; 32], Vec<u8>) {
+        let esk = EphemeralSecret::random_from_rng(&mut OsRng);
+        let epk = PublicKey::from(&esk);
+        let shared = {
+            let pk = PublicKey::from(*pk_d);
+            esk.diffie_hellman(&pk)
+        };
+        let key = blake3::hash(shared.as_bytes());
+        let aes_key = Key::<Aes256Gcm>::from_slice(&key.as_bytes()[..32]);
+        let cipher = Aes256Gcm::new(aes_key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut plaintext = Vec::with_capacity(8 + 32);
+        plaintext.extend_from_slice(&amount.to_le_bytes());
+        plaintext.extend_from_slice(blinding);
+        let ct = cipher.encrypt(&nonce, plaintext.as_ref()).expect("encryption failed");
+        let mut output = nonce.to_vec();
+        output.extend_from_slice(&ct);
+        (*epk.as_bytes(), output)
+    }
+
     pub fn encrypt_output(
         recipient_vk: &[u8; 32],
         amount: u64,

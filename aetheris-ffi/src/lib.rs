@@ -8,7 +8,6 @@ use serde::{Serialize, Deserialize};
 use aetheris_zkp::{ZKProofSystem, ZkProverSystem};
 use aetheris_recursive::{accumulate_proof, empty_accumulator};
 use bip39::{Mnemonic};
-use tiny_keccak::{Hasher, Keccak};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore};
 use aes_gcm::aead::{Aead, OsRng};
 use argon2::{Argon2, PasswordHasher};
@@ -946,11 +945,17 @@ fn ensure_db_open(state: &mut AppState) {
             let decrypted = state.cipher.decrypt(nonce, ciphertext).expect("Decryption failed");
             let mnemonic_str = String::from_utf8(decrypted).unwrap();
             
-            let mut hasher = Keccak::v256();
-            hasher.update(mnemonic_str.trim().as_bytes());
-            let mut res = [0u8; 32];
-            hasher.finalize(&mut res);
-            state.address = format!("aet1{}", &hex::encode(res)[..24]);
+            if let Some(pk_d_bytes) = ledger.db.get(b"pk_d").unwrap() {
+                let mut pk_d = [0u8; 32];
+                pk_d.copy_from_slice(&pk_d_bytes);
+                state.address = format!("aet1{}", hex::encode(pk_d));
+            } else {
+                // Legacy: derive pk_d from viewing_key on the fly
+                let vk = blake3::hash(&[mnemonic_str.trim().as_bytes(), b"aetheris-viewing-key"].concat());
+                let sk = x25519_dalek::StaticSecret::from(<[u8; 32]>::from(*vk.as_bytes()));
+                let pk = x25519_dalek::PublicKey::from(&sk);
+                state.address = format!("aet1{}", hex::encode(pk.as_bytes()));
+            }
         }
     }
 }
@@ -1192,9 +1197,18 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     let vk = blake3::hash(&[phrase.as_bytes(), b"aetheris-viewing-key"].concat());
     viewing_key.copy_from_slice(vk.as_bytes());
 
-    // 1. First Pass: Derive the address properly before scanning transactions
-    let addr_hash = blake3::hash(phrase.as_bytes());
-    let address = format!("aet1{}", hex::encode(&addr_hash.as_bytes()[..24]));
+    // A-3: Derive pk_d (public DH key) from viewing_key for target encryption.
+    // pk_d = viewing_key * G (x25519). Recipients use viewing_key for trial_decrypt
+    // (DH(viewing_key, epk) = DH(esk, pk_d) via x25519 commutativity).
+    let pk_d = {
+        let sk = x25519_dalek::StaticSecret::from(viewing_key);
+        let pk = x25519_dalek::PublicKey::from(&sk);
+        *pk.as_bytes()
+    };
+
+    // New address format: "aet1" + 64 hex chars of pk_d (32 bytes).
+    let address = format!("aet1{}", hex::encode(pk_d));
+    _ = db.insert(b"pk_d", &pk_d);
     
     #[cfg(debug_assertions)]
     println!("[FFI] IMPORT: Address: {}", address);
@@ -1502,12 +1516,11 @@ fn scan_ledger_for_wallet(state: &mut AppState) {
 
             // Found an output belonging to us!
             // Check if it's spent by calculating its nullifier
-            // In this prototype, we use commitment as index for simplicity in nullifier derivation
-            let mut hasher = Keccak::v256();
-            hasher.update(&output.commitment);
-            let mut comm_idx_bytes = [0u8; 8];
-            hasher.finalize(&mut comm_idx_bytes[..]); // Dummy index derivation
-            let idx = u64::from_le_bytes(comm_idx_bytes);
+            // A-3: Use blake3 (domain-separated) instead of Keccak for nullifier index
+            let idx = {
+                let h = blake3::hash(&[b"aetheris-utxo-index", &output.commitment as &[u8]].concat());
+                u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
+            };
 
             let nf = aetheris_zkp::create_nullifier(&viewing_key, idx);
             
@@ -2121,11 +2134,10 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
     let mut input_commitments = Vec::new();
 
     for utxo in &selected_utxos {
-        let mut hasher = Keccak::v256();
-        hasher.update(&utxo.commitment);
-        let mut comm_idx_bytes = [0u8; 8];
-        hasher.finalize(&mut comm_idx_bytes[..]);
-        let idx = u64::from_le_bytes(comm_idx_bytes);
+        let idx = {
+            let h = blake3::hash(&[b"aetheris-utxo-index", &utxo.commitment as &[u8]].concat());
+            u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
+        };
         
         nullifiers.push(aetheris_zkp::create_nullifier(&viewing_key, idx));
         in_amounts.push(utxo.amount_atoms);
@@ -2171,24 +2183,27 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         path
     };
 
-    // Stealth Address Derivation:
-    // In Aetheris, we don't send to the public address. 
-    // We derive a one-time stealth address (D-H shared secret based).
-    let mut hasher = Keccak::v256();
-    hasher.update(target_address.as_bytes());
-    hasher.update(&chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
-    let mut stealth_res = [0u8; 32];
-    hasher.finalize(&mut stealth_res);
-    let one_time_address = format!("aet1_st{}", &hex::encode(stealth_res)[..24]);
+    // A-3: Extract recipient pk_d from target address for proper DH encryption.
+    // Address format: "aet1" + 64 hex chars of pk_d (32 bytes).
+    let target_pk_d = if target_address.len() == 68 && target_address.starts_with("aet1") {
+        let hex_body = &target_address[4..];
+        let mut pk_d = [0u8; 32];
+        if hex::decode_to_slice(hex_body, &mut pk_d).is_ok() {
+            pk_d
+        } else {
+            let err_msg = format!("INVALID_TARGET_ADDRESS: cannot decode pk_d from {}", target_address);
+            set_error(&err_msg);
+            return false;
+        }
+    } else {
+        let err_msg = format!("INVALID_TARGET_ADDRESS: bad format/length {}", target_address);
+        set_error(&err_msg);
+        return false;
+    };
 
-    // Encrypt note for recipient (trial decryption support)
-    // TODO(PHASE-3): Derive target_viewing_key from recipient's public key instead of address
-    let mut target_viewing_key = [0u8; 32];
-    let vk = blake3::hash(&[target_address.as_bytes(), b"aetheris-viewing-key"].concat());
-    target_viewing_key.copy_from_slice(vk.as_bytes());
-
-    let (ephemeral_pk, ciphertext) = aetheris_zkp::ZKProofSystem::encrypt_output(
-        &target_viewing_key,
+    // Encrypt note for recipient using proper DH: shared = DH(esk, pk_d)
+    let (ephemeral_pk, ciphertext) = aetheris_zkp::ZKProofSystem::encrypt_for_recipient(
+        &target_pk_d,
         send_amount_atoms,
         &out_blinding
     );
@@ -2260,7 +2275,7 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
         "address": target_address,
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "status": "Pending (Mixnet)",
-        "tx_id": hex::encode(stealth_res),
+        "tx_id": hex::encode(ephemeral_pk),
         "commitment": hex::encode(output_commitments[0])
     });
 
@@ -2277,8 +2292,8 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
     db.insert(b"owned_utxos", serde_json::to_vec(&owned_utxos).unwrap()).unwrap();
     db.flush().unwrap();
 
-    println!("[FFI] ANONYMOUS_TRANSACTION_INITIATED: Stealth Address={}, PathLength={}", 
-             one_time_address, 
+    println!("[FFI] ANONYMOUS_TRANSACTION_INITIATED: target={}, PathLength={}", 
+             target_address, 
              PEER_KEYS.lock().unwrap().len().min(3).max(1));
     true
 }
