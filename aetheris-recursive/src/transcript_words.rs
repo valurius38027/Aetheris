@@ -5,7 +5,7 @@
 //! expose a word layer above `transcript_bytes` before implementing the full
 //! compression constraints.
 
-use ff::Field;
+use ff::{Field, PrimeField};
 use halo2_proofs::{
     circuit::{Layouter, Value},
     halo2curves::pasta::Fp,
@@ -24,7 +24,7 @@ pub const BLAKE2B_BLOCK_WORDS: usize = BLAKE2B_BLOCK_BYTES / BLAKE2B_WORD_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct TranscriptWord64 {
-    pub limb: Limb,
+    pub limb: Limb<Fp>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +80,9 @@ fn reconstruct_word_value(byte_slice: &[crate::transcript_bytes::TranscriptByte]
 }
 
 impl TranscriptWordChip {
-    pub fn configure(meta: &mut ConstraintSystem<Fp>) -> TranscriptWordConfig {
+    pub fn configure<F: PrimeField + From<u64>>(
+        meta: &mut ConstraintSystem<F>,
+    ) -> TranscriptWordConfig {
         let word = meta.advice_column();
         let byte_cols = [0; BLAKE2B_WORD_BYTES].map(|_| meta.advice_column());
         let s_decode = meta.selector();
@@ -93,10 +95,10 @@ impl TranscriptWordChip {
             let word_expr = meta.query_advice(word, Rotation::cur());
             let byte_exprs = byte_cols.map(|col| meta.query_advice(col, Rotation::cur()));
             let acc_expr = byte_exprs.into_iter().enumerate().fold(
-                halo2_proofs::plonk::Expression::Constant(Fp::ZERO),
+                halo2_proofs::plonk::Expression::Constant(F::ZERO),
                 |acc, (i, byte)| {
                     acc + byte
-                        * halo2_proofs::plonk::Expression::Constant(Fp::from(1u64 << (8 * i)))
+                        * halo2_proofs::plonk::Expression::Constant(F::from(1u64 << (8 * i)))
                 },
             );
             vec![s * (word_expr - acc_expr)]

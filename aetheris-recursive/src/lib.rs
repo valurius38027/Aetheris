@@ -1,25 +1,17 @@
 //! Aetheris (AET) Recursive Proof System
 //!
-//! Phase 1.4: native Pasta 2-cycle recursion. The inner recursive circuit runs
-//! over Vesta (scalar field = Pallas base = `Fp`), and the outer ZK circuit
-//! (in `aetheris-zkp`) runs over Pallas (scalar field = Vesta base = `Fq`).
-//! The 2-cycle is what makes recursive accumulation native (no NonNativeChip
-//! required) and what enables the IPA accumulator's `Q + challenge · pi_commitment`
-//! relation to be expressed as a single field-arithmetic constraint.
+//! B-2 Migration (Active): Native IPA Accumulation on Vesta.
 //!
-//! The `EccChip` identity-point fix from Phase 1.3 is preserved and extended:
-//!   - `on_curve_check` gate now uses Vesta's curve equation `y² = x³ + 5`
-//!     (previously hardcoded to Grumpkin's `y² = x³ + 3`, ISSUE-1.3.B).
-//!   - The windowed scalar-mul window decomposition uses `PASTA_SCALAR_BIT_LEN = 255`
-//!     (previously `BN254_FR_BIT_LEN = 254`).
-//!   - The base point tables and `h_generator` NUMS point are computed on Vesta.
+//! Per `protocol_design_ruling.md` §1.1, the recursive circuit runs on **Vesta**
+//! (`Circuit<Fq>`), making Fq scalars native. This eliminates the NonNativeChip
+//! architecture entirely. See `B-2_plan.md` for the implementation roadmap.
 //!
-//! Accumulator: see `AccumulatorIPA` and `CircuitAccumulate` in `aetheris-zkp`.
-//! Trust model: the accumulator is a "trusted-aggregator" model — the aggregator
-//! must call `verify_conservation` on every inner proof, and the in-circuit
-//! `CircuitAccumulate` checks the algebraic accumulator update relation. A
-//! future Phase (1.6, see ISSUE-1.4.A) will add in-circuit IPA verification for
-//! trustless recursion.
+//! The old `ipa_fold.rs`, `non_native_mul.rs`, `ipa_verifier_circuit.rs` have been
+//! deleted in B-2 S11. `non_native_fq.rs` is retained for the transcript gadget
+//! (to be replaced in Phase 6).
+//!
+//! The Blake2b transcript gadget (§1.12d1-d4) is preserved and will be
+//! field-parameterized (Phase 1 of B-2) for reuse in `Circuit<Fq>`.
 
 use halo2_proofs::{
     circuit::{Cell, Layouter, Value},
@@ -245,8 +237,8 @@ impl<const T: usize, const RATE: usize> PoseidonChip<T, RATE> {
     pub fn hash(
         &self,
         mut layouter: impl Layouter<Fp>,
-        values: &[Limb],
-    ) -> Result<Limb, ErrorFront> {
+        values: &[Limb<Fp>],
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "poseidon hash",
             |mut region| {
@@ -484,9 +476,9 @@ impl EcPoint {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectivePoint {
-    pub x: Limb,
-    pub y: Limb,
-    pub z: Limb,
+    pub x: Limb<Fp>,
+    pub y: Limb<Fp>,
+    pub z: Limb<Fp>,
 }
 
 /// Phase 1.4: Pasta Vesta scalar field bit length (255 bits).
@@ -782,9 +774,9 @@ impl EccChip {
     pub fn field_mul(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-        b: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        a: &Limb<Fp>,
+        b: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "field mul",
             |mut region| {
@@ -813,9 +805,9 @@ impl EccChip {
     pub fn field_add(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-        b: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        a: &Limb<Fp>,
+        b: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "field add",
             |mut region| {
@@ -844,9 +836,9 @@ impl EccChip {
     pub fn field_sub(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-        b: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        a: &Limb<Fp>,
+        b: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "field sub",
             |mut region| {
@@ -875,8 +867,8 @@ impl EccChip {
     pub fn one_minus_bit(
         &self,
         mut layouter: impl Layouter<Fp>,
-        bit: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        bit: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "field one minus bit",
             |mut region| {
@@ -904,10 +896,10 @@ impl EccChip {
     pub fn select_limb_bit(
         &self,
         mut layouter: impl Layouter<Fp>,
-        bit: &Limb,
-        when_one: &Limb,
-        when_zero: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        bit: &Limb<Fp>,
+        when_one: &Limb<Fp>,
+        when_zero: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         Ok(layouter.assign_region(
             || "field select bit",
             |mut region| {
@@ -948,8 +940,8 @@ impl EccChip {
     pub fn is_zero_limb(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        a: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         let inv_val = a.value.map(|v| v.invert().unwrap_or(Fp::ZERO));
 
         let prod = self.field_mul(
@@ -991,9 +983,9 @@ impl EccChip {
     pub fn eq_limb(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-        b: &Limb,
-    ) -> Result<Limb, ErrorFront> {
+        a: &Limb<Fp>,
+        b: &Limb<Fp>,
+    ) -> Result<Limb<Fp>, ErrorFront> {
         let diff = self.field_sub(layouter.namespace(|| "eq_diff"), a, b)?;
         self.is_zero_limb(layouter.namespace(|| "eq_zero"), &diff)
     }
@@ -1001,7 +993,7 @@ impl EccChip {
     pub(crate) fn select_projective_bit(
         &self,
         mut layouter: impl Layouter<Fp>,
-        bit: &Limb,
+        bit: &Limb<Fp>,
         when_one: &ProjectivePoint,
         when_zero: &ProjectivePoint,
     ) -> Result<ProjectivePoint, ErrorFront> {
@@ -1244,8 +1236,8 @@ impl EccChip {
     pub fn constrain_equal_limb(
         &self,
         mut layouter: impl Layouter<Fp>,
-        a: &Limb,
-        b: &Limb,
+        a: &Limb<Fp>,
+        b: &Limb<Fp>,
     ) -> Result<(), ErrorFront> {
         Ok(layouter.assign_region(
             || "constrain equal limb",
@@ -1350,7 +1342,7 @@ impl EccChip {
         &self,
         mut layouter: impl Layouter<Fp>,
         p: &EcPoint,
-    ) -> Result<Limb, ErrorFront> {
+    ) -> Result<Limb<Fp>, ErrorFront> {
         let x = Limb {
             value: p.x,
             cell: p.x_cell,
@@ -1395,7 +1387,7 @@ impl EccChip {
     pub fn select_bit(
         &self,
         mut layouter: impl Layouter<Fp>,
-        bit: &Limb,
+        bit: &Limb<Fp>,
         p1: &EcPoint,
         p2: &EcPoint,
     ) -> Result<EcPoint, ErrorFront> {
@@ -1527,7 +1519,7 @@ impl EccChip {
     pub fn fixed_base_scalar_mul(
         &self,
         mut layouter: impl Layouter<Fp>,
-        scalar: &Limb,
+        scalar: &Limb<Fp>,
         base_point: &PallasAffine,
         table_offset: usize,
     ) -> Result<EcPoint, ErrorFront> {
@@ -1587,7 +1579,7 @@ impl EccChip {
         &self,
         mut layouter: impl Layouter<Fp>,
         p: &EcPoint,
-        scalar: &Limb,
+        scalar: &Limb<Fp>,
     ) -> Result<EcPoint, ErrorFront> {
         self.assert_on_curve(layouter.namespace(|| "scalar_mul_input_on_curve"), p)?;
         self.identity_bit(layouter.namespace(|| "scalar_mul_input_identity"), p)?;
@@ -1825,22 +1817,29 @@ impl EccChip {
 // --- Non-Native Arithmetic ---
 
 pub mod diagnostics;
-pub mod ipa_fold;
 pub mod ipa_transcript;
-pub mod ipa_verifier_circuit;
 pub mod non_native_fq;
-pub mod non_native_mul;
 pub mod transcript_blake2b;
 pub mod transcript_blake2b_circuit;
 pub mod transcript_blake2b_compression;
 pub mod transcript_bytes;
 pub mod transcript_words;
+pub mod vesta_ecc;
+pub mod vesta_fq;
+pub mod vesta_ipa;
+pub mod vesta_accumulate;
 
+pub mod vesta_range;
+
+pub mod vesta_transcript;
 #[derive(Clone, Debug)]
-pub struct Limb {
-    pub value: Value<Fp>,
+pub struct Limb<F: Field> {
+    pub value: Value<F>,
     pub cell: Option<Cell>,
 }
+
+/// Type alias for Limb used in Circuit\<Fp\> (the current recursive circuit field).
+pub type FpLimb = Limb<Fp>;
 
 #[allow(dead_code)]
 fn fp_to_hex(fp: &Fp) -> String {
