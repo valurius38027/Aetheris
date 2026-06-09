@@ -502,6 +502,147 @@ impl LedgerState {
 mod tests {
     use super::*;
     use aetheris_core::{BlockHeader, ShieldedOutput, Transaction, calculate_block_reward_atoms};
+    use aetheris_zkp::ZkProverSystem;
+
+    #[test]
+    fn test_state_root_mismatch_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                aggregate_proof: empty_accumulator(),
+                height: 0,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+
+        state.height = 1;
+        state.current_difficulty = 100;
+        state.last_block_hash = [42u8; 32];
+        state.last_aggregate_proof = empty_accumulator();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+
+        let mut wrong_root = state.get_state_root();
+        wrong_root[0] ^= 0xFF;
+
+        let reward = calculate_block_reward_atoms(1);
+        let coinbase_tx = Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment: [0xFF; 32],
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: reward,
+            proof: vec![],
+        };
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: wrong_root,
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                aggregate_proof: empty_accumulator(),
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        let result = state.apply_block(block);
+        assert!(result.is_err(), "wrong state_root must be rejected");
+        assert!(result.unwrap_err().contains("State root mismatch"));
+    }
+
+    #[test]
+    fn test_nullifier_double_spend_end_to_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        // Insert mock block 0
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                aggregate_proof: empty_accumulator(),
+                height: 0,
+                difficulty: 100,
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+
+        state.height = 1;
+        state.current_difficulty = 100;
+        state.last_block_hash = [42u8; 32];
+        state.last_aggregate_proof = empty_accumulator();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        // Pre-insert the spent nullifier
+        let spent_nf = [0xDDu8; 32];
+        state.nullifiers.insert(spent_nf);
+
+        // Solve VDF
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+
+        // Create a valid conservation proof (zero amounts: sum = 0)
+        let proof = aetheris_zkp::ZKProofSystem::prove_conservation(
+            &[], &[], &[], &[], &[], 0,
+        );
+
+        // Non-coinbase tx: public_amount = 0, carries the spent nullifier
+        let tx = Transaction {
+            inputs: vec![spent_nf],
+            outputs: vec![],
+            public_amount: 0,
+            proof,
+        };
+
+        // Pre-compute the correct accumulator: empty parent + 1 proof
+        let commitments: Vec<[u8; 32]> = vec![];
+        let correct_acc = aetheris_recursive::AccumulatorIPA::new()
+            .accumulate(&tx.proof, &commitments, tx.circuit_public_amount())
+            .expect("accumulate must succeed");
+
+        let state_root = state.get_state_root();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root,
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                aggregate_proof: correct_acc.to_bytes(),
+                height: 1,
+                difficulty: 100,
+            },
+            transactions: vec![tx],
+        };
+
+        let result = state.apply_block(block);
+        assert!(result.is_err(), "double-spend nullifier must be rejected by apply_block");
+        assert!(result.unwrap_err().contains("double-spend"));
+    }
 
     #[test]
     fn test_double_spend_rejected() {

@@ -243,7 +243,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
             let mut offset = 0;
             let inv_2 = Fq::from(2).invert().unwrap();
 
-            // ─── 64-bit range proof per amount (unchanged) ──────────
+            // ─── 64-bit range proof per amount ──────────────────────
             for &amount in &all_amounts {
                 let z_0 = Fq::from(amount);
                 region.assign_advice(|| "z_0", config.advice[0], offset, || Value::known(z_0))?;
@@ -265,7 +265,13 @@ impl Circuit<Fq> for ValueConservationCircuit {
                     z_prev = z_cur;
                     remaining >>= 1;
                 }
-                offset += 1; // gap after each amount
+                // Constrain z_64 = 0 (A-1 soundness fix: prover can't claim amount > 2^64−1)
+                offset += 1;
+                config.s_constrain_equal.enable(&mut region, offset)?;
+                region.assign_advice(|| "z_64_zero", config.advice[0], offset, || Value::known(z_prev))?;
+                region.assign_advice(|| "zero", config.advice[2], offset, || Value::known(Fq::ZERO))?;
+
+                offset += 1; // gap / next z_0
             }
 
             // ─── Conservation running sum ───────────────────────────
@@ -963,6 +969,48 @@ mod tests {
             *last ^= 0xFF;
         }
         assert!(!Halo2PastaBackend::verify_conservation(&proof, &out_cms, 0));
+    }
+
+    #[test]
+    fn test_range_rejects_overflow_amount() {
+        use halo2_proofs::dev::MockProver;
+
+        struct OverflowCircuit;
+        impl Circuit<Fq> for OverflowCircuit {
+            type Config = ValueConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self { OverflowCircuit }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                <ValueConservationCircuit as Circuit<Fq>>::configure(meta)
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let large = Fq::from(u64::MAX) + Fq::one();
+                let inv_2 = Fq::from(2).invert().unwrap();
+                layouter.assign_region(|| "overflow_range", |mut region| {
+                    let mut offset = 0;
+                    region.assign_advice(|| "z_0_overflow", config.advice[0], offset, || Value::known(large))?;
+                    region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fq::zero()))?;
+                    let mut z_prev = large;
+                    for _ in 0..64 {
+                        offset += 1;
+                        config.s_running_sum.enable(&mut region, offset)?;
+                        let bit = Fq::zero();
+                        let z_cur = (z_prev - bit) * inv_2;
+                        region.assign_advice(|| "z_cur", config.advice[0], offset, || Value::known(z_cur))?;
+                        region.assign_advice(|| "bit", config.advice[1], offset, || Value::known(bit))?;
+                        z_prev = z_cur;
+                    }
+                    offset += 1;
+                    config.s_constrain_equal.enable(&mut region, offset)?;
+                    region.assign_advice(|| "z_64_overflow", config.advice[0], offset, || Value::known(z_prev))?;
+                    region.assign_advice(|| "zero_ref", config.advice[2], offset, || Value::known(Fq::ZERO))?;
+                    Ok(())
+                })
+            }
+        }
+
+        let prover = MockProver::run(11, &OverflowCircuit, vec![vec![]]).unwrap();
+        assert!(prover.verify().is_err(), "overflow amount should be rejected by constraint");
     }
 
     #[test]
