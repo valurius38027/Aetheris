@@ -2976,14 +2976,59 @@ cargo test -p aetheris-node --lib                      新增 state_root/nullifi
 cargo test -p aetheris-ffi --lib -- --test-threads=1   新增 viewing key 测试通过
 ```
 
+---
+
+## Stage 43 — Phase 1.4 B-3: aggregate_proofs IPA 化（2026-06-10）
+
+**Scope**: 替换旧 Merkle 哈希 `aggregate_proofs`/`verify_aggregate` 为 IPA accumulator chain。从 `ZkProverSystem` trait 中移除旧方法，添加 `batch_verify_conservation` 使用 `AccumulatorStrategyIPA`。
+
+### 变更文件
+
+| 文件 | 变化 |
+|------|------|
+| `aetheris-zkp/src/trait_.rs` | 从 trait 移除 `aggregate_proofs`/`verify_aggregate` |
+| `aetheris-zkp/src/halo2_pasta.rs` | 移除 `aggregate_proofs`/`verify_aggregate`；新增 `batch_verify_conservation` + 5 测试 |
+| `aetheris-zkp/src/halo2_bn254.rs` | 移除 `aggregate_proofs`/`verify_aggregate` 实现 + 旧测试 |
+| `aetheris-node/src/main.rs` | 挖矿迁移到 per-tx `accumulate_proof` IPA 循环；genesis 使用 `empty_accumulator()` |
+
+### 多 Agent 审查发现
+
+| 问题 | 严重性 | 描述 | 修复 |
+|------|--------|------|------|
+| Coinbase 跳过 | 🔴 CRITICAL | `tx.circuit_public_amount() > 0` 对 coinbase 返回负数，不会跳过 | 改为 `tx.public_amount > 0` |
+| .expect() panic | 🔴 HIGH | 损坏的证明会导致挖矿线程崩溃 | 替换为 `match` + 记录日志并跳过 |
+
+### 验证
+
+```
+cargo check --workspace                                ✅ 零错误
+cargo test -p aetheris-zkp --lib                       119/119 ✅
+cargo test -p aetheris-recursive --lib                 155/155 ✅
+cargo test -p aetheris-node --lib                       11/11 ✅
+cargo test -p aetheris-core --lib                       21/21 ✅
+cargo test -p aetheris-crypto --lib                     41/41 ✅
+```
+
+### 提交
+
+`2bc2110` — 4 个文件，+140/-272。
+
+### 路线更新
+
+| 项 | 状态 |
+|----|--------|
+| 1.4 B-3: aggregate_proofs IPA 化 | ✅ 完成 |
+| 1.5: IPA 区块集成 | ✅ 完成（B-3 范围内） |
+| 1.7: 恢复调用方 | ✅ 完成（没有损坏的调用方） |
+| 1.10: Signed Accumulator | ⏳ 待处理 |
+| 1.11: P2P Proof Gossip | ⏳ 待处理 |
+| 1.13: Recursive Proof Wrapper → Mainnet | ⏳ 下一步 |
+
 ### 下一步
 
-P0 全部完成，恢复 Phase 1 剩余：
-1. **Phase 1.6**: 将 `aetheris-zkp` 真实 proof 接入 `vesta_accumulate` 电路（当前使用 mock 数据）
-2. **B-3**: `aggregate_proofs` IPA 化（替换 Merkle 哈希为 AccumulatorStrategyIPA）
-3. **Phase 1.7+**: IPA 区块集成、Signed Accumulator、P2P Gossip、Recursive Wrapper
+当前 **Phase 1.13 — Recursive Proof Wrapper**：将 `aetheris-zkp` 真实 Halo2 IPA proof（来自 `prove_conservation`）接入 `VestaAccumulateChip` 电路实现 in-circuit 验证，输出恒定大小递归证明。这是 trustless O(1) 积累的关键里程碑。---
 
----
+
 
 ## Stage 41 — B-2: Native IPA Accumulation Circuit on Vesta (Circuit\<Fq\>) (2026-06-09)
 
