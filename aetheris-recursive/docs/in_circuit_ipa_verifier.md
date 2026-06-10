@@ -1,8 +1,19 @@
 # In-Circuit IPA Verifier Gadget — Design Document
 
-**Status**: Draft
-**Phase**: §1.12 (research, 2–3 months estimated)
-**Depends on**: §1.3 (EccChip, PoseidonChip, GrainLFSR), §1.1 (IPA commitment scheme)
+> **⚠️ SUPERSEDED**
+>
+> This document describes the old NonNativeChip-based IPA verifier design (`§1.12`),
+> which is superseded by `protocol_design_ruling.md` §1.1 and §4 P1.
+>
+> The active implementation plan is **B-2** (Native IPA Accumulation on Vesta):
+> see `aetheris-recursive/B-2_plan.md`.
+>
+> The Blake2b transcript work (§1.12d1-d4) is preserved — the B-2 plan Phase 1
+> generalizes it from `Fp`-specific to field-agnostic, then reuses it in `Circuit<Fq>`.
+
+**Status**: **Superseded** (see B-2_plan.md)
+**Phase**: ~~§1.12~~ → **B-2** (Native Vesta IPA accumulation)
+**Depends on**: ~~§1.3 (EccChip, PoseidonChip, GrainLFSR)~~ → `protocol_design_ruling.md` §1.1
 **Prerequisite reading**: `aetheris-zkp/src/ipa/verifier.rs`, `aetheris-zkp/src/ipa/prover.rs`, `aetheris-zkp/src/ipa/commitment.rs`, `aetheris-recursive/src/lib.rs` (EccChip, PoseidonChip)
 
 ---

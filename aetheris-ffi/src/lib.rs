@@ -349,8 +349,9 @@ fn create_genesis_block() -> aetheris_core::Block {
 }
 
 // Helper to check if an address is frozen (Original Genesis Seed)
+// Frozen address pk_d = 9bd56a0ecdf078384cab79a56f0a85d41a0a4905436df2a49f04373dc5c0d770
 fn is_address_frozen(address: &str) -> bool {
-    address == "aet12f615319124ce9db1669040f"
+    address == "aet19bd56a0ecdf078384cab79a56f0a85d41a0a4905436df2a49f04373dc5c0d770"
 }
 
 use aetheris_node::consensus::{BlockProposal, MathematicalArbitrator};
@@ -1227,8 +1228,11 @@ pub extern "C" fn aetheris_import_wallet(mnemonic: *const c_char) -> bool {
     println!("[FFI] SCANNING_GENESIS for address: {}, scan_addr: {}", address, scan_addr);
 
     // Hardcoded genesis recipients for the prototype's "scanning" logic
-    let genesis_seed_addr = "aet12f615319124ce9db1669040f"; 
-    let dev_addr = "aet147cafe7b55906a973197db85";
+    // pk_d = viewing_key * G for the two genesis allocations
+    // Seed viewing key: 2f615319124ce9db1669040fbd2aa171e4a5f64e0ecba600aa6e186e915f9abc
+    // Dev viewing key:  47cafe7b55906a973197db85130efdcca48b1a54d917c60282f6f290b434a2b5
+    let genesis_seed_addr = "aet19bd56a0ecdf078384cab79a56f0a85d41a0a4905436df2a49f04373dc5c0d770";
+    let dev_addr = "aet122745ff02b2bf6ad779f8e439a85c6c29058bc42aaac8eac0f032dab7cd7ed0e";
 
     // tx[0] is Mint (21M to Seed)
     let mint_tx = &genesis.transactions[0];

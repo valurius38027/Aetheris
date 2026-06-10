@@ -2931,17 +2931,32 @@ The final multi-agent review approved the multiplication gadget after carry rang
 | B-2: Native IPA 积累电路 | ✅ Stage 41 | S0-S11 完整，155/155 递归测试通过 |
 | B-2 清理: 删除旧文件 | ✅ | `ipa_fold.rs`, `ipa_verifier_circuit.rs`, `non_native_mul.rs` 已删除 |
 
-### P0 Sprint（当前执行）
+### P0 Sprint（全部完成 ✅）
 
 按 小→中→大 顺序：
 
-| # | 项目 | 范围 | 文件 | 优先级 |
-|---|------|------|------|--------|
-| P0.1 | A-1: running_sum z_64=0 约束 | **小型** ~30 行 | `aetheris-zkp/src/halo2_pasta.rs:198-269` | 🔴 **最高** — 当前 soundness hole |
-| P0.2 | H-1: state_root 拒绝负测试 | **小型** ~20 行 | `aetheris-node/src/state.rs:373-380` | 🟡 |
-| P0.3 | C-5: nullifier 双花端到端测试 | **小型** ~30 行 | `aetheris-node/src/state.rs:364-371` | 🟡 |
-| P0.4 | A-3: 统一 viewing key 派生 | **中大型** ~200 行 | `aetheris-ffi/src/lib.rs:1190-2188` | 🟠 隐私漏洞 |
-| P0.5 | C-2: membership + nullifier 电路 | **大型** ~500-1000 行 | `aetheris-zkp/src/halo2_pasta.rs` | 🔴 协议完备性 |
+| # | 项目 | 范围 | 文件 | 优先级 | 状态 |
+|---|------|------|------|--------|------|
+| P0.1 | A-1: running_sum z_64=0 约束 | **小型** ~30 行 | `aetheris-zkp/src/halo2_pasta.rs:198-269` | 🔴 | ✅ |
+| P0.2 | H-1: state_root 拒绝负测试 | **小型** ~20 行 | `aetheris-node/src/state.rs:373-380` | 🟡 | ✅ |
+| P0.3 | C-5: nullifier 双花端到端测试 | **小型** ~30 行 | `aetheris-node/src/state.rs:364-371` | 🟡 | ✅ |
+| P0.4 | A-3: 统一 viewing key 派生 | **中大型** ~200 行 | `aetheris-ffi/src/lib.rs:1190-2188` | 🟠 | ✅ |
+| P0.5 | C-2: membership + nullifier 电路 | **大型** ~500-1000 行 | `aetheris-zkp/src/halo2_pasta.rs` | 🔴 | ✅ |
+
+#### P0.5 子步骤详情
+
+| 子步骤 | 内容 | 提交 |
+|--------|------|------|
+| C-2 | IPA 回环诊断 + Gate 选择设计文档 | `bae6688` |
+| C-3 | Gate 基 mux（`mux_inputs`）替换 branch-dependent `constrain_equal` | `3504e2c` |
+| C-4 | 合并 MembershipCircuit 到 ValueConservationCircuit（CombinedCircuit） | `9f4fdaf` |
+| A1-C1 | 级间 `constrain_equal` 链（两个电路） | `5e6b29e` |
+| A1-W1 | `s_bool.enable()` 在 Merkle 位区域 | `5e6b29e` |
+| A1-W2/A2-W1 | `s_constrain_equal` → `s_zero_check` 重命名（16 处） | `5e6b29e` |
+| A2-W2 | `verify_combined_tx` 检查 `output_commitments.len()` | `5e6b29e` |
+| A3-W2 | 公共 API roundtrip 测试（暴露 PREFIX_LEN 错误） | `5e6b29e` |
+| A3-W3 | `PREFIX_LEN` 修复 19→20（前缀实际 20 字节） | `5e6b29e` |
+| A3-P1 | `mainnet_execution_plan.md` 状态更新 | `5e6b29e` |
 
 ### 路线变更
 
@@ -2951,11 +2966,11 @@ The final multi-agent review approved the multiplication gadget after carry rang
 | ISSUE_IPA_PLONK_INTEGRATION.md | 活跃跟踪 | 已关闭（过时，h_eval 已修复） |
 | B-2_plan.md | 执行中 | ✅ 完成，标记为历史 |
 
-### 验证门禁（P0 完成后）
+### 验证门禁（P0 已完成 ✅）
 
 ```
 cargo check --workspace                                ✅ 零错误零警告
-cargo test -p aetheris-zkp --lib                       新增范围拒绝测试通过
+cargo test -p aetheris-zkp --lib                       116/116 全部通过（新增 membership + combined + roundtrip 测试）
 cargo test -p aetheris-recursive --lib                 155/155 回归通过
 cargo test -p aetheris-node --lib                      新增 state_root/nullifier 测试通过
 cargo test -p aetheris-ffi --lib -- --test-threads=1   新增 viewing key 测试通过
@@ -2963,9 +2978,10 @@ cargo test -p aetheris-ffi --lib -- --test-threads=1   新增 viewing key 测试
 
 ### 下一步
 
-P0 完成后恢复 Phase 1 剩余：
-1. **B-3**: `aggregate_proofs` IPA 化（替换 Merkle 哈希为 AccumulatorStrategyIPA）
-2. **Phase 1.5-1.16**: IPA 区块集成、Signed Accumulator、P2P Gossip、Recursive Wrapper
+P0 全部完成，恢复 Phase 1 剩余：
+1. **Phase 1.6**: 将 `aetheris-zkp` 真实 proof 接入 `vesta_accumulate` 电路（当前使用 mock 数据）
+2. **B-3**: `aggregate_proofs` IPA 化（替换 Merkle 哈希为 AccumulatorStrategyIPA）
+3. **Phase 1.7+**: IPA 区块集成、Signed Accumulator、P2P Gossip、Recursive Wrapper
 
 ---
 

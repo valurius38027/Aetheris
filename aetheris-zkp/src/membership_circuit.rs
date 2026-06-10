@@ -206,10 +206,10 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
         // ── Merkle path verification (inline Poseidon + gate-based mux) ──
         // Each level: row 0 = s_select + s_full (mux + first full round),
         // then r_f/2-1 full, r_p partial, r_f/2 full, 1 output row.
-        // No constrain_equal between witness cells and hash inputs —
-        // the s_select gate enforces correct muxing; soundness via final instance check.
+        // Level-to-level constrain_equal links hash output → next leaf input
+        // for formal soundness (beyond Poseidon preimage resistance).
         let mut current_val = leaf_fq;
-        let mut current_cell: Option<Cell> = None;
+        let mut level_cells: Vec<(Cell, Cell)> = Vec::with_capacity(depth);
 
         for i in 0..depth {
             let sibling_val = sibling_fqs[i];
@@ -220,7 +220,7 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
             let second = if !bit { sibling_val } else { current_val };
             let next_val = chip.native_hash(first, second);
 
-            let hash_cell = layouter.assign_region(
+            let (leaf_cell, hash_cell) = layouter.assign_region(
                 || format!("merkle_level_{}", i),
                 |mut region| {
                     let mut state = [
@@ -230,11 +230,12 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
                     ];
                     let mut offset = 0usize;
 
-                    // ── Row 0: mux + first full round ──────────────────────
+                    // ── Row 0: mux + bool_check + first full round ────────
                     config.s_select.enable(&mut region, offset)?;
+                    config.s_bool.enable(&mut region, offset)?;
                     config.poseidon.s_full.enable(&mut region, offset)?;
 
-                    region.assign_advice(
+                    let leaf_cell = region.assign_advice(
                         || "leaf", config.leaf, offset,
                         || Value::known(current_val),
                     )?;
@@ -426,15 +427,26 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
                             || state[col_i],
                         )?;
                     }
-                    Ok(out)
+                    Ok((leaf_cell.cell(), out.cell()))
                 },
             )?;
 
+            level_cells.push((leaf_cell, hash_cell));
+
             current_val = next_val;
-            current_cell = Some(hash_cell.cell());
         }
 
-        let current_cell = current_cell.expect("Merkle depth must be ≥ 1");
+        // Chain levels: constrain_equal(hash_output_i, leaf_input_{i+1})
+        layouter.assign_region(|| "chain_levels", |mut region| {
+            for i in 0..level_cells.len().saturating_sub(1) {
+                let (_, prev_hash) = level_cells[i];
+                let (next_leaf, _) = level_cells[i + 1];
+                region.constrain_equal(prev_hash, next_leaf)?;
+            }
+            Ok(())
+        })?;
+
+        let final_hash_cell = level_cells.last().expect("Merkle depth must be ≥ 1").1;
 
         // Constrain computed root to instance[0]
 
@@ -442,7 +454,7 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
             let instance_cell = region.assign_advice_from_instance(
                 || "root_instance", config.instance, 0, config.poseidon.state[0], 0,
             )?;
-            region.constrain_equal(current_cell, instance_cell.cell())?;
+            region.constrain_equal(final_hash_cell, instance_cell.cell())?;
             Ok(())
         })?;
 

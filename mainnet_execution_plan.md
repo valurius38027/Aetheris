@@ -83,10 +83,10 @@ Phase 4  生产就绪    ─→  文档/清理
 | **IPA 回环发现** | 原实现用 `constrain_equal` 做 position_bits 分支选择，导致 IPA 真实证明失败：keygen 哑电路走全 `false` 分支，实际电路走混合分支，两者产生**不同的置换等价类**，验证返回 `ConstraintSystemFailure`。 |
 | **根因修复** | 改为 **Gate 输入选择**：每层新增 `mux_inputs` gate 约束 `first_input = (1-bit)*current + bit*sibling` / `second_input = bit*current + (1-bit)*sibling`，`assign_hash` 不再传 `first_cell`/`second_cell`（即不再有 branch-dependent `constrain_equal`）。详见 `protocol_design_ruling.md §2.2` 更新。 |
 | **测试** | `test_membership_proof_rejects_fake_input`、`test_nullifier_correctness_mismatch_rejected`；IPA roundtrip: `test_membership_direct_ipa`、`test_exact_membership_structure_ipa` |
-| **状态** | ⏳ 实现中——电路 mock prover 已通过，IPA 回环已修复，待接入 `ValueConservationCircuit` |
+| **状态** | ✅ 已完成——Gate 选择重构 (mux_inputs) + 集成到 CombinedConservationCircuit + 多 agent 审查修复 + `PREFIX_LEN` 20 修复 + public API roundtrip 测试 |
 
 > **P0 完成标准**: 以下全部通过 ——
-> - `cargo test -p aetheris-zkp` 新增测试全部通过（A-1 堵住 + C-2 电路约束活跃）
+> - `cargo test -p aetheris-zkp` 新增测试全部通过（A-1 堵住 + C-2 电路约束活跃 + A3 multi-agent review 修复）
 > - `cargo test -p aetheris-node` 新增测试全部通过（C-5 双花拒绝 + H-1 state_root 拒绝）
 > - `cargo test -p aetheris-ffi -- --test-threads=1` 全部通过（A-3 统一 vk 派生）
 > - `cargo check --workspace` 零错误零警告
@@ -540,7 +540,7 @@ P0 (协议安全 — 当前执行，所有 Phase 暂停)
   P0.2 ──┤  H-1: state_root 负测试        ✅
   P0.3 ──┤  C-5: nullifier 端到端测试     ✅
   P0.4 ──┤  A-3: viewing key 统一         ✅
-  P0.5 ──┘  C-2: membership+nullifier     ⏳ IPA 回环已修复，Gate 选择待实现
+   P0.5 ──┘  C-2: membership+nullifier     ✅ Gate 选择与集成已完成
          │  P0 全部完成 → 恢复 Phase 1
          ▼
 Phase 0-1 (Node + ZK — 大部分已完成，等待 P0)
@@ -607,14 +607,14 @@ P0 Sprint (当前):
   P0.2  H-1 state_root 负测试                ✅ 已完成
   P0.3  C-5 nullifier 端到端测试             ✅ 已完成
   P0.4  A-3 viewing key 统一                 ✅ 已完成
-  P0.5  C-2 membership+nullifier              ⏳ Gate 选择待实现（见 §2.2 更新）
+   P0.5  C-2 membership+nullifier              ✅ Gate 选择与集成已完成（见 §2.2 更新）
   ─────────────────────────────────────────────────────────────────
 
 P0.5 实施子项:
   1.  ✅ MockProver: MembershipCircuit + Poseidon Merkle 路径验证 + Nullifier 派生
   2.  ✅ IPA 回环: 根因分析（permutation label mismatch）+ 初步修复（preserve position_bits in without_witnesses）
-  3.  ⏳ Gate 选择重构: 替换 constrain_equal 分支为 mux_inputs gate，使 VK 与 position_bits 无关
-  4.  ❌ 集成到 ValueConservationCircuit: 将 MembershipCircuit 作为子模块接入 tx 电路
+  3.  ✅ Gate 选择重构: 替换 constrain_equal 分支为 mux_inputs gate，使 VK 与 position_bits 无关
+  4.  ✅ 集成到 CombinedConservationCircuit (`combined_circuit.rs`): 将 membership+conservation 合并在单一电路中
 
 P0 后继续:
   Phase 1.4  B-3: aggregate_proofs IPA 化    ~1 周

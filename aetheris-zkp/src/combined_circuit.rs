@@ -36,7 +36,7 @@ pub struct CombinedConfig {
     pub poseidon: PoseidonFqConfig,
     /// Selectors
     pub s_running_sum: Selector,
-    pub s_constrain_equal: Selector,
+    pub s_zero_check: Selector,
     pub s_conservation: Selector,
     pub s_bool: Selector,
     pub s_select: Selector,
@@ -173,7 +173,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
 
         // ── Selectors ──
         let s_running_sum = meta.selector();
-        let s_constrain_equal = meta.selector();
+        let s_zero_check = meta.selector();
         let s_conservation = meta.selector();
         let s_bool = meta.selector();
         let s_select = meta.selector();
@@ -200,9 +200,9 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
         });
 
-        // Gate 3: constrain_equal
-        meta.create_gate("constrain_equal", |meta| {
-            let s = meta.query_selector(s_constrain_equal);
+        // Gate 3: zero_check
+        meta.create_gate("zero_check", |meta| {
+            let s = meta.query_selector(s_zero_check);
             let a = meta.query_advice(advice[0], Rotation(0));
             let b = meta.query_advice(advice[2], Rotation(0));
             vec![s.clone() * (a - b.clone()), s * b]
@@ -253,7 +253,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             bit,
             poseidon,
             s_running_sum,
-            s_constrain_equal,
+            s_zero_check,
             s_conservation,
             s_bool,
             s_select,
@@ -371,7 +371,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                         remaining >>= 1;
                     }
                     offset += 1;
-                    config.s_constrain_equal.enable(&mut region, offset)?;
+                    config.s_zero_check.enable(&mut region, offset)?;
                     region.assign_advice(
                         || "z_64_zero",
                         config.advice[0],
@@ -458,8 +458,10 @@ impl Circuit<Fq> for CombinedConservationCircuit {
         )?;
 
         // ── Merkle path verification (inline Poseidon + gate mux) ────────
+        // Level-to-level constrain_equal links hash output → next leaf input
+        // for formal soundness (beyond Poseidon preimage resistance).
         let mut current_val = leaf_fq;
-        let mut current_cell: Option<Cell> = None;
+        let mut level_cells: Vec<(Cell, Cell)> = Vec::with_capacity(depth);
 
         for i in 0..depth {
             let sibling_val = sibling_fqs[i];
@@ -470,7 +472,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             let chip = PoseidonFqChip::new(config.poseidon.clone());
             let next_val = chip.native_hash(first, second);
 
-            let hash_cell = layouter.assign_region(
+            let (leaf_cell, hash_cell) = layouter.assign_region(
                 || format!("merkle_level_{}", i),
                 |mut region| {
                     let mut state = [
@@ -480,11 +482,12 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                     ];
                     let mut offset = 0usize;
 
-                    // Row 0: mux + first full round
+                    // Row 0: mux + bool_check + first full round
                     config.s_select.enable(&mut region, offset)?;
+                    config.s_bool.enable(&mut region, offset)?;
                     config.poseidon.s_full.enable(&mut region, offset)?;
 
-                    region.assign_advice(
+                    let leaf_cell = region.assign_advice(
                         || "leaf",
                         config.leaf,
                         offset,
@@ -674,15 +677,26 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                             || state[col_i],
                         )?;
                     }
-                    Ok(out)
+                    Ok((leaf_cell.cell(), out.cell()))
                 },
             )?;
 
+            level_cells.push((leaf_cell, hash_cell));
+
             current_val = next_val;
-            current_cell = Some(hash_cell.cell());
         }
 
-        let current_cell = current_cell.expect("Merkle depth must be ≥ 1");
+        // Chain levels: constrain_equal(hash_output_i, leaf_input_{i+1})
+        layouter.assign_region(|| "chain_levels", |mut region| {
+            for i in 0..level_cells.len().saturating_sub(1) {
+                let (_, prev_hash) = level_cells[i];
+                let (next_leaf, _) = level_cells[i + 1];
+                region.constrain_equal(prev_hash, next_leaf)?;
+            }
+            Ok(())
+        })?;
+
+        let final_hash_cell = level_cells.last().expect("Merkle depth must be ≥ 1").1;
 
         // ── Constrain root to instance[0] ──
         layouter.assign_region(|| "constrain_root", |mut region| {
@@ -693,7 +707,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                 config.poseidon.state[0],
                 0,
             )?;
-            region.constrain_equal(current_cell, instance_cell.cell())?;
+            region.constrain_equal(final_hash_cell, instance_cell.cell())?;
             Ok(())
         })?;
 
@@ -851,6 +865,9 @@ pub fn verify_combined_tx(
             .try_into()
             .unwrap()) as usize;
     if in_len + out_len > MAX_IOPS || depth == 0 || depth > MAX_DEPTH {
+        return false;
+    }
+    if output_commitments.len() != out_len {
         return false;
     }
     let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
@@ -1133,5 +1150,116 @@ mod tests {
         let wrong_root = make_leaf(0xFF);
         let valid = verify_combined_tx(&proof, &wrong_root, &nf, &[[4u8; 32]], 0);
         assert!(!valid, "wrong root should be rejected");
+    }
+
+    #[test]
+    fn test_combined_empty_amounts_mock() {
+        let depth = 3;
+        let n_leaves = 1 << depth;
+        let leaves: Vec<[u8; 32]> = (0..n_leaves).map(|i| make_leaf(i as u64)).collect();
+        let mut tree = IncrementalMerkleTree::new();
+        for leaf in &leaves {
+            tree.append(*leaf);
+        }
+        let path = tree.path(2).unwrap();
+        let root = *tree.root();
+        let sk = make_leaf(0xCAFE);
+        let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
+
+        let circuit = CombinedConservationCircuit {
+            amounts_in: vec![],
+            amounts_out: vec![],
+            in_blindings: vec![],
+            out_blindings: vec![],
+            output_commitments: vec![],
+            public_amount: 0,
+            leaf: leaves[2],
+            path_siblings: path.siblings.clone(),
+            position_bits: path.position_bits.clone(),
+            sk,
+            index: 2,
+            merkle_root: root,
+            nullifier: nf,
+        };
+        let root_fq = Fq::from_repr(root).unwrap();
+        let nf_fq = Fq::from_repr(nf).unwrap();
+        let instances = vec![vec![root_fq, nf_fq, Fq::ZERO]];
+        let prover = MockProver::run(MEMBERSHIP_K, &circuit, instances).unwrap();
+        assert_eq!(prover.verify(), Ok(()), "empty amounts mock should pass");
+    }
+
+    #[test]
+    fn test_combined_mock_depth_1() {
+        run_combined_mock(1, 0, true);
+    }
+
+    #[test]
+    fn test_combined_verify_len_mismatch() {
+        let depth = 3;
+        let n_leaves = 1 << depth;
+        let leaves: Vec<[u8; 32]> = (0..n_leaves).map(|i| make_leaf(i as u64)).collect();
+        let mut tree = IncrementalMerkleTree::new();
+        for leaf in &leaves {
+            tree.append(*leaf);
+        }
+        let path = tree.path(2).unwrap();
+        let root = *tree.root();
+        let sk = make_leaf(0xCAFE);
+        let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
+
+        let proof = prove_combined_tx(
+            &[100, 200],
+            &[300],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32]],
+            &[[4u8; 32]],
+            0,
+            &leaves[2],
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            2,
+            &root,
+            &nf,
+        );
+
+        // Provide 2 commitments when proof expects 1
+        let valid = verify_combined_tx(&proof, &root, &nf, &[[4u8; 32], [5u8; 32]], 0);
+        assert!(!valid, "len mismatch should be rejected");
+    }
+
+    #[test]
+    fn test_combined_verify_swapped_root_nf() {
+        let depth = 3;
+        let n_leaves = 1 << depth;
+        let leaves: Vec<[u8; 32]> = (0..n_leaves).map(|i| make_leaf(i as u64)).collect();
+        let mut tree = IncrementalMerkleTree::new();
+        for leaf in &leaves {
+            tree.append(*leaf);
+        }
+        let path = tree.path(2).unwrap();
+        let root = *tree.root();
+        let sk = make_leaf(0xCAFE);
+        let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
+
+        let proof = prove_combined_tx(
+            &[100, 200],
+            &[300],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32]],
+            &[[4u8; 32]],
+            0,
+            &leaves[2],
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            2,
+            &root,
+            &nf,
+        );
+
+        // Swap root and nullifier in verification
+        let valid = verify_combined_tx(&proof, &nf, &root, &[[4u8; 32]], 0);
+        assert!(!valid, "swapped root/nf should be rejected");
     }
 }

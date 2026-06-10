@@ -103,7 +103,7 @@ pub fn create_nullifier(sk: &[u8], commitment_index: u64) -> [u8; 32] {
 pub struct ValueConfig {
     pub advice: [Column<Advice>; 3],
     pub s_running_sum: Selector,
-    pub s_constrain_equal: Selector,
+    pub s_zero_check: Selector,
     pub instance: Column<Instance>,
 }
 
@@ -148,7 +148,7 @@ impl Circuit<Fr> for ValueConservationCircuit {
             meta.enable_equality(*col);
         }
         let s_running_sum = meta.selector();
-        let s_constrain_equal = meta.selector();
+        let s_zero_check = meta.selector();
         let instance = meta.instance_column();
         meta.enable_equality(instance);
 
@@ -166,8 +166,8 @@ impl Circuit<Fr> for ValueConservationCircuit {
             vec![s * b.clone() * (Expression::Constant(Fr::one()) - b)]
         });
 
-        meta.create_gate("constrain_equal", |meta| {
-            let s = meta.query_selector(s_constrain_equal);
+        meta.create_gate("zero_check", |meta| {
+            let s = meta.query_selector(s_zero_check);
             let a = meta.query_advice(advice[0], Rotation(0));
             let b = meta.query_advice(advice[2], Rotation(0));
             vec![s * (a - b)]
@@ -176,7 +176,7 @@ impl Circuit<Fr> for ValueConservationCircuit {
         ValueConfig {
             advice,
             s_running_sum,
-            s_constrain_equal,
+            s_zero_check,
             instance,
         }
     }
@@ -236,7 +236,7 @@ impl Circuit<Fr> for ValueConservationCircuit {
             let net_fr = Fr::from(net_value.unsigned_abs());
             region.assign_advice(|| "net_value", config.advice[0], offset, || Value::known(net_fr))?;
             region.assign_advice(|| "net_value_copy", config.advice[2], offset, || Value::known(net_fr))?;
-            config.s_constrain_equal.enable(&mut region, offset)?;
+            config.s_zero_check.enable(&mut region, offset)?;
             region.constrain_constant(config.advice[2], offset, Fr::zero())?;
 
             Ok(())
@@ -447,6 +447,7 @@ impl Halo2BN254Backend {
         amount: u64,
         blinding: &[u8; 32],
     ) -> ([u8; 32], Vec<u8>) {
+        assert!(!pk_d.iter().all(|&b| b == 0), "encrypt_for_recipient: pk_d cannot be all-zero");
         let esk = EphemeralSecret::random_from_rng(&mut OsRng);
         let epk = PublicKey::from(&esk);
         let shared = {
@@ -630,6 +631,33 @@ mod tests {
         let (_, ct1) = Halo2BN254Backend::encrypt_note(&vk, &epk_pub.to_bytes(), 42, &blinding);
         let (_, ct2) = Halo2BN254Backend::encrypt_note(&vk, &epk_pub.to_bytes(), 42, &blinding);
         assert_ne!(ct1, ct2, "Nonces should be unique");
+    }
+
+    #[test]
+    fn test_encrypt_for_recipient_roundtrip() {
+        let vk = [0xABu8; 32];
+        let blinding = [0x42u8; 32];
+        let amount = 12345u64;
+
+        let pk_d = {
+            let sk = x25519_dalek::StaticSecret::from(vk);
+            let pk = x25519_dalek::PublicKey::from(&sk);
+            *pk.as_bytes()
+        };
+
+        let (epk, ciphertext) = Halo2BN254Backend::encrypt_for_recipient(&pk_d, amount, &blinding);
+
+        let decrypted = Halo2BN254Backend::trial_decrypt(&vk, &epk, &ciphertext);
+        assert_eq!(decrypted, Some((amount, blinding)));
+    }
+
+    #[test]
+    fn test_encrypt_for_recipient_rejects_zero_pk_d() {
+        let pk_d = [0u8; 32];
+        let result = std::panic::catch_unwind(|| {
+            Halo2BN254Backend::encrypt_for_recipient(&pk_d, 100, &[1u8; 32]);
+        });
+        assert!(result.is_err(), "encrypt_for_recipient should panic on all-zero pk_d");
     }
 
     #[test]

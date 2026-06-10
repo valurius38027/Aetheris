@@ -126,8 +126,8 @@ fn ensure_membership_keys(circuit: &MembershipCircuit) -> CachedKeyPair {
 }
 
 fn ensure_membership_keys_for_depth(depth: usize) -> CachedKeyPair {
-    // NOTE: these keys are only valid for position_bits=[false; depth].
-    // For circuits with mixed position_bits, use ensure_membership_keys with the real circuit.
+    // After C-3 gate-based mux fix, VK is position_bits-independent.
+    // The dummy circuit (all-false bits) produces a VK valid for any position_bits.
     let params = ensure_params();
     let dummy = MembershipCircuit::dummy(depth);
     let vk = keygen_vk(params, &dummy).expect("membership keygen_vk failed");
@@ -157,7 +157,7 @@ pub fn create_nullifier(sk: &[u8], commitment_index: u64) -> [u8; 32] {
 pub struct ValueConfig {
     pub advice: [Column<Advice>; 5],
     pub s_running_sum: Selector,
-    pub s_constrain_equal: Selector,
+    pub s_zero_check: Selector,
     pub s_conservation: Selector,
     pub instance: Column<Instance>,
 }
@@ -209,7 +209,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
             meta.enable_equality(*col);
         }
         let s_running_sum = meta.selector();
-        let s_constrain_equal = meta.selector();
+        let s_zero_check = meta.selector();
         let s_conservation = meta.selector();
         let instance = meta.instance_column();
         meta.enable_equality(instance);
@@ -228,8 +228,8 @@ impl Circuit<Fq> for ValueConservationCircuit {
             vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
         });
 
-        meta.create_gate("constrain_equal", |meta| {
-            let s = meta.query_selector(s_constrain_equal);
+        meta.create_gate("zero_check", |meta| {
+            let s = meta.query_selector(s_zero_check);
             let a = meta.query_advice(advice[0], Rotation(0));
             let b = meta.query_advice(advice[2], Rotation(0));
             vec![s.clone() * (a - b.clone()), s * b]
@@ -246,7 +246,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
         ValueConfig {
             advice,
             s_running_sum,
-            s_constrain_equal,
+            s_zero_check,
             s_conservation,
             instance,
         }
@@ -286,7 +286,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
                 }
                 // Constrain z_64 = 0 (A-1 soundness fix: prover can't claim amount > 2^64−1)
                 offset += 1;
-                config.s_constrain_equal.enable(&mut region, offset)?;
+                config.s_zero_check.enable(&mut region, offset)?;
                 region.assign_advice(|| "z_64_zero", config.advice[0], offset, || Value::known(z_prev))?;
                 region.assign_advice(|| "zero", config.advice[2], offset, || Value::known(Fq::ZERO))?;
 
@@ -622,7 +622,7 @@ impl Halo2PastaBackend {
     /// Returns true iff the proof is valid for the given `merkle_root` and `nullifier`.
     pub fn verify_membership(proof: &[u8], merkle_root: &[u8; 32], nullifier: &[u8; 32]) -> bool {
         const PREFIX: &[u8] = b"halo2_ipa_member_v1_";
-        const PREFIX_LEN: usize = 19;
+        const PREFIX_LEN: usize = 20;
         const DEPTH_LEN: usize = 4;
         const MAX_DEPTH: usize = 32;
         if proof.len() < PREFIX_LEN + DEPTH_LEN || !proof.starts_with(PREFIX) {
@@ -1763,10 +1763,34 @@ mod tests {
     }
 
     #[test]
-    // NOTE: test_membership_roundtrip_depth_2 was removed because the
-    // prove_membership/verify_membership API uses depth-cached VK/PK
-    // (all-false position_bits) which is incompatible with mixed position_bits.
-    // Use ensure_membership_keys(&circuit) for position_bits-aware keygen.
+    fn test_membership_public_api_roundtrip() {
+        use crate::merkle_tree::IncrementalMerkleTree;
+        use crate::poseidon_fq;
+
+        let mut tree = IncrementalMerkleTree::new();
+        for i in 0..4u64 {
+            let mut leaf = [0u8; 32];
+            leaf[..8].copy_from_slice(&i.to_le_bytes());
+            tree.append(leaf);
+        }
+        let index = 2u64;
+        let mut leaf = [0u8; 32];
+        leaf[..8].copy_from_slice(&index.to_le_bytes());
+        let sk = Fq::from(42u64).to_repr();
+        let nf = poseidon_fq::poseidon_nullifier(&sk, index);
+
+        let path = tree.path(index as usize).unwrap();
+        let root = *tree.root();
+
+        let proof = Halo2PastaBackend::prove_membership(
+            &leaf, &path.siblings, &path.position_bits, &sk, index, &root, &nf,
+        );
+        assert!(Halo2PastaBackend::verify_membership(&proof, &root, &nf),
+            "public API membership roundtrip should verify");
+        let fake_root = [0xFFu8; 32];
+        assert!(!Halo2PastaBackend::verify_membership(&proof, &fake_root, &nf),
+            "wrong root should be rejected");
+    }
 
     #[test]
     fn test_conservation_basic() {
@@ -2173,7 +2197,7 @@ mod tests {
                         z_prev = z_cur;
                     }
                     offset += 1;
-                    config.s_constrain_equal.enable(&mut region, offset)?;
+                    config.s_zero_check.enable(&mut region, offset)?;
                     region.assign_advice(|| "z_64_overflow", config.advice[0], offset, || Value::known(z_prev))?;
                     region.assign_advice(|| "zero_ref", config.advice[2], offset, || Value::known(Fq::ZERO))?;
                     Ok(())
