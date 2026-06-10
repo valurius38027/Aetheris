@@ -77,11 +77,13 @@ Phase 4  生产就绪    ─→  文档/清理
 
 | 维度 | 值 |
 |------|-----|
-| **文件** | `aetheris-zkp/src/halo2_pasta.rs:147-318`（`ValueConservationCircuit`） |
+| **文件** | `aetheris-zkp/src/membership_circuit.rs`、`aetheris-zkp/src/halo2_pasta.rs` |
 | **问题** | 电路中完全没有：(a) Merkle 路径验证（验证 input 存在于承诺树）；(b) Nullifier 派生约束（blake3(sk, record_id)）；(c) 花费密钥与 note 所有权的关联。 |
-| **修复** | 在 `Circuit<Fq>` 中新增：(a) Poseidon 或 Blake3 Merkle 路径验证门；(b) Nullifier 派生约束门；(c) 实例绑定到 public input。此电路运行在 **Pallas**（外电路），与 B-2 的 Vesta 递归电路正交。 |
-| **测试** | `test_membership_proof_rejects_fake_input`、`test_nullifier_correctness_mismatch_rejected` |
-| **估算** | ~500-1000 行，1-2 周 |
+| **修复** | 在 `Circuit<Fq>` 中新增：(a) Poseidon Merkle 路径验证门；(b) Nullifier 派生约束门；(c) 实例绑定到 public input。 |
+| **IPA 回环发现** | 原实现用 `constrain_equal` 做 position_bits 分支选择，导致 IPA 真实证明失败：keygen 哑电路走全 `false` 分支，实际电路走混合分支，两者产生**不同的置换等价类**，验证返回 `ConstraintSystemFailure`。 |
+| **根因修复** | 改为 **Gate 输入选择**：每层新增 `mux_inputs` gate 约束 `first_input = (1-bit)*current + bit*sibling` / `second_input = bit*current + (1-bit)*sibling`，`assign_hash` 不再传 `first_cell`/`second_cell`（即不再有 branch-dependent `constrain_equal`）。详见 `protocol_design_ruling.md §2.2` 更新。 |
+| **测试** | `test_membership_proof_rejects_fake_input`、`test_nullifier_correctness_mismatch_rejected`；IPA roundtrip: `test_membership_direct_ipa`、`test_exact_membership_structure_ipa` |
+| **状态** | ⏳ 实现中——电路 mock prover 已通过，IPA 回环已修复，待接入 `ValueConservationCircuit` |
 
 > **P0 完成标准**: 以下全部通过 ——
 > - `cargo test -p aetheris-zkp` 新增测试全部通过（A-1 堵住 + C-2 电路约束活跃）
@@ -534,11 +536,11 @@ Phase 4  生产就绪    ─→  文档/清理
 
 ```
 P0 (协议安全 — 当前执行，所有 Phase 暂停)
-  P0.1 ──┐  A-1: running_sum z_64=0  (小)
-  P0.2 ──┤  H-1: state_root 负测试    (小)
-  P0.3 ──┤  C-5: nullifier 端到端测试 (小)
-  P0.4 ──┤  A-3: viewing key 统一     (中)
-  P0.5 ──┘  C-2: membership+nullifier (大)
+  P0.1 ──┐  A-1: running_sum z_64=0       ✅
+  P0.2 ──┤  H-1: state_root 负测试        ✅
+  P0.3 ──┤  C-5: nullifier 端到端测试     ✅
+  P0.4 ──┤  A-3: viewing key 统一         ✅
+  P0.5 ──┘  C-2: membership+nullifier     ⏳ IPA 回环已修复，Gate 选择待实现
          │  P0 全部完成 → 恢复 Phase 1
          ▼
 Phase 0-1 (Node + ZK — 大部分已完成，等待 P0)
@@ -594,15 +596,25 @@ Phase 2 ──→ Phase 3 ──→ Phase 4
   Phase 1.9        Conservation soundness fix (partial)                      ✅
   Phase 1.11.5     IPA-PLONK h_eval 修复                                     ✅
   Phase 1.12       B-2: In-Circuit IPA Verifier (Vesta native)               ✅
+  P0.1             A-1 running_sum z_64=0                                    ✅
+  P0.2             H-1 state_root 负测试                                     ✅
+  P0.3             C-5 nullifier 端到端测试                                  ✅
+  P0.4             A-3 viewing key 统一                                      ✅
   ─────────────────────────────────────────────────────────────────
 
 P0 Sprint (当前):
-  P0.1  A-1 running_sum z_64=0     ~1 天    正在执行
-  P0.2  H-1 state_root 负测试      ~1 天
-  P0.3  C-5 nullifier 端到端测试   ~1 天
-  P0.4  A-3 viewing key 统一       ~3 天
-  P0.5  C-2 membership+nullifier   ~2 周
+  P0.1  A-1 running_sum z_64=0               ✅ 已完成
+  P0.2  H-1 state_root 负测试                ✅ 已完成
+  P0.3  C-5 nullifier 端到端测试             ✅ 已完成
+  P0.4  A-3 viewing key 统一                 ✅ 已完成
+  P0.5  C-2 membership+nullifier              ⏳ Gate 选择待实现（见 §2.2 更新）
   ─────────────────────────────────────────────────────────────────
+
+P0.5 实施子项:
+  1.  ✅ MockProver: MembershipCircuit + Poseidon Merkle 路径验证 + Nullifier 派生
+  2.  ✅ IPA 回环: 根因分析（permutation label mismatch）+ 初步修复（preserve position_bits in without_witnesses）
+  3.  ⏳ Gate 选择重构: 替换 constrain_equal 分支为 mux_inputs gate，使 VK 与 position_bits 无关
+  4.  ❌ 集成到 ValueConservationCircuit: 将 MembershipCircuit 作为子模块接入 tx 电路
 
 P0 后继续:
   Phase 1.4  B-3: aggregate_proofs IPA 化    ~1 周

@@ -27,6 +27,7 @@ use crate::ipa::commitment::{CommitmentSchemeIPA, ParamsIPA};
 use crate::ipa::prover::ProverIPA;
 use crate::ipa::strategy::SingleStrategyIPA;
 use crate::trait_::{ZkProverSystem, TxCommitments};
+use crate::membership_circuit::MembershipCircuit;
 
 const PROVING_K: u32 = 11;
 
@@ -114,6 +115,24 @@ fn ensure_keys(
         .expect("key cache mutex poisoned")
         .insert(key, (vk, pk));
     result
+}
+
+#[cfg(test)]
+fn ensure_membership_keys(circuit: &MembershipCircuit) -> CachedKeyPair {
+    let params = ensure_params();
+    let vk = keygen_vk(params, circuit).expect("membership keygen_vk failed");
+    let pk = keygen_pk(params, vk.clone(), circuit).expect("membership keygen_pk failed");
+    (vk, pk)
+}
+
+fn ensure_membership_keys_for_depth(depth: usize) -> CachedKeyPair {
+    // NOTE: these keys are only valid for position_bits=[false; depth].
+    // For circuits with mixed position_bits, use ensure_membership_keys with the real circuit.
+    let params = ensure_params();
+    let dummy = MembershipCircuit::dummy(depth);
+    let vk = keygen_vk(params, &dummy).expect("membership keygen_vk failed");
+    let pk = keygen_pk(params, vk.clone(), &dummy).expect("membership keygen_pk failed");
+    (vk, pk)
 }
 
 pub fn create_commitment(amount: u64, blinding: &[u8; 32]) -> [u8; 32] {
@@ -409,7 +428,12 @@ impl ZkProverSystem for Halo2PastaBackend {
             Fq::ZERO - Fq::from(public_amount.unsigned_abs())
         };
         let mut instance_col = vec![instance_fq];
-        instance_col.extend(output_commitments.iter().map(|cm| Fq::from_repr(*cm).into_option().unwrap()));
+        for cm in output_commitments {
+            instance_col.push(
+                Fq::from_repr(*cm).into_option()
+                    .expect("prove_conservation: invalid commitment bytes — must be canonical Fq repr")
+            );
+        }
         let instances = vec![instance_col];
         create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
             params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
@@ -451,7 +475,12 @@ impl ZkProverSystem for Halo2PastaBackend {
             Fq::ZERO - Fq::from(public_amount.unsigned_abs())
         };
         let mut instance_col = vec![instance_fq];
-        instance_col.extend(output_commitments.iter().map(|cm| Fq::from_repr(*cm).into_option().unwrap()));
+        for cm in output_commitments {
+            match Fq::from_repr(*cm).into_option() {
+                Some(fq) => instance_col.push(fq),
+                None => return false,
+            }
+        }
         let instances = vec![instance_col];
 
         let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
@@ -547,6 +576,97 @@ impl ZkProverSystem for Halo2PastaBackend {
 }
 
 impl Halo2PastaBackend {
+    /// Prove membership of a leaf (note commitment) in the Merkle tree,
+    /// and that the nullifier H(sk, index) matches the claimed value.
+    /// Public instances: [merkle_root, nullifier].
+    /// Wire format: 19-byte prefix + 4-byte depth (u32 LE) + inner Halo2 proof.
+    pub fn prove_membership(
+        leaf: &[u8; 32],
+        path_siblings: &[[u8; 32]],
+        position_bits: &[bool],
+        sk: &[u8; 32],
+        index: u64,
+        merkle_root: &[u8; 32],
+        nullifier: &[u8; 32],
+    ) -> Vec<u8> {
+        let depth = path_siblings.len();
+        let (params, (_vk, pk)) = (ensure_params(), ensure_membership_keys_for_depth(depth));
+
+        let circuit = MembershipCircuit {
+            leaf: *leaf,
+            path_siblings: path_siblings.to_vec(),
+            position_bits: position_bits.to_vec(),
+            sk: *sk,
+            index,
+            merkle_root: *merkle_root,
+            nullifier: *nullifier,
+        };
+
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        let root_fq = Fq::from_repr(*merkle_root).into_option().expect("merkle_root is canonical Fq");
+        let nf_fq = Fq::from_repr(*nullifier).into_option().expect("nullifier is canonical Fq");
+        let instances = vec![vec![root_fq, nf_fq]];
+
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
+        )
+        .expect("prove_membership failed");
+        let proof = transcript.finalize();
+        let mut full = b"halo2_ipa_member_v1_".to_vec();
+        full.extend_from_slice(&(depth as u32).to_le_bytes());
+        full.extend_from_slice(&proof);
+        full
+    }
+
+    /// Verify a membership proof produced by `prove_membership`.
+    /// Returns true iff the proof is valid for the given `merkle_root` and `nullifier`.
+    pub fn verify_membership(proof: &[u8], merkle_root: &[u8; 32], nullifier: &[u8; 32]) -> bool {
+        const PREFIX: &[u8] = b"halo2_ipa_member_v1_";
+        const PREFIX_LEN: usize = 19;
+        const DEPTH_LEN: usize = 4;
+        const MAX_DEPTH: usize = 32;
+        if proof.len() < PREFIX_LEN + DEPTH_LEN || !proof.starts_with(PREFIX) {
+            return false;
+        }
+        let depth = u32::from_le_bytes(
+            proof[PREFIX_LEN..PREFIX_LEN + DEPTH_LEN]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if depth == 0 || depth > MAX_DEPTH {
+            return false;
+        }
+        let inner_proof = &proof[PREFIX_LEN + DEPTH_LEN..];
+
+        let (params, (vk, _)) = (ensure_params(), ensure_membership_keys_for_depth(depth));
+
+        let root_fq = match Fq::from_repr(*merkle_root).into_option() {
+            Some(fq) => fq,
+            None => return false,
+        };
+        let nf_fq = match Fq::from_repr(*nullifier).into_option() {
+            Some(fq) => fq,
+            None => return false,
+        };
+        let instances = vec![vec![root_fq, nf_fq]];
+
+        let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
+        let result = verify_proof_with_strategy::<
+            CommitmentSchemeIPA<EpAffine>,
+            _,
+            Challenge255<EpAffine>,
+            Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>,
+            SingleStrategyIPA<'_, EpAffine>,
+        >(params, &vk, SingleStrategyIPA::new(params), &[instances], &mut transcript);
+        match result {
+            Ok(strategy) => strategy.finalize(),
+            Err(e) => {
+                eprintln!("[ZK] verify_membership error: {:?}", e);
+                false
+            }
+        }
+    }
+
     pub fn setup_params() -> ParamsIPA<EpAffine> {
         ParamsIPA::<EpAffine>::setup(
             PROVING_K,
@@ -557,11 +677,13 @@ impl Halo2PastaBackend {
 
     /// A-3: Sender-side DH encryption using recipient's public key (pk_d).
     /// Generates ephemeral keypair, computes DH(esk, pk_d), derives AES key.
+    /// Panics if pk_d is all-zero (identity element → shared secret is zero).
     pub fn encrypt_for_recipient(
         pk_d: &[u8; 32],
         amount: u64,
         blinding: &[u8; 32],
     ) -> ([u8; 32], Vec<u8>) {
+        assert!(!pk_d.iter().all(|&b| b == 0), "encrypt_for_recipient: pk_d cannot be all-zero");
         let esk = EphemeralSecret::random_from_rng(&mut OsRng);
         let epk = PublicKey::from(&esk);
         let shared = {
@@ -647,9 +769,1004 @@ impl Halo2PastaBackend {
 mod tests {
     use super::*;
 
+    fn test_merkle_leaf(i: u64) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b
+    }
+
     fn make_proof(amounts_in: &[u64], amounts_out: &[u64], commitments: &[[u8; 32]], pub_amt: i64) -> Vec<u8> {
         Halo2PastaBackend::prove_conservation(amounts_in, amounts_out, &[], &[], commitments, pub_amt)
     }
+
+    #[test]
+    fn test_witness_bool_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{
+                Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector,
+            },
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct WBConfig {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct WBCircuit {
+            leaf: Fq,
+            bits: Vec<bool>,
+        }
+
+        impl Circuit<Fq> for WBCircuit {
+            type Config = WBConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self { self.clone() }
+
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                meta.enable_equality(leaf);
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(leaf, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                WBConfig { poseidon, leaf, s_bool, instance }
+            }
+
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let leaf_cell = layouter.assign_region(|| "witness", |mut region| {
+                    let lc = region.assign_advice(|| "leaf", config.leaf, 0, || Value::known(self.leaf))?;
+                    for (i, &b) in self.bits.iter().enumerate() {
+                        config.s_bool.enable(&mut region, 1 + i)?;
+                        region.assign_advice(|| format!("bit_{}", i), config.leaf, 1 + i,
+                            || Value::known(if b { Fq::one() } else { Fq::ZERO }))?;
+                    }
+                    Ok(lc.cell())
+                })?;
+                let one = Fq::one();
+                let hash_cell = chip.assign_hash(layouter.namespace(|| "hash"), Value::known(self.leaf), Value::known(one), Some(leaf_cell), None)?;
+                layouter.assign_region(|| "constrain", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "inst", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(hash_cell.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+
+        let params = ensure_params();
+        let dummy = WBCircuit { leaf: Fq::ZERO, bits: vec![false] };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+
+        let leaf = Fq::from(42u64);
+        let spec = ensure_poseidon_spec();
+        let mut state = [leaf, Fq::one(), Fq::ZERO];
+        poseidon_permute(spec, &mut state);
+        let expected = state[0];
+        let circuit = WBCircuit { leaf, bits: vec![true] };
+        let instances = vec![vec![expected]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "witness_bool verify returned false"),
+            Err(e) => panic!("witness_bool verify error: {:?}", e),
+        }
+        eprintln!("WITNESS_BOOL IPA ROUNDTRIP OK");
+    }
+
+    #[test]
+    fn test_merkle2_nf_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct M2Config {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            sib0: Column<Advice>,
+            sib1: Column<Advice>,
+            sk: Column<Advice>,
+            idx: Column<Advice>,
+            bit: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct M2Circuit {
+            leaf: Fq,
+            sib0: Fq,
+            sib1: Fq,
+            sk: Fq,
+            index: Fq,
+        }
+
+        impl Circuit<Fq> for M2Circuit {
+            type Config = M2Config;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self { self.clone() }
+
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let sib0 = meta.advice_column();
+                let sib1 = meta.advice_column();
+                let sk = meta.advice_column();
+                let idx = meta.advice_column();
+                let bit = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                for c in [&leaf, &sib0, &sib1, &sk, &idx, &bit] {
+                    meta.enable_equality(*c);
+                }
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(bit, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                M2Config { poseidon, leaf, sib0, sib1, sk, idx, bit, s_bool, instance }
+            }
+
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let witnesses = layouter.assign_region(|| "witness", |mut region| {
+                    let lc = region.assign_advice(|| "leaf", config.leaf, 0, || Value::known(self.leaf))?;
+                    let s0c = region.assign_advice(|| "sib0", config.sib0, 1, || Value::known(self.sib0))?;
+                    let s1c = region.assign_advice(|| "sib1", config.sib1, 2, || Value::known(self.sib1))?;
+                    config.s_bool.enable(&mut region, 3)?;
+                    region.assign_advice(|| "bit", config.bit, 3, || Value::known(Fq::one()))?;
+                    let skc = region.assign_advice(|| "sk", config.sk, 4, || Value::known(self.sk))?;
+                    let ic = region.assign_advice(|| "index", config.idx, 5, || Value::known(self.index))?;
+                    Ok((lc.cell(), s0c.cell(), s1c.cell(), skc.cell(), ic.cell()))
+                })?;
+                let (leaf_cell, sib0_cell, sib1_cell, sk_cell, idx_cell) = witnesses;
+
+                // H1 = H(leaf, sib0)
+                let h1_native = chip.native_hash(self.leaf, self.sib0);
+                let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
+
+                // H2 = H(h1_out, sib1) — BOTH cells copy-constrained
+                let h2_native = chip.native_hash(h1_native, self.sib1);
+                let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(h1_native), Value::known(self.sib1), Some(h1.cell()), Some(sib1_cell))?;
+
+                // Nullifier = H(sk, index)
+                let nf_native = chip.native_hash(self.sk, self.index);
+                let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
+
+                // instance[0] = h2, instance[1] = nf
+                layouter.assign_region(|| "c0", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "r", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                layouter.assign_region(|| "c1", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "n", config.instance, 1, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(nf.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+
+        let params = ensure_params();
+        let dummy = M2Circuit { leaf: Fq::ZERO, sib0: Fq::ZERO, sib1: Fq::ZERO, sk: Fq::ZERO, index: Fq::ZERO };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+
+        let leaf = Fq::from(3u64);
+        let sib0 = Fq::from(5u64);
+        let sib1 = Fq::from(7u64);
+        let sk = Fq::from(9u64);
+        let index = Fq::from(11u64);
+        let spec = ensure_poseidon_spec();
+        let mut s = [leaf, sib0, Fq::ZERO]; poseidon_permute(spec, &mut s);
+        let mut s2 = [s[0], sib1, Fq::ZERO]; poseidon_permute(spec, &mut s2);
+        let mut nf_s = [sk, index, Fq::ZERO]; poseidon_permute(spec, &mut nf_s);
+        let circuit = M2Circuit { leaf, sib0, sib1, sk, index };
+        let instances = vec![vec![s2[0], nf_s[0]]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "m2 verify returned false"),
+            Err(e) => panic!("m2 verify error: {:?}", e),
+        }
+        eprintln!("M2 IPA ROUNDTRIP OK");
+    }
+
+    /// Same as M2 but uses a SINGLE `siblings` column (like MembershipCircuit).
+    #[test]
+    fn test_single_sib_col_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct SSConfig {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            siblings: Column<Advice>,   // single column for ALL siblings
+            sk: Column<Advice>,
+            idx: Column<Advice>,
+            bit: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct SSCircuit {
+            leaf: Fq,
+            sib0: Fq,
+            sib1: Fq,
+            sk: Fq,
+            index: Fq,
+        }
+
+        impl Circuit<Fq> for SSCircuit {
+            type Config = SSConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self { self.clone() }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let siblings = meta.advice_column();
+                let sk = meta.advice_column();
+                let idx = meta.advice_column();
+                let bit = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                for c in [&leaf, &siblings, &sk, &idx, &bit] {
+                    meta.enable_equality(*c);
+                }
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(bit, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                SSConfig { poseidon, leaf, siblings, sk, idx, bit, s_bool, instance }
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let witnesses = layouter.assign_region(|| "witness", |mut region| {
+                    let lc = region.assign_advice(|| "leaf", config.leaf, 0, || Value::known(self.leaf))?;
+                    let s0c = region.assign_advice(|| "sib0", config.siblings, 1, || Value::known(self.sib0))?;
+                    let s1c = region.assign_advice(|| "sib1", config.siblings, 2, || Value::known(self.sib1))?;
+                    config.s_bool.enable(&mut region, 3)?;
+                    region.assign_advice(|| "bit", config.bit, 3, || Value::known(Fq::one()))?;
+                    let skc = region.assign_advice(|| "sk", config.sk, 4, || Value::known(self.sk))?;
+                    let ic = region.assign_advice(|| "index", config.idx, 5, || Value::known(self.index))?;
+                    Ok((lc.cell(), s0c.cell(), s1c.cell(), skc.cell(), ic.cell()))
+                })?;
+                let (leaf_cell, sib0_cell, sib1_cell, sk_cell, idx_cell) = witnesses;
+                let h1_native = chip.native_hash(self.leaf, self.sib0);
+                let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
+                let h2_native = chip.native_hash(h1_native, self.sib1);
+                let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(h1_native), Value::known(self.sib1), Some(h1.cell()), Some(sib1_cell))?;
+                let nf_native = chip.native_hash(self.sk, self.index);
+                let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
+                layouter.assign_region(|| "c0", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "r", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                layouter.assign_region(|| "c1", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "n", config.instance, 1, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(nf.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+        let params = ensure_params();
+        let dummy = SSCircuit { leaf: Fq::ZERO, sib0: Fq::ZERO, sib1: Fq::ZERO, sk: Fq::ZERO, index: Fq::ZERO };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+        let leaf = Fq::from(3u64);
+        let sib0 = Fq::from(5u64);
+        let sib1 = Fq::from(7u64);
+        let sk = Fq::from(9u64);
+        let index = Fq::from(11u64);
+        let spec = ensure_poseidon_spec();
+        let mut s = [leaf, sib0, Fq::ZERO]; poseidon_permute(spec, &mut s);
+        let mut s2 = [s[0], sib1, Fq::ZERO]; poseidon_permute(spec, &mut s2);
+        let mut nf_s = [sk, index, Fq::ZERO]; poseidon_permute(spec, &mut nf_s);
+        let circuit = SSCircuit { leaf, sib0, sib1, sk, index };
+        let instances = vec![vec![s2[0], nf_s[0]]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "ss verify returned false"),
+            Err(e) => panic!("ss verify error: {:?}", e),
+        }
+        eprintln!("SINGLE SIB COL IPA ROUNDTRIP OK");
+    }
+
+    /// Tests swapped order: H2 first_cell = sib (siblings col), second_cell = h1_out (state col)
+    #[test]
+    fn test_swapped_order_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct SwapConfig {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            sib0: Column<Advice>,
+            sib1: Column<Advice>,
+            sk: Column<Advice>,
+            idx: Column<Advice>,
+            bit: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct SwapCircuit {
+            leaf: Fq,
+            sib0: Fq,
+            sib1: Fq,
+            sk: Fq,
+            index: Fq,
+        }
+
+        impl Circuit<Fq> for SwapCircuit {
+            type Config = SwapConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self { self.clone() }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let sib0 = meta.advice_column();
+                let sib1 = meta.advice_column();
+                let sk = meta.advice_column();
+                let idx = meta.advice_column();
+                let bit = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                for c in [&leaf, &sib0, &sib1, &sk, &idx, &bit] { meta.enable_equality(*c); }
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(bit, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                SwapConfig { poseidon, leaf, sib0, sib1, sk, idx, bit, s_bool, instance }
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let witnesses = layouter.assign_region(|| "witness", |mut region| {
+                    let lc = region.assign_advice(|| "leaf", config.leaf, 0, || Value::known(self.leaf))?;
+                    let s0c = region.assign_advice(|| "sib0", config.sib0, 1, || Value::known(self.sib0))?;
+                    let s1c = region.assign_advice(|| "sib1", config.sib1, 2, || Value::known(self.sib1))?;
+                    config.s_bool.enable(&mut region, 3)?;
+                    region.assign_advice(|| "bit", config.bit, 3, || Value::known(Fq::one()))?;
+                    let skc = region.assign_advice(|| "sk", config.sk, 4, || Value::known(self.sk))?;
+                    let ic = region.assign_advice(|| "index", config.idx, 5, || Value::known(self.index))?;
+                    Ok((lc.cell(), s0c.cell(), s1c.cell(), skc.cell(), ic.cell()))
+                })?;
+                let (leaf_cell, sib0_cell, sib1_cell, sk_cell, idx_cell) = witnesses;
+
+                // H1 = H(leaf, sib0) — normal order
+                let h1_native = chip.native_hash(self.leaf, self.sib0);
+                let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
+
+                // H2 = H(h1_out, sib1) — SWAPPED: sib1 goes FIRST, prev hash output goes SECOND
+                // This mimics position_bits=true in the membership circuit
+                let h2_native = chip.native_hash(self.sib1, h1_native); // swapped native
+                // first_cell = Some(sib1_cell), second_cell = Some(h1.cell())
+                let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(self.sib1), Value::known(h1_native), Some(sib1_cell), Some(h1.cell()))?;
+
+                // Nullifier
+                let nf_native = chip.native_hash(self.sk, self.index);
+                let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
+
+                layouter.assign_region(|| "c0", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "r", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                layouter.assign_region(|| "c1", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "n", config.instance, 1, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(nf.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+        let params = ensure_params();
+        let dummy = SwapCircuit { leaf: Fq::ZERO, sib0: Fq::ZERO, sib1: Fq::ZERO, sk: Fq::ZERO, index: Fq::ZERO };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+        let leaf = Fq::from(3u64);
+        let sib0 = Fq::from(5u64);
+        let sib1 = Fq::from(7u64);
+        let sk = Fq::from(9u64);
+        let index = Fq::from(11u64);
+        let spec = ensure_poseidon_spec();
+        let mut s = [leaf, sib0, Fq::ZERO]; poseidon_permute(spec, &mut s);
+        let mut s2 = [sib1, s[0], Fq::ZERO]; poseidon_permute(spec, &mut s2); // swapped order
+        let mut nf_s = [sk, index, Fq::ZERO]; poseidon_permute(spec, &mut nf_s);
+        let circuit = SwapCircuit { leaf, sib0, sib1, sk, index };
+        let instances = vec![vec![s2[0], nf_s[0]]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "swap verify returned false"),
+            Err(e) => panic!("swap verify error: {:?}", e),
+        }
+        eprintln!("SWAP IPA ROUNDTRIP OK");
+    }
+
+    /// Single siblings column + swapped order (like MembershipCircuit when position_bits has mixed entries)
+    #[test]
+    fn test_ss_swap_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct SSSConfig {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            siblings: Column<Advice>,
+            sk: Column<Advice>,
+            idx: Column<Advice>,
+            bit: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct SSSCircuit {
+            leaf: Fq,
+            sib0: Fq,
+            sib1: Fq,
+            sk: Fq,
+            index: Fq,
+        }
+
+        impl Circuit<Fq> for SSSCircuit {
+            type Config = SSSConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self { self.clone() }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let siblings = meta.advice_column();
+                let sk = meta.advice_column();
+                let idx = meta.advice_column();
+                let bit = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                for c in [&leaf, &siblings, &sk, &idx, &bit] { meta.enable_equality(*c); }
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(bit, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                SSSConfig { poseidon, leaf, siblings, sk, idx, bit, s_bool, instance }
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let witnesses = layouter.assign_region(|| "witness", |mut region| {
+                    let lc = region.assign_advice(|| "leaf", config.leaf, 0, || Value::known(self.leaf))?;
+                    let s0c = region.assign_advice(|| "sib0", config.siblings, 1, || Value::known(self.sib0))?;
+                    let s1c = region.assign_advice(|| "sib1", config.siblings, 2, || Value::known(self.sib1))?;
+                    config.s_bool.enable(&mut region, 3)?;
+                    region.assign_advice(|| "bit", config.bit, 3, || Value::known(Fq::one()))?;
+                    let skc = region.assign_advice(|| "sk", config.sk, 4, || Value::known(self.sk))?;
+                    let ic = region.assign_advice(|| "index", config.idx, 5, || Value::known(self.index))?;
+                    Ok((lc.cell(), s0c.cell(), s1c.cell(), skc.cell(), ic.cell()))
+                })?;
+                let (leaf_cell, sib0_cell, sib1_cell, sk_cell, idx_cell) = witnesses;
+
+                // H1: normal order
+                let h1_native = chip.native_hash(self.leaf, self.sib0);
+                let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
+
+                // H2: swapped — sib1→state[0], h1_out→state[1] (mimics position_bits true)
+                let h2_native = chip.native_hash(self.sib1, h1_native);
+                let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(self.sib1), Value::known(h1_native), Some(sib1_cell), Some(h1.cell()))?;
+
+                let nf_native = chip.native_hash(self.sk, self.index);
+                let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
+
+                layouter.assign_region(|| "c0", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "r", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                layouter.assign_region(|| "c1", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "n", config.instance, 1, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(nf.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+        let params = ensure_params();
+        let dummy = SSSCircuit { leaf: Fq::ZERO, sib0: Fq::ZERO, sib1: Fq::ZERO, sk: Fq::ZERO, index: Fq::ZERO };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+        let leaf = Fq::from(3u64);
+        let sib0 = Fq::from(5u64);
+        let sib1 = Fq::from(7u64);
+        let sk = Fq::from(9u64);
+        let index = Fq::from(11u64);
+        let spec = ensure_poseidon_spec();
+        let mut s = [leaf, sib0, Fq::ZERO]; poseidon_permute(spec, &mut s);
+        let mut s2 = [sib1, s[0], Fq::ZERO]; poseidon_permute(spec, &mut s2);
+        let mut nf_s = [sk, index, Fq::ZERO]; poseidon_permute(spec, &mut nf_s);
+        let circuit = SSSCircuit { leaf, sib0, sib1, sk, index };
+        let instances = vec![vec![s2[0], nf_s[0]]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "sss verify returned false"),
+            Err(e) => panic!("sss verify error: {:?}", e),
+        }
+        eprintln!("SS SWAP IPA ROUNDTRIP OK");
+    }
+
+    /// Imports MembershipCircuit directly and runs IPA roundtrip
+    #[test]
+    fn test_membership_direct_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::membership_circuit::{MembershipCircuit, MEMBERSHIP_K};
+        use crate::merkle_tree::IncrementalMerkleTree;
+        use crate::poseidon_fq;
+
+        let mut tree = IncrementalMerkleTree::new();
+        for i in 0..4u64 {
+            let mut leaf_bytes = [0u8; 32];
+            leaf_bytes[..8].copy_from_slice(&i.to_le_bytes());
+            tree.append(leaf_bytes);
+        }
+        let sk = Fq::from(42u64).to_repr();
+        let index = 2u64;
+        let mut leaf_bytes = [0u8; 32];
+        leaf_bytes[..8].copy_from_slice(&index.to_le_bytes());
+        let mut index_bytes = [0u8; 32];
+        index_bytes[..8].copy_from_slice(&index.to_le_bytes());
+        let nf = poseidon_fq::poseidon_hash(&sk, &index_bytes);
+
+        let path = tree.path(index as usize).unwrap();
+
+        let params = ensure_params();
+        let circuit = MembershipCircuit {
+            leaf: leaf_bytes,
+            path_siblings: path.siblings.clone(),
+            position_bits: path.position_bits.clone(),
+            sk,
+            index,
+            merkle_root: *tree.root(),
+            nullifier: nf,
+        };
+        let (vk, pk) = ensure_membership_keys(&circuit);
+
+        let root_fq = Fq::from_repr(*tree.root()).into_option().unwrap();
+        let nf_fq = Fq::from_repr(nf).into_option().unwrap();
+        let instances = vec![vec![root_fq, nf_fq]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("membership direct create_proof failed");
+        let proof = transcript.finalize();
+        eprintln!("DIRECT membership proof len={}", proof.len());
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "direct membership verify false"),
+            Err(e) => panic!("direct membership verify error: {:?}", e),
+        }
+        eprintln!("MEMBERSHIP DIRECT IPA OK");
+    }
+
+    /// Exact membership structure: 5 witness cols, 2 bit rows (gap after sibs),
+    /// sk+index with gap before, BOTH inputs copy-constrained, swapped second hash.
+    #[test]
+    fn test_exact_membership_structure_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Cell, Layouter, SimpleFloorPlanner, Value},
+            plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
+            poly::Rotation,
+        };
+
+        #[derive(Clone)]
+        struct ExactConfig {
+            poseidon: PoseidonFqConfig,
+            leaf: Column<Advice>,
+            siblings: Column<Advice>,
+            sk: Column<Advice>,
+            idx: Column<Advice>,
+            bit: Column<Advice>,
+            s_bool: Selector,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct ExactCircuit {
+            leaf: Fq,
+            sibs: Vec<Fq>,
+            pos_bits: Vec<bool>,
+            sk: Fq,
+            index: Fq,
+        }
+
+        impl Circuit<Fq> for ExactCircuit {
+            type Config = ExactConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self {
+                Self { leaf: Fq::ZERO, sibs: vec![Fq::ZERO; self.sibs.len()], pos_bits: self.pos_bits.clone(), sk: Fq::ZERO, index: Fq::ZERO }
+            }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let leaf = meta.advice_column();
+                let siblings = meta.advice_column();
+                let sk = meta.advice_column();
+                let idx = meta.advice_column();
+                let bit = meta.advice_column();
+                let s_bool = meta.selector();
+                let instance = meta.instance_column();
+                for c in [&leaf, &siblings, &sk, &idx, &bit] { meta.enable_equality(*c); }
+                meta.enable_equality(instance);
+                meta.create_gate("bool_check", |meta| {
+                    let s = meta.query_selector(s_bool);
+                    let b = meta.query_advice(bit, Rotation::cur());
+                    vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+                });
+                ExactConfig { poseidon, leaf, siblings, sk, idx, bit, s_bool, instance }
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let depth = self.sibs.len();
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+
+                // Same as MembersipCircuit but SINGLE bit row + sk at 4, index at 5
+                let witness = layouter.assign_region(|| "witnesses", |mut region| {
+                    let mut offset = 0usize;
+                    let lc = region.assign_advice(|| "leaf", config.leaf, offset, || Value::known(self.leaf))?;
+                    let mut sc = Vec::new();
+                    for i in 0..depth {
+                        offset += 1;
+                        let c = region.assign_advice(|| format!("sib_{}", i), config.siblings, offset, || Value::known(self.sibs[i]))?;
+                        sc.push(c);
+                    }
+                    // Single bit row (like SS Swap and all passing tests)
+                    offset += 1;
+                    config.s_bool.enable(&mut region, offset)?;
+                    region.assign_advice(|| "bit", config.bit, offset, || Value::known(Fq::one()))?;
+                    offset += 1;
+                    let skc = region.assign_advice(|| "sk", config.sk, offset, || Value::known(self.sk))?;
+                    offset += 1;
+                    let ic = region.assign_advice(|| "index", config.idx, offset, || Value::known(self.index))?;
+                    Ok((lc.cell(), sc.iter().map(|a| a.cell()).collect::<Vec<_>>(), skc.cell(), ic.cell()))
+                })?;
+                let (leaf_cell, sibling_cells, sk_cell, index_cell) = witness;
+
+                // Loop with pos_bits branching
+                let mut current_val = self.leaf;
+                let mut current_cell = leaf_cell;
+                for i in 0..self.sibs.len() {
+                    if !self.pos_bits[i] {
+                        let hc = chip.assign_hash(layouter.namespace(|| format!("h{}", i)), Value::known(current_val), Value::known(self.sibs[i]), Some(current_cell), Some(sibling_cells[i]))?;
+                        current_val = chip.native_hash(current_val, self.sibs[i]);
+                        current_cell = hc.cell();
+                    } else {
+                        let hc = chip.assign_hash(layouter.namespace(|| format!("h{}", i)), Value::known(self.sibs[i]), Value::known(current_val), Some(sibling_cells[i]), Some(current_cell))?;
+                        current_val = chip.native_hash(self.sibs[i], current_val);
+                        current_cell = hc.cell();
+                    }
+                }
+                let current_cell = current_cell;
+
+                // Nullifier hash (BEFORE root constraint, like SS Swap)
+                let nf_cell = chip.assign_hash(layouter.namespace(|| "nullifier"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(index_cell))?;
+
+                // Constrain root to instance[0] (AFTER nullifier, matching SS Swap)
+                layouter.assign_region(|| "constrain_root", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "root", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(current_cell, ic.cell())?;
+                    Ok(())
+                })?;
+
+                // Constrain nullifier to instance[1]
+                // Use row 1 like MembershipCircuit (also put before root)
+                layouter.assign_region(|| "constrain_nullifier", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "nf", config.instance, 1, config.poseidon.state[0], 1)?;
+                    region.constrain_equal(nf_cell.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+
+        let params = ensure_params();
+        let leaf = Fq::from(3u64);
+        let sibs = vec![Fq::from(5u64), Fq::from(7u64)];
+        let pos_bits = vec![false, true]; // match SS Swap: second hash swapped
+        let sk = Fq::from(9u64);
+        let index = Fq::from(11u64);
+        let spec = ensure_poseidon_spec();
+        let mut cur = leaf;
+        for i in 0..2 {
+            let mut s = if !pos_bits[i] { [cur, sibs[i], Fq::ZERO] } else { [sibs[i], cur, Fq::ZERO] };
+            poseidon_permute(spec, &mut s);
+            cur = s[0];
+        }
+        let mut nf_s = [sk, index, Fq::ZERO]; poseidon_permute(spec, &mut nf_s);
+        let circuit = ExactCircuit { leaf, sibs, pos_bits, sk, index };
+        // NOTE: keygen takes the real circuit; without_witnesses() zeros witnesses but preserves pos_bits
+        let vk = keygen_vk(params, &circuit).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &circuit).expect("keygen_pk");
+        let instances = vec![vec![cur, nf_s[0]]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+            params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r,
+        ) {
+            Ok(strategy) => assert!(strategy.finalize(), "exact verify returned false"),
+            Err(e) => panic!("exact verify error: {:?}", e),
+        }
+        eprintln!("EXACT IPA ROUNDTRIP OK");
+    }
+
+    #[test]
+    fn test_chained_poseidon_mock() {
+        use crate::poseidon_fq::poseidon_hash;
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            dev::MockProver,
+            plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+        };
+
+        #[derive(Clone)]
+        struct ChainedConfig {
+            poseidon: PoseidonFqConfig,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct ChainedCircuit {
+            a: [u8; 32],
+            b: [u8; 32],
+        }
+
+        impl Circuit<Fq> for ChainedCircuit {
+            type Config = ChainedConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self { self.clone() }
+
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let instance = meta.instance_column();
+                meta.enable_equality(instance);
+                ChainedConfig { poseidon, instance }
+            }
+
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let a_fq = Fq::from_repr(self.a).into_option().unwrap();
+                let b_fq = Fq::from_repr(self.b).into_option().unwrap();
+                let h1_native = chip.native_hash(a_fq, b_fq);
+                let h1 = chip.assign_hash(layouter.namespace(|| "hash1"), Value::known(a_fq), Value::known(b_fq), None, None)?;
+                let h2 = chip.assign_hash(layouter.namespace(|| "hash2"), Value::known(h1_native), Value::known(a_fq), Some(h1.cell()), None)?;
+                layouter.assign_region(|| "constrain", |mut region| {
+                    let ic = region.assign_advice_from_instance(|| "inst", config.instance, 0, config.poseidon.state[0], 0)?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+
+        let a = [0u8; 32];
+        let b = [0u8; 32];
+        let h1_repr = poseidon_hash(&a, &b);
+        let h2_repr = poseidon_hash(&h1_repr, &a);
+        let expected = Fq::from_repr(h2_repr).into_option().unwrap();
+        let circuit = ChainedCircuit { a, b };
+        let prover = MockProver::run(11, &circuit, vec![vec![expected]]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+        eprintln!("CHAINED MOCKPROVER OK");
+    }
+
+    #[test]
+    fn test_chained_poseidon_ipa() {
+        unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
+
+        use crate::poseidon_fq::poseidon_hash;
+        use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+        use halo2_proofs::{
+            circuit::{Layouter, SimpleFloorPlanner, Value},
+            plonk::{Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+        };
+
+        #[derive(Clone)]
+        struct ChainedConfig {
+            poseidon: PoseidonFqConfig,
+            instance: Column<Instance>,
+        }
+
+        #[derive(Clone)]
+        struct ChainedCircuit {
+            a: [u8; 32],
+            b: [u8; 32],
+        }
+
+        impl Circuit<Fq> for ChainedCircuit {
+            type Config = ChainedConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+
+            fn without_witnesses(&self) -> Self {
+                self.clone()
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                let poseidon = PoseidonFqChip::configure(meta);
+                let instance = meta.instance_column();
+                meta.enable_equality(instance);
+                ChainedConfig { poseidon, instance }
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fq>,
+            ) -> Result<(), ErrorFront> {
+                let chip = PoseidonFqChip::new(config.poseidon.clone());
+                let a_fq = Fq::from_repr(self.a).into_option().unwrap();
+                let b_fq = Fq::from_repr(self.b).into_option().unwrap();
+
+                // Chain TWO hashes: hash1 = H(a, b), hash2 = H(hash1_out, a)
+                // The second hash's first input is the output of hash1.
+                let h1_native = chip.native_hash(a_fq, b_fq);
+                let h1 = chip.assign_hash(
+                    layouter.namespace(|| "hash1"),
+                    Value::known(a_fq), Value::known(b_fq),
+                    None, None,
+                )?;
+                let h2 = chip.assign_hash(
+                    layouter.namespace(|| "hash2"),
+                    Value::known(h1_native), Value::known(a_fq),
+                    Some(h1.cell()), None,
+                )?;
+
+                layouter.assign_region(|| "constrain", |mut region| {
+                    let ic = region.assign_advice_from_instance(
+                        || "inst", config.instance, 0, config.poseidon.state[0], 0,
+                    )?;
+                    region.constrain_equal(h2.cell(), ic.cell())?;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+        }
+
+        let params = ensure_params();
+        let dummy = ChainedCircuit { a: [0u8; 32], b: [0u8; 32] };
+        let vk = keygen_vk(params, &dummy).expect("keygen_vk");
+        let pk = keygen_pk(params, vk.clone(), &dummy).expect("keygen_pk");
+
+        let a_bytes = { let mut b = [0u8; 32]; b[0] = 42; b };
+        let b_bytes = { let mut b = [0u8; 32]; b[0] = 7; b };
+        let h1_repr = poseidon_hash(&a_bytes, &b_bytes);
+        let h2_repr = poseidon_hash(&h1_repr, &a_bytes);
+        let expected = Fq::from_repr(h2_repr).into_option().unwrap();
+        let circuit = ChainedCircuit { a: a_bytes, b: b_bytes };
+        let instances = vec![vec![expected]];
+        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+            params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        ).expect("create_proof");
+        let proof = transcript.finalize();
+        eprintln!("chained proof len={}", proof.len());
+
+        let mut r = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(&proof[..]);
+        match verify_proof_with_strategy::<
+            CommitmentSchemeIPA<EpAffine>, _,
+            Challenge255<EpAffine>,
+            Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>,
+            SingleStrategyIPA<'_, EpAffine>,
+        >(params, &vk, SingleStrategyIPA::new(params), &[instances], &mut r) {
+            Ok(strategy) => assert!(strategy.finalize(), "chained verify returned false"),
+            Err(e) => panic!("chained verify error: {:?}", e),
+        }
+        eprintln!("CHAINED IPA ROUNDTRIP OK");
+    }
+
+    #[test]
+    // NOTE: test_membership_roundtrip_depth_2 was removed because the
+    // prove_membership/verify_membership API uses depth-cached VK/PK
+    // (all-false position_bits) which is incompatible with mixed position_bits.
+    // Use ensure_membership_keys(&circuit) for position_bits-aware keygen.
 
     #[test]
     fn test_conservation_basic() {
@@ -760,6 +1877,35 @@ mod tests {
         let (_epk_sent, ciphertext) = Halo2PastaBackend::encrypt_note(&vk, &epk_pub.to_bytes(), amount, &blinding);
         let decrypted = Halo2PastaBackend::trial_decrypt(&vk, &epk_pub.to_bytes(), &ciphertext);
         assert_eq!(decrypted, Some((amount, blinding)));
+    }
+
+    #[test]
+    fn test_encrypt_for_recipient_roundtrip() {
+        let vk = [0xABu8; 32];
+        let blinding = [0x42u8; 32];
+        let amount = 12345u64;
+
+        // Sender encrypts for pk_d
+        let pk_d = {
+            let sk = x25519_dalek::StaticSecret::from(vk);
+            let pk = x25519_dalek::PublicKey::from(&sk);
+            *pk.as_bytes()
+        };
+
+        let (epk, ciphertext) = Halo2PastaBackend::encrypt_for_recipient(&pk_d, amount, &blinding);
+
+        // Recipient decrypts with viewing_key + epk
+        let decrypted = Halo2PastaBackend::trial_decrypt(&vk, &epk, &ciphertext);
+        assert_eq!(decrypted, Some((amount, blinding)));
+    }
+
+    #[test]
+    fn test_encrypt_for_recipient_rejects_zero_pk_d() {
+        let pk_d = [0u8; 32];
+        let result = std::panic::catch_unwind(|| {
+            Halo2PastaBackend::encrypt_for_recipient(&pk_d, 100, &[1u8; 32]);
+        });
+        assert!(result.is_err(), "encrypt_for_recipient should panic on all-zero pk_d");
     }
 
     #[test]

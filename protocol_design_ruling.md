@@ -157,8 +157,8 @@ Circuit_constraints:
   1. amount ∈ [0, 2^64)                         ← range proof (running-sum)
   2. sum(input_amounts) + public_in = sum(output_amounts) + public_out  ← conservation
   3. output_commitment_i == amount_i·G + blinding_i·H  ← instance binding (C-1)
-  4. ∀i: input_commitment_i ∈ MerkleTree(state) ← membership proof (C-2 待实现)
-  5. ∀i: nullifier_i == Poseidon(sk_i, record_id_i) ← nullifier correctness (C-2 待实现)
+  4. ∀i: input_commitment_i ∈ MerkleTree(state) ← membership proof (C-2)
+  5. ∀i: nullifier_i == Poseidon(sk_i, record_id_i) ← nullifier correctness (C-2)
   6. ∀i: signature_verify(pk_i, tx_data, sig_i)  ← ownership (MOCK-01 待实现)
 
 Public instances:
@@ -167,6 +167,28 @@ Public instances:
   [1+MAX_OUTPUTS..1+MAX_OUTPUTS+MAX_INPUTS] = merkle_roots (membership proof)
   [1+MAX_OUTPUTS+MAX_INPUTS..] = range_z_final (zeros)
 ```
+
+##### Merkle 路径验证实现（C-2 最终设计）
+
+**不可使用 `constrain_equal` 做 position_bits 分支选择**：keygen 哑电路与实际电路走不同分支时产生不同的置换等价类，导致 IPA 真实证明验证失败 (`ConstraintSystemFailure`)。
+
+**改为 Gate 输入选择**：每层用 gate 约束选通输入位置，`assign_hash` 永远不传 `first_cell`/`second_cell`（即 `constrain_equal` 零次分支）：
+
+```
+Gate mux_inputs (degree 3):
+  s_select * (first_input  - (1-bit)·current_val  - bit·sibling_val) = 0
+  s_select * (second_input - bit·current_val  - (1-bit)·sibling_val) = 0
+
+其中:
+  first_input  = Poseidon state[0] 第一行（assign_hash 的 left 位置）
+  second_input = Poseidon state[1] 第一行（assign_hash 的 right 位置）
+  bit          = position_bits[i] ∈ {0,1}（由现有 bool_check gate 约束）
+```
+
+**效果**：
+- 置换标签与 position_bits 完全无关 → depth 缓存 VK/PK 对所有 position 有效
+- `assign_hash` 调用不加 `constrain_equal` → 所有 `constrain_equal` 调用固定不变
+- 约束 degree 保持 3，与现有 Poseidon 门一致
 
 #### 第三层：递归积累
 

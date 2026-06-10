@@ -45,8 +45,9 @@ Every phase follows this strict cycle:
 The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[patch]` in workspace `Cargo.toml`. Key change: visibility of query types relaxed from `pub(crate)` → `pub`. If patching or upgrading, coordinate both the git dep AND the vendor patches.
 
 ### Known Limitations (read before working)
-- **IPA + PLONK multiopen integration** is broken. See `ISSUE_IPA_PLONK_INTEGRATION.md` for root cause and attempted fixes. Any vanishing argument or permutation work touches this.
-- **`aetheris-recursive`** — B-2 migration **COMPLETE**. The native Vesta IPA accumulation circuit is implemented (see `aetheris-recursive/B-2_plan.md`). Old files `ipa_fold.rs`, `non_native_mul.rs`, `ipa_verifier_circuit.rs` deleted. `non_native_fq.rs` retained for transcript gadget (Phase 6). **IPA + PLONK multiopen integration** remains broken (`ISSUE_IPA_PLONK_INTEGRATION.md`).
+- **IPA + PLONK multiopen integration** — h_eval constraint was fixed in Phase 1.11.5 (`extended_k=13`). `ISSUE_IPA_PLONK_INTEGRATION.md` is **outdated** and no longer reflects the current state. The constraint check at `vanishing/verifier.rs:142-144` is active.
+- **Permutation label mismatch** — `constrain_equal` calls in branch-dependent code produce different permutation labels between keygen and proving, causing IPA verification failure. **Never use `constrain_equal` in a branch-dependent way** (e.g., based on `position_bits`). Use Gate-based input selection instead. See `protocol_design_ruling.md §2.2` for the approved pattern.
+- **`aetheris-recursive`** — B-2 migration **COMPLETE**. The native Vesta IPA accumulation circuit is implemented (see `aetheris-recursive/B-2_plan.md`). Old files `ipa_fold.rs`, `non_native_mul.rs`, `ipa_verifier_circuit.rs` deleted. `non_native_fq.rs` retained for transcript gadget (Phase 6).
 - **Coq proofs** in `formal_proof/` are stubs/placeholders, not verified.
 - **Wallet encryption/send/scan** has placeholder-simulated paths.
 
