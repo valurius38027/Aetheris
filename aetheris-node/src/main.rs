@@ -2,7 +2,8 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, accumulate_proof, empty_accumulator};
+use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, signed_accumulate_proof, empty_accumulator};
+use ed25519_dalek::SigningKey;
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -112,6 +113,7 @@ mod tests {
             last_aggregate_proof: empty_accumulator(),
             current_difficulty: 10,
             timestamps: Vec::new(),
+            aggregator_pk: None,
         };
         let test_state_root = state.get_state_root();
 
@@ -228,6 +230,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut my_mix_sk = [0u8; 32];
     OsRng.fill_bytes(&mut my_mix_sk);
     let my_mix_pk = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(my_mix_sk));
+    
+    // §1.10: Aggregator ed25519 signing key for signed accumulator.
+    // The corresponding verifying key is stored in LedgerState for validators.
+    let mut agg_sk_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut agg_sk_seed);
+    let aggregator_sk = SigningKey::from_bytes(&agg_sk_seed);
+    let aggregator_pk = aggregator_sk.verifying_key();
+    ledger.lock().unwrap().set_aggregator_pk(&aggregator_pk);
     
     // Recovery proof state
     if current_height > 0 {
@@ -614,7 +624,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             continue; // skip coinbase — no ZK proof
                         }
                         let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
-                        match accumulate_proof(&agg, &tx.proof, &commitments, tx.circuit_public_amount()) {
+                        match signed_accumulate_proof(&agg, &tx.proof, &commitments, tx.circuit_public_amount(), &aggregator_sk) {
                             Ok(new_agg) => agg = new_agg,
                             Err(e) => {
                                 eprintln!("[Miner] Skipping tx with invalid proof: {}", e);

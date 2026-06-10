@@ -2,6 +2,7 @@ use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_D
 use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
 use aetheris_recursive::{empty_accumulator, verify_accumulator_chain};
+use ed25519_dalek::VerifyingKey;
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;
@@ -31,6 +32,9 @@ pub struct LedgerState {
     pub last_aggregate_proof: Vec<u8>,
     pub current_difficulty: u64,
     pub timestamps: Vec<u64>,
+    /// Aggregator's ed25519 verifying key for O(1) signed-accumulator checks.
+    /// `None` = fall back to O(n) proof replay.
+    pub aggregator_pk: Option<VerifyingKey>,
 }
 
 impl LedgerState {
@@ -50,7 +54,9 @@ impl LedgerState {
             last_aggregate_proof: empty_accumulator(),
             current_difficulty: VDF_DIFFICULTY,
             timestamps: Vec::new(),
+            aggregator_pk: None,
         };
+        state.restore_aggregator_pk();
         state.restore_from_db();
         state
     }
@@ -220,6 +226,26 @@ impl LedgerState {
         true
     }
 
+    /// Load the aggregator's ed25519 verifying key from the DB.
+    fn restore_aggregator_pk(&mut self) {
+        if let Ok(Some(pk_bytes)) = self.db.get(b"aggregator_pk") {
+            if pk_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&pk_bytes);
+                if let Ok(pk) = VerifyingKey::from_bytes(&arr) {
+                    self.aggregator_pk = Some(pk);
+                }
+            }
+        }
+    }
+
+    /// Persist the aggregator's ed25519 verifying key so it survives restarts.
+    pub fn set_aggregator_pk(&mut self, pk: &VerifyingKey) {
+        let _ = self.db.insert(b"aggregator_pk", pk.as_bytes());
+        let _ = self.db.flush();
+        self.aggregator_pk = Some(*pk);
+    }
+
     pub fn get_block(&self, height: u64) -> Option<Block> {
         if let Ok(Some(data)) = self.db.get(format!("block_{}", height).as_bytes()) {
             bincode::deserialize::<Block>(&data).ok()
@@ -353,7 +379,7 @@ impl LedgerState {
             &tx_proofs,
             &tx_commitments,
             &public_amounts,
-            None, // §1.10: No aggregator pubkey configured yet
+            self.aggregator_pk.as_ref(),
         ) {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }

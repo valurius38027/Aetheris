@@ -3088,3 +3088,44 @@ cargo test -p aetheris-crypto --lib                     41/41 ✅
 ### 剩余工作
 - **IPA + PLONK multiopen 集成** — 已知问题（`ISSUE_IPA_PLONK_INTEGRATION.md`）
 - **第 6 阶段**：用 `VestaFqChip` 替换 `NonNativeFqChip` 在转录小工具中的使用，删除 `non_native_fq.rs`
+
+---
+
+## Stage 44 — Phase 1.10: Signed Accumulator (ed25519 O(1) Optimization) (2026-06-10)
+
+**Scope**: Wire the existing signed-accumulator infrastructure (already implemented in `block_aggregator.rs`) into callers — miner produces signed accumulators, validator checks signatures via `LedgerState.aggregator_pk`.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `aetheris-node/Cargo.toml` | 添加 `ed25519-dalek` 依赖 |
+| `aetheris-node/src/main.rs` | 启动时生成聚合器 keypair；挖矿循环改用 `signed_accumulate_proof`；存储验证密钥到 state |
+| `aetheris-node/src/state.rs` | 新增 `aggregator_pk: Option<VerifyingKey>` 字段；`restore_aggregator_pk()` + `set_aggregator_pk()` 方法；通过 DB 键 `b"aggregator_pk"` 持久化；将 `None`→`self.aggregator_pk.as_ref()` 传递给 `verify_accumulator_chain` |
+
+### 设计要点
+- **签名消息** = `blake3(ACCUMULATOR_SIGNATURE_DOMAIN || prev_bytes || unsigned_new_bytes)`
+- **O(1) 快速路径**: 验证器用配置的 pubkey 验证 ed25519 签名 → 通过则跳过 O(n) proof replay
+- **O(n) 回退**: 无 pubkey / 签名失败 / 未签名 accumulator 自动降到 proof replay
+- **向后兼容**: 旧 unsigned accumulator (96B) 和 signed (160B) 通过 `from_bytes` 自动检测
+- **密钥持久化**: 验证密钥存储在 sled DB (`b"aggregator_pk"`)，重启后恢复；签名密钥每次重启重新生成（trusted-aggregator 模型已接受）
+
+### 验证
+
+```
+cargo check --workspace                    ✅ 零错误零警告
+cargo test -p aetheris-node --lib           ✅ 11/11
+cargo test -p aetheris-zkp --lib            ✅ 119/119
+cargo test -p aetheris-recursive --lib      ✅ 155/155（含 5 个 signed-accumulator 测试）
+```
+
+### 路线更新
+
+| 项 | 状态 |
+|----|--------|
+| 1.4 B-3: aggregate_proofs IPA 化 | ✅ Stage 43 |
+| 1.5: IPA 区块集成 | ✅ Stage 43（B-3 范围内） |
+| 1.7: 恢复调用方 | ✅ Stage 43 |
+| 1.10: Signed Accumulator | **✅ Stage 44** |
+| 1.11: P2P Proof Gossip | ⏳ 待处理 |
+| 1.13: Recursive Proof Wrapper → Mainnet | ⏳ 下一步 |

@@ -23,6 +23,7 @@ bincode = { workspace = true }
 x25519-dalek = { workspace = true }
 tiny-keccak = { workspace = true }
 aes-gcm = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
