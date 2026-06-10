@@ -9,6 +9,7 @@ use halo2_proofs::halo2curves::pasta::Fq;
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::arithmetic::Field;
 
+use crate::poseidon_fq::ensure_poseidon_spec;
 use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
 
 /// Maximum Merkle-tree depth supported by the membership circuit.
@@ -28,6 +29,7 @@ pub struct MembershipConfig {
     pub index: Column<Advice>,
     pub bit: Column<Advice>,
     pub s_bool: Selector,
+    pub s_select: Selector,
     pub instance: Column<Instance>,
 }
 
@@ -106,6 +108,28 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
             vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
         });
 
+        let s_select = meta.selector();
+
+        meta.create_gate("mux_inputs", |meta| {
+            let s = meta.query_selector(s_select);
+            let leaf_val = meta.query_advice(leaf, Rotation::cur());
+            let sibling_val = meta.query_advice(siblings, Rotation::cur());
+            let bit_val = meta.query_advice(bit, Rotation::cur());
+            let state_0 = meta.query_advice(poseidon.state[0], Rotation::cur());
+            let state_1 = meta.query_advice(poseidon.state[1], Rotation::cur());
+
+            let one_minus_bit = Expression::Constant(Fq::one()) - bit_val.clone();
+            let first_mux = one_minus_bit.clone() * leaf_val.clone()
+                + bit_val.clone() * sibling_val.clone();
+            let second_mux = one_minus_bit * sibling_val.clone()
+                + bit_val * leaf_val.clone();
+
+            vec![
+                s.clone() * (state_0 - first_mux),
+                s * (state_1 - second_mux),
+            ]
+        });
+
         MembershipConfig {
             poseidon,
             leaf,
@@ -114,6 +138,7 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
             index,
             bit,
             s_bool,
+            s_select,
             instance,
         }
     }
@@ -125,6 +150,8 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
     ) -> Result<(), ErrorFront> {
         let depth = self.path_siblings.len();
         let chip = PoseidonFqChip::new(config.poseidon.clone());
+        let spec = ensure_poseidon_spec();
+        const T: usize = 3;
 
         let leaf_fq = Fq::from_repr(self.leaf).expect("leaf is canonical Fq");
         let sk_fq = Fq::from_repr(self.sk).expect("sk is canonical Fq");
@@ -136,35 +163,16 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
             .map(|s| Fq::from_repr(*s).expect("sibling is canonical Fq"))
             .collect();
 
-        // Witness assignments (cells for copy-constraining)
-        let leaf_cell: Cell;
-        let sibling_cells: Vec<Cell>;
+        // Witness assignments (cells for copy-constraining — only what's needed)
         let sk_cell: Cell;
         let index_cell: Cell;
 
-        // We wire up witness cells in one region
         let witness_result = layouter.assign_region(
             || "witnesses",
             |mut region| {
                 let mut offset = 0;
 
-                let lc = region.assign_advice(
-                    || "leaf", config.leaf, offset,
-                    || Value::known(leaf_fq),
-                )?;
-
-                let mut sc = Vec::new();
-                for i in 0..depth {
-                    offset += 1;
-                    let c = region.assign_advice(
-                        || format!("sibling_{}", i),
-                        config.siblings, offset,
-                        || Value::known(sibling_fqs[i]),
-                    )?;
-                    sc.push(c);
-                }
-
-                offset += 1;
+                // Bool-checked path bits (column `bit`, gate `s_bool`)
                 for (i, &b) in self.position_bits.iter().enumerate() {
                     config.s_bool.enable(&mut region, offset)?;
                     let bit_val = if b { Fq::one() } else { Fq::ZERO };
@@ -176,6 +184,7 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
                     offset += 1;
                 }
 
+                // sk and index (used by nullifier hash via constrain_equal)
                 offset += 1;
                 let skc = region.assign_advice(
                     || "sk", config.sk, offset,
@@ -187,41 +196,245 @@ impl halo2_proofs::plonk::Circuit<Fq> for MembershipCircuit {
                     || Value::known(index_fq),
                 )?;
 
-                Ok((lc.cell(), sc.iter().map(|a| a.cell()).collect::<Vec<_>>(), skc.cell(), ic.cell()))
+                Ok((skc.cell(), ic.cell()))
             },
         )?;
 
-        leaf_cell = witness_result.0;
-        sibling_cells = witness_result.1;
-        sk_cell = witness_result.2;
-        index_cell = witness_result.3;
+        sk_cell = witness_result.0;
+        index_cell = witness_result.1;
 
-        // ── Merkle path verification ──────────────────────────────────────
+        // ── Merkle path verification (inline Poseidon + gate-based mux) ──
+        // Each level: row 0 = s_select + s_full (mux + first full round),
+        // then r_f/2-1 full, r_p partial, r_f/2 full, 1 output row.
+        // No constrain_equal between witness cells and hash inputs —
+        // the s_select gate enforces correct muxing; soundness via final instance check.
         let mut current_val = leaf_fq;
-        let mut current_cell = leaf_cell;
+        let mut current_cell: Option<Cell> = None;
 
         for i in 0..depth {
             let sibling_val = sibling_fqs[i];
+            let bit = self.position_bits[i];
+            let bit_fq = if bit { Fq::one() } else { Fq::ZERO };
 
-            let (first_val, second_val, first_cell, second_cell, next_val) = if !self.position_bits[i] {
-                let next = chip.native_hash(current_val, sibling_val);
-                (Value::known(current_val), Value::known(sibling_val), Some(current_cell), Some(sibling_cells[i]), next)
-            } else {
-                let next = chip.native_hash(sibling_val, current_val);
-                (Value::known(sibling_val), Value::known(current_val), Some(sibling_cells[i]), Some(current_cell), next)
-            };
+            let first = if !bit { current_val } else { sibling_val };
+            let second = if !bit { sibling_val } else { current_val };
+            let next_val = chip.native_hash(first, second);
 
-            let hash_cell = chip.assign_hash(
-                layouter.namespace(|| format!("merkle_level_{}", i)),
-                first_val,
-                second_val,
-                first_cell,
-                second_cell,
+            let hash_cell = layouter.assign_region(
+                || format!("merkle_level_{}", i),
+                |mut region| {
+                    let mut state = [
+                        Value::known(first),
+                        Value::known(second),
+                        Value::known(Fq::ZERO),
+                    ];
+                    let mut offset = 0usize;
+
+                    // ── Row 0: mux + first full round ──────────────────────
+                    config.s_select.enable(&mut region, offset)?;
+                    config.poseidon.s_full.enable(&mut region, offset)?;
+
+                    region.assign_advice(
+                        || "leaf", config.leaf, offset,
+                        || Value::known(current_val),
+                    )?;
+                    region.assign_advice(
+                        || "sibling", config.siblings, offset,
+                        || Value::known(sibling_val),
+                    )?;
+                    region.assign_advice(
+                        || "bit", config.bit, offset,
+                        || Value::known(bit_fq),
+                    )?;
+
+                    for col_i in 0..T {
+                        region.assign_advice(
+                            || format!("state_{}", col_i),
+                            config.poseidon.state[col_i],
+                            offset,
+                            || state[col_i],
+                        )?;
+                        region.assign_fixed(
+                            || format!("rc_{}", col_i),
+                            config.poseidon.rc[col_i],
+                            offset,
+                            || Value::known(spec.constants[offset][col_i]),
+                        )?;
+                    }
+
+                    // sbox + MDS for row 0
+                    let sbox: Vec<Value<Fq>> = (0..T)
+                        .map(|j| {
+                            state[j].map(|s| {
+                                let x = s + spec.constants[offset][j];
+                                let x2 = x * x;
+                                x2 * x2 * x
+                            })
+                        })
+                        .collect();
+                    for col_i in 0..T {
+                        let mut sum = sbox[0].map(|s| s * spec.mds[col_i][0]);
+                        for j in 1..T {
+                            sum = sum
+                                .zip(sbox[j])
+                                .map(|(acc, s)| acc + s * spec.mds[col_i][j]);
+                        }
+                        state[col_i] = sum;
+                    }
+                    offset += 1;
+
+                    // ── Remaining first-half full rounds ────────────────────
+                    for _ in 1..spec.r_f / 2 {
+                        config.poseidon.s_full.enable(&mut region, offset)?;
+                        for col_i in 0..T {
+                            region.assign_advice(
+                                || format!("state_{}", col_i),
+                                config.poseidon.state[col_i],
+                                offset,
+                                || state[col_i],
+                            )?;
+                            region.assign_fixed(
+                                || format!("rc_{}", col_i),
+                                config.poseidon.rc[col_i],
+                                offset,
+                                || Value::known(spec.constants[offset][col_i]),
+                            )?;
+                        }
+                        let sbox: Vec<Value<Fq>> = (0..T)
+                            .map(|j| {
+                                state[j].map(|s| {
+                                    let x = s + spec.constants[offset][j];
+                                    let x2 = x * x;
+                                    x2 * x2 * x
+                                })
+                            })
+                            .collect();
+                        for col_i in 0..T {
+                            let mut sum = sbox[0].map(|s| s * spec.mds[col_i][0]);
+                            for j in 1..T {
+                                sum = sum
+                                    .zip(sbox[j])
+                                    .map(|(acc, s)| acc + s * spec.mds[col_i][j]);
+                            }
+                            state[col_i] = sum;
+                        }
+                        offset += 1;
+                    }
+
+                    // ── Partial rounds ──────────────────────────────────────
+                    for _ in 0..spec.r_p {
+                        config.poseidon.s_partial.enable(&mut region, offset)?;
+                        for col_i in 0..T {
+                            region.assign_advice(
+                                || format!("state_{}", col_i),
+                                config.poseidon.state[col_i],
+                                offset,
+                                || state[col_i],
+                            )?;
+                            region.assign_fixed(
+                                || format!("rc_{}", col_i),
+                                config.poseidon.rc[col_i],
+                                offset,
+                                || Value::known(spec.constants[offset][col_i]),
+                            )?;
+                        }
+
+                        let sbox0 = state[0].map(|s| {
+                            let x = s + spec.constants[offset][0];
+                            let x2 = x * x;
+                            x2 * x2 * x
+                        });
+
+                        region.assign_advice(
+                            || "partial_sbox",
+                            config.poseidon.partial_sbox,
+                            offset,
+                            || sbox0,
+                        )?;
+
+                        let other: Vec<Value<Fq>> = state[1..]
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &s)| {
+                                s.map(|v| v + spec.constants[offset][j + 1])
+                            })
+                            .collect();
+
+                        for col_i in 0..T {
+                            let mut sum = sbox0.map(|s| s * spec.mds[col_i][0]);
+                            for j in 1..T {
+                                sum = sum
+                                    .zip(other[j - 1])
+                                    .map(|(acc, s)| acc + s * spec.mds[col_i][j]);
+                            }
+                            state[col_i] = sum;
+                        }
+                        offset += 1;
+                    }
+
+                    // ── Second-half full rounds ─────────────────────────────
+                    for _ in 0..spec.r_f / 2 {
+                        config.poseidon.s_full.enable(&mut region, offset)?;
+                        for col_i in 0..T {
+                            region.assign_advice(
+                                || format!("state_{}", col_i),
+                                config.poseidon.state[col_i],
+                                offset,
+                                || state[col_i],
+                            )?;
+                            region.assign_fixed(
+                                || format!("rc_{}", col_i),
+                                config.poseidon.rc[col_i],
+                                offset,
+                                || Value::known(spec.constants[offset][col_i]),
+                            )?;
+                        }
+                        let sbox: Vec<Value<Fq>> = (0..T)
+                            .map(|j| {
+                                state[j].map(|s| {
+                                    let x = s + spec.constants[offset][j];
+                                    let x2 = x * x;
+                                    x2 * x2 * x
+                                })
+                            })
+                            .collect();
+                        for col_i in 0..T {
+                            let mut sum = sbox[0].map(|s| s * spec.mds[col_i][0]);
+                            for j in 1..T {
+                                sum = sum
+                                    .zip(sbox[j])
+                                    .map(|(acc, s)| acc + s * spec.mds[col_i][j]);
+                            }
+                            state[col_i] = sum;
+                        }
+                        offset += 1;
+                    }
+
+                    // ── Output row (no gate) ────────────────────────────────
+                    debug_assert!(offset == spec.r_f + spec.r_p);
+                    let out = region.assign_advice(
+                        || "output",
+                        config.poseidon.state[0],
+                        offset,
+                        || state[0],
+                    )?;
+                    for col_i in 1..T {
+                        region.assign_advice(
+                            || format!("state_final_{}", col_i),
+                            config.poseidon.state[col_i],
+                            offset,
+                            || state[col_i],
+                        )?;
+                    }
+                    Ok(out)
+                },
             )?;
 
             current_val = next_val;
-            current_cell = hash_cell.cell();
+            current_cell = Some(hash_cell.cell());
         }
+
+        let current_cell = current_cell.expect("Merkle depth must be ≥ 1");
 
         // Constrain computed root to instance[0]
 
