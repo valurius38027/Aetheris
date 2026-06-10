@@ -32,14 +32,14 @@ use crate::membership_circuit::MembershipCircuit;
 const PROVING_K: u32 = 11;
 
 static CACHED_PARAMS: OnceLock<ParamsIPA<EpAffine>> = OnceLock::new();
-type CachedKeyPair = (
+pub(crate) type CachedKeyPair = (
     halo2_proofs::plonk::VerifyingKey<EpAffine>,
     halo2_proofs::plonk::ProvingKey<EpAffine>,
 );
 static KEY_CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), CachedKeyPair>>> =
     OnceLock::new();
 
-fn ensure_params() -> &'static ParamsIPA<EpAffine> {
+pub(crate) fn ensure_params() -> &'static ParamsIPA<EpAffine> {
     CACHED_PARAMS.get_or_init(|| {
         let crs_paths = ["aetheris-zkp/crs.bin", "crs.bin"];
         for path in &crs_paths {
