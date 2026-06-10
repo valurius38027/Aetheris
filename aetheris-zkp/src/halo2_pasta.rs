@@ -25,8 +25,8 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use crate::ipa::commitment::{CommitmentSchemeIPA, ParamsIPA};
 use crate::ipa::prover::ProverIPA;
-use crate::ipa::strategy::SingleStrategyIPA;
-use crate::trait_::{ZkProverSystem, TxCommitments};
+use crate::ipa::strategy::{SingleStrategyIPA, AccumulatorStrategyIPA};
+use crate::trait_::ZkProverSystem;
 use crate::membership_circuit::MembershipCircuit;
 
 const PROVING_K: u32 = 11;
@@ -492,87 +492,6 @@ impl ZkProverSystem for Halo2PastaBackend {
         }
     }
 
-    fn aggregate_proofs(
-        last_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> Result<Vec<u8>, String> {
-        let proof_hashes: Vec<[u8; 32]> = tx_proofs.iter()
-            .map(|p| blake3::hash(p).into())
-            .collect();
-        let merkle_root = build_merkle_root(&proof_hashes);
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(blake3::hash(last_agg).as_bytes());
-        hasher.update(&merkle_root);
-        hasher.update(&height.to_le_bytes());
-        hasher.update(state_root);
-        let binding_hash = hasher.finalize();
-        
-        let mut agg = b"aetheris_aggregate_v1_".to_vec();
-        agg.extend_from_slice(binding_hash.as_bytes());
-        agg.extend_from_slice(&merkle_root);
-        agg.extend_from_slice(&(tx_proofs.len() as u64).to_le_bytes());
-
-        for (i, proof) in tx_proofs.iter().enumerate() {
-            if proof.is_empty() { continue; }
-            let commitments = tx_commitments.get(i).cloned().unwrap_or_default();
-            let pub_amt = tx_public_amounts.get(i).copied().unwrap_or(0);
-            if !Self::verify_conservation(proof, &commitments, pub_amt) {
-                return Err(format!("Tx proof {} failed conservation verification", i));
-            }
-        }
-
-        Ok(agg)
-    }
-
-    fn verify_aggregate(
-        agg_proof: &[u8],
-        prev_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> bool {
-        if !agg_proof.starts_with(b"aetheris_aggregate_v1_") {
-            return false;
-        }
-        let binding_hash = &agg_proof[22..54];
-        let merkle_root = &agg_proof[54..86];
-
-        let proof_hashes: Vec<[u8; 32]> = tx_proofs.iter()
-            .map(|p| blake3::hash(p).into())
-            .collect();
-        let expected_merkle = build_merkle_root(&proof_hashes);
-        if merkle_root != &expected_merkle[..] {
-            return false;
-        }
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(blake3::hash(prev_agg).as_bytes());
-        hasher.update(&expected_merkle);
-        hasher.update(&height.to_le_bytes());
-        hasher.update(state_root);
-        let expected_binding = hasher.finalize();
-        if binding_hash != expected_binding.as_bytes() {
-            return false;
-        }
-
-        for (i, proof) in tx_proofs.iter().enumerate() {
-            if proof.is_empty() { continue; }
-            let commitments = tx_commitments.get(i).cloned().unwrap_or_default();
-            let pub_amt = tx_public_amounts.get(i).copied().unwrap_or(0);
-            if !Self::verify_conservation(proof, &commitments, pub_amt) {
-                return false;
-            }
-        }
-
-        true
-    }
 }
 
 impl Halo2PastaBackend {
@@ -762,6 +681,79 @@ impl Halo2PastaBackend {
             blinding.copy_from_slice(&plaintext[8..40]);
             Some((amount, blinding))
         })
+    }
+
+    /// Batch-verify multiple conservation proofs using AccumulatorStrategyIPA.
+    /// All proofs are folded into a single MSM accumulator; finalize() checks
+    /// once. Equivalent to calling verify_conservation per proof, but O(1) MSM check.
+    pub fn batch_verify_conservation(
+        proofs: &[Vec<u8>],
+        outputs_list: &[&[[u8; 32]]],
+        public_amounts: &[i64],
+    ) -> bool {
+        if proofs.len() != outputs_list.len() || proofs.len() != public_amounts.len() {
+            return false;
+        }
+        if proofs.is_empty() {
+            return true;
+        }
+
+        let params = ensure_params();
+        let mut strategy = AccumulatorStrategyIPA::new(params);
+
+        const PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
+        const PREFIX_LEN: usize = 19;
+        const SHAPE_LEN: usize = 4;
+        const MAX_PROOF_IOPS: usize = 30;
+
+        for (i, proof) in proofs.iter().enumerate() {
+            if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
+                return false;
+            }
+            let in_len = u16::from_le_bytes(proof[PREFIX_LEN..PREFIX_LEN + 2].try_into().unwrap()) as usize;
+            let out_len = u16::from_le_bytes(
+                proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN].try_into().unwrap(),
+            ) as usize;
+            if in_len + out_len > MAX_PROOF_IOPS {
+                return false;
+            }
+            let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
+
+            let (vk, _) = ensure_keys(in_len, out_len);
+
+            let public_amount = public_amounts[i];
+            let output_commitments = outputs_list[i];
+            let instance_fq = if public_amount >= 0 {
+                Fq::from(public_amount as u64)
+            } else {
+                Fq::ZERO - Fq::from(public_amount.unsigned_abs())
+            };
+            let mut instance_col = vec![instance_fq];
+            for cm in output_commitments {
+                match Fq::from_repr(*cm).into_option() {
+                    Some(fq) => instance_col.push(fq),
+                    None => return false,
+                }
+            }
+            let instances = vec![instance_col];
+
+            let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
+            let result = verify_proof_with_strategy::<
+                CommitmentSchemeIPA<EpAffine>,
+                _,
+                Challenge255<EpAffine>,
+                Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>,
+                AccumulatorStrategyIPA<'_, EpAffine>,
+            >(
+                params, &vk, strategy, &[instances], &mut transcript,
+            );
+            match result {
+                Ok(s) => strategy = s,
+                Err(_) => return false,
+            }
+        }
+
+        strategy.finalize()
     }
 }
 
@@ -1944,56 +1936,60 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_multi_tx_roundtrip() {
+    fn test_batch_verify_two_proofs() {
         let commitments1 = vec![[0u8; 32]; 1];
         let p1 = make_proof(&[10], &[10], &commitments1, 0);
         let commitments2 = vec![[0u8; 32]; 1];
         let p2 = make_proof(&[20], &[20], &commitments2, 0);
 
-        let prev = b"aetheris_aggregate_v1_genesis_test";
-        let agg = Halo2PastaBackend::aggregate_proofs(
-            prev,
-            &[p1.clone(), p2.clone()],
-            &[commitments1.clone(), commitments2.clone()],
-            &[0, 0],
-            1,
-            &[0u8; 32],
-        ).unwrap();
-        assert!(Halo2PastaBackend::verify_aggregate(
-            &agg,
-            prev,
+        assert!(Halo2PastaBackend::batch_verify_conservation(
             &[p1, p2],
-            &[commitments1, commitments2],
+            &[&commitments1, &commitments2],
             &[0, 0],
-            1,
-            &[0u8; 32],
         ));
     }
 
     #[test]
-    fn test_aggregate_rejects_tampered() {
+    fn test_batch_verify_rejects_tampered_amount() {
         let commitments1 = vec![[0u8; 32]; 1];
         let p1 = make_proof(&[10], &[10], &commitments1, 0);
         let commitments2 = vec![[0u8; 32]; 1];
         let p2 = make_proof(&[20], &[20], &commitments2, 0);
 
-        let prev = b"aetheris_aggregate_v1_genesis_test";
-        let agg = Halo2PastaBackend::aggregate_proofs(
-            prev,
-            &[p1.clone(), p2.clone()],
-            &[commitments1.clone(), commitments2.clone()],
-            &[0, 0],
-            1,
-            &[0u8; 32],
-        ).unwrap();
-        assert!(!Halo2PastaBackend::verify_aggregate(
-            &agg,
-            prev,
+        assert!(!Halo2PastaBackend::batch_verify_conservation(
             &[p1, p2],
-            &[commitments1, commitments2],
+            &[&commitments1, &commitments2],
             &[1, 0],
-            1,
-            &[0u8; 32],
+        ));
+    }
+
+    #[test]
+    fn test_batch_verify_empty_proofs() {
+        assert!(Halo2PastaBackend::batch_verify_conservation(&[], &[], &[]));
+    }
+
+    #[test]
+    fn test_batch_verify_mismatched_lengths() {
+        let commitments1 = vec![[0u8; 32]; 1];
+        let p1 = make_proof(&[10], &[10], &commitments1, 0).to_vec();
+        assert!(!Halo2PastaBackend::batch_verify_conservation(
+            &[p1],
+            &[&commitments1],
+            &[], // mismatched length
+        ));
+    }
+
+    #[test]
+    fn test_batch_verify_rejects_tampered_proof() {
+        let commitments1 = vec![[0u8; 32]; 1];
+        let mut p1 = make_proof(&[10], &[10], &commitments1, 0);
+        if let Some(last) = p1.last_mut() {
+            *last ^= 0xFF;
+        }
+        assert!(!Halo2PastaBackend::batch_verify_conservation(
+            &[p1],
+            &[&commitments1],
+            &[0],
         ));
     }
 
@@ -2121,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_with_commitments_binding() {
+    fn test_batch_verify_single_proof() {
         let blinding = [0xAAu8; 32];
         let ins = [30u64, 30u64];
         let outs = [60u64];
@@ -2135,16 +2131,11 @@ mod tests {
             &out_cms, 0,
         );
 
-        let prev = b"aetheris_aggregate_v1_genesis_test";
-        let result = Halo2PastaBackend::aggregate_proofs(
-            prev,
-            &[proof.clone()],
-            &[out_cms.clone()],
+        assert!(Halo2PastaBackend::batch_verify_conservation(
+            &[proof],
+            &[&out_cms],
             &[0],
-            1,
-            &[0u8; 32],
-        );
-        assert!(result.is_ok(), "aggregate_proofs should succeed with valid proofs");
+        ));
     }
 
     #[test]

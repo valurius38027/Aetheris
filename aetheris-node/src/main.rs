@@ -2,7 +2,7 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain};
+use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, accumulate_proof, empty_accumulator};
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -109,7 +109,7 @@ mod tests {
             db: db.clone(),
             height: 1,
             last_block_hash: [0u8; 32],
-            last_aggregate_proof: b"aetheris_aggregate_v1_genesis".to_vec(),
+            last_aggregate_proof: empty_accumulator(),
             current_difficulty: 10,
             timestamps: Vec::new(),
         };
@@ -122,7 +122,7 @@ mod tests {
                 timestamp: 100,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: aetheris_zkp::ZKProofSystem::aggregate_proofs(b"genesis", &[], &[], &[], 0, &[0u8; 32]).unwrap(),
+                aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 10,
             },
@@ -142,7 +142,7 @@ mod tests {
             let (res, proof, _) = vdf.solve(&b.header.parent_hash);
             b.header.vdf_result = res;
             b.header.vdf_proof = proof;
-            b.header.aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&state.last_aggregate_proof, &[], &[], &[], i as u64, &[0u8; 32]).unwrap();
+            b.header.aggregate_proof = state.last_aggregate_proof.clone();
             
             state.apply_block(b).unwrap();
         }
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
-    let mut last_block_proof = vec![0u8; 32]; // Initial proof for genesis
+    let mut last_block_proof = empty_accumulator();
     let mut seen_aggregates: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut agg_gossip_check = std::time::Instant::now();
     let mut agg_gossip_count: u32 = 0;
@@ -604,14 +604,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     
                     // 2. Prepare Transactions & Recursive ZK Proof
                     let txs = mempool.lock().unwrap().take_all();
-                    let tx_count = txs.len();
-                    
-                    // Generate a real block proof (In production, this is the recursive link)
-                    let tx_proofs: Vec<Vec<u8>> = txs.iter().map(|t| t.proof.clone()).collect();
-                    let tx_commitments: Vec<Vec<[u8; 32]>> = txs.iter().map(|t| t.outputs.iter().map(|o| o.commitment).collect()).collect();
-                    let tx_public_amounts: Vec<i64> = txs.iter().map(|t| t.circuit_public_amount()).collect();
                     let state_root = ledger.lock().unwrap().get_state_root();
-                    let aggregate_proof = aetheris_zkp::ZKProofSystem::aggregate_proofs(&last_block_proof, &tx_proofs, &tx_commitments, &tx_public_amounts, current_height, &state_root).expect("Mathematical Consistency Failure");
+                    
+                    // Generate block aggregate proof via IPA accumulator chain
+                    let tx_count = txs.len();
+                    let mut agg = last_block_proof.clone();
+                    for tx in &txs {
+                        if tx.public_amount > 0 {
+                            continue; // skip coinbase — no ZK proof
+                        }
+                        let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
+                        match accumulate_proof(&agg, &tx.proof, &commitments, tx.circuit_public_amount()) {
+                            Ok(new_agg) => agg = new_agg,
+                            Err(e) => {
+                                eprintln!("[Miner] Skipping tx with invalid proof: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    let aggregate_proof = agg;
                     last_block_proof = aggregate_proof.clone();
 
                     // 3. Propose Block — single timestamp, hash from serialized block

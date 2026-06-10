@@ -30,25 +30,6 @@ pub trait ZkProverSystem: Sized {
         public_amount: i64,
     ) -> bool;
 
-    fn aggregate_proofs(
-        last_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> Result<Vec<u8>, String>;
-
-    fn verify_aggregate(
-        agg_proof: &[u8],
-        prev_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> bool;
-
     /// Compute a Wesolowski VDF proof over the class group Cl(D), |D|=2048.
     ///
     /// **Wire format**: returns `(result, proof)` — both are serialized class

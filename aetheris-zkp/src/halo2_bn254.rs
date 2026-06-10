@@ -39,7 +39,7 @@ use rand::rngs::OsRng;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore, aead::Aead};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-use crate::trait_::{ZkProverSystem, TxCommitments};
+use crate::trait_::ZkProverSystem;
 
 const PROVING_K: u32 = 11;
 
@@ -351,89 +351,6 @@ impl ZkProverSystem for Halo2BN254Backend {
         verify_proof(params, vk, &[&[] as &[Vec<Fr>]], &mut transcript, &[dummy_circuit], &[&public_inputs]).is_ok()
     }
 
-    fn aggregate_proofs(
-        last_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> Result<Vec<u8>, String> {
-        let proof_hashes: Vec<[u8; 32]> = tx_proofs.iter()
-            .map(|p| blake3::hash(p).into())
-            .collect();
-        let merkle_root = build_merkle_root(&proof_hashes);
-
-        let binding_hash = blake3::hash(last_agg);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(binding_hash.as_bytes());
-        hasher.update(&merkle_root);
-        hasher.update(&height.to_le_bytes());
-        hasher.update(state_root);
-        let binding_hash = hasher.finalize();
-
-        let mut agg = b"aetheris_aggregate_v1_".to_vec();
-        agg.extend_from_slice(binding_hash.as_bytes());
-        agg.extend_from_slice(&merkle_root);
-        agg.extend_from_slice(&(tx_proofs.len() as u64).to_le_bytes());
-
-        for (i, proof) in tx_proofs.iter().enumerate() {
-            if proof.is_empty() { continue; }
-            let commitments = tx_commitments.get(i).cloned().unwrap_or_default();
-            let pub_amt = tx_public_amounts.get(i).copied().unwrap_or(0);
-            if !Self::verify_conservation(proof, &commitments, pub_amt) {
-                return Err(format!("Tx proof {} failed conservation verification", i));
-            }
-        }
-
-        Ok(agg)
-    }
-
-    fn verify_aggregate(
-        agg_proof: &[u8],
-        prev_agg: &[u8],
-        tx_proofs: &[Vec<u8>],
-        tx_commitments: &[TxCommitments],
-        tx_public_amounts: &[i64],
-        height: u64,
-        state_root: &[u8; 32],
-    ) -> bool {
-        if !agg_proof.starts_with(b"aetheris_aggregate_v1_") {
-            return false;
-        }
-        let binding_hash = &agg_proof[22..54];
-        let merkle_root = &agg_proof[54..86];
-
-        let proof_hashes: Vec<[u8; 32]> = tx_proofs.iter()
-            .map(|p| blake3::hash(p).into())
-            .collect();
-        let expected_merkle = build_merkle_root(&proof_hashes);
-        if merkle_root != &expected_merkle[..] {
-            return false;
-        }
-
-        let prev_hash = blake3::hash(prev_agg);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(prev_hash.as_bytes());
-        hasher.update(&expected_merkle);
-        hasher.update(&height.to_le_bytes());
-        hasher.update(state_root);
-        let expected_binding = hasher.finalize();
-        if binding_hash != expected_binding.as_bytes() {
-            return false;
-        }
-
-        for (i, proof) in tx_proofs.iter().enumerate() {
-            if proof.is_empty() { continue; }
-            let commitments = tx_commitments.get(i).cloned().unwrap_or_default();
-            let pub_amt = tx_public_amounts.get(i).copied().unwrap_or(0);
-            if !Self::verify_conservation(proof, &commitments, pub_amt) {
-                return false;
-            }
-        }
-
-        true
-    }
 }
 
 impl Halo2BN254Backend {
@@ -658,38 +575,6 @@ mod tests {
             Halo2BN254Backend::encrypt_for_recipient(&pk_d, 100, &[1u8; 32]);
         });
         assert!(result.is_err(), "encrypt_for_recipient should panic on all-zero pk_d");
-    }
-
-    #[test]
-    fn test_aggregate_multi_tx_roundtrip() {
-        let commitments1 = vec![vec![]; 1];
-        let p1 = make_proof(&[10], &[10], &commitments1, 0);
-        let commitments2 = vec![vec![]; 1];
-        let p2 = make_proof(&[20], &[20], &commitments2, 0);
-
-        let prev = b"aetheris_aggregate_v1_genesis_test";
-        let agg = Halo2BN254Backend::aggregate_proofs(
-            prev, &[p1.clone(), p2.clone()], &[commitments1.clone(), commitments2.clone()], &[0, 0], 1, &[0u8; 32],
-        ).unwrap();
-        assert!(Halo2BN254Backend::verify_aggregate(
-            &agg, prev, &[p1, p2], &[commitments1, commitments2], &[0, 0], 1, &[0u8; 32],
-        ));
-    }
-
-    #[test]
-    fn test_aggregate_rejects_tampered() {
-        let commitments1 = vec![vec![]; 1];
-        let p1 = make_proof(&[10], &[10], &commitments1, 0);
-        let commitments2 = vec![vec![]; 1];
-        let p2 = make_proof(&[20], &[20], &commitments2, 0);
-
-        let prev = b"aetheris_aggregate_v1_genesis_test";
-        let agg = Halo2BN254Backend::aggregate_proofs(
-            prev, &[p1.clone(), p2.clone()], &[commitments1.clone(), commitments2.clone()], &[0, 0], 1, &[0u8; 32],
-        ).unwrap();
-        assert!(!Halo2BN254Backend::verify_aggregate(
-            &agg, prev, &[p1, p2], &[commitments1, commitments2], &[1, 0], 1, &[0u8; 32],
-        ));
     }
 
     #[test]
