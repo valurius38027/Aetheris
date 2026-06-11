@@ -1,6 +1,6 @@
 # Phase 1.13 — Recursive Proof Wrapper Plan
 
-> **Status**: S1 (non_native_fp.rs) ✅, S2 (pallas_ecc.rs) ✅
+> **Status**: S1-S5 ✅ (scope reduced: see §4.4 — host-precompute pattern avoids in-circuit scalar_mul)
 > **Depends on**: §1.12 (B-2: `vesta_ecc`, `vesta_fq`, `vesta_ipa`, `vesta_accumulate`, `proof_import`)
 > **Goal**: In-circuit Pallas IPA proof verification → output constant-size (<10 KB) Halo2 recursive proof
 
@@ -104,7 +104,7 @@ What's NOT:     Fp (Pallas coords)
 Modeled on `non_native_fq.rs` (which does Fq-over-Fp), but for Fp-over-Fq.
 
 ```
-Fp modulus: 0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001
+Fp modulus: 0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001
 Fp bit length: 255
 
 Limb decomposition: 3 × 85-bit limbs (same as Fq-over-Fp)
@@ -1010,19 +1010,19 @@ If the inner proofs use k=10 (1024 generators), the IPA has 10 rounds. Each addi
 
 ```
 1. S1 — non_native_fp.rs       ✅ done (1619 lines, 8 tests)
-2. S2 — pallas_ecc.rs           ✅ done (570 lines, tests included)
+2. S2 — pallas_ecc.rs           ✅ done (570 lines, 5 tests)
 3. S3 — pallas_ipa.rs           ✅ done (128 lines, 1 test)
 4. S4 — pallas_accumulate.rs    ✅ done (225 lines, 1 test)
 5. lib.rs update                ✅ done
-6. cargo check --workspace      [verify no breakage]
-7. S5 — recursive_proof.rs      ✅ done (195 lines, 1 test)
-8. cargo check --workspace      [verify]
-9. cargo test -p aetheris-recursive  [full test suite: 163 + new]
+6. cargo check --workspace      ✅ clean
+7. S5 — recursive_proof.rs      ✅ done (234 lines, 2 tests + instance column)
+8. cargo check --workspace      ✅ clean
+9. cargo test (filtered)        ✅ 181 tests pass, 17 new
 ```
 
-Total new code: ~2500 lines (including tests)
+Total new code: ~2800 lines (including tests)
 Total new files: 5
-Files modified: 1 (lib.rs)
+Files modified: 2 (lib.rs, vesta_fq.rs — added Clone derive)
 
 ---
 
@@ -1031,12 +1031,21 @@ Files modified: 1 (lib.rs)
 Before Phase 1.13 is complete:
 
 - [x] `cargo check --workspace` passes with zero errors
-- [ ] `cargo test -p aetheris-recursive --lib` passes (all 163 + 29 new tests)
+- [ ] `cargo test -p aetheris-recursive --lib` passes (all tests) — filtered runs pass (181 tests)
 - [ ] `cargo test -p aetheris-zkp` passes (no regressions in 119 tests)
+- [x] `cargo test -p aetheris-crypto` passes
+- [x] `cargo test -p aetheris-core` passes
 - [x] NonNativeFpChip tests: add/sub/mul/invert/neg/assign_constant roundtrip (8 tests, K=10-12)
-- [x] PallasEccChip tests: on_curve, point_add, point_double, select, negate, constrain_equal, constrain_zero
+- [x] PallasEccChip tests: on_curve, point_add, point_double, select, negate (5 tests, K=16)
 - [x] PallasIpaChip test: k=1 verify_ipa_full (K=16)
 - [x] PallasAccumulateChip test: k=1 synthetic proof (K=16)
-- [x] RecursiveProofCircuit: k=1 synthetic proof (K=16)
-- [ ] Recursive proof output size ≤ 10 KB
-- [ ] Existing VestaAccumulateChip tests still pass (no disruption)
+- [x] RecursiveProofCircuit: k=1 synthetic proof (K=16) + wrong-commitment rejection
+- [x] RecursiveProofCircuit: public instance column (commitment coordinates, 6 Fq limbs)
+- [x] fix: invert zero-input short-circuit removed (branch-dependent shape bug)
+- [x] fix: hardcoded `3`→`FP_NUM_LIMBS` in test helpers
+- [x] Existing VestaAccumulateChip tests pass (9 tests)
+- [x] All existing ECC/IPA/transcript/Fq/blake2b tests pass (no regression)
+- [ ] Recursive proof output size ≤ 10 KB (requires real prove API — deferred)
+- [ ] `prove_recursive`/`verify_recursive_proof` host API (deferred to Phase 1.14)
+- [ ] Blake2b transcript/challenge squeezing in PallasAccumulateChip (deferred)
+- [ ] `precompute_ipa_witness` host helper (deferred)
