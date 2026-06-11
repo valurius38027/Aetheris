@@ -373,7 +373,14 @@ impl LedgerState {
             .filter(|tx| tx.public_amount <= 0)
             .map(|tx| tx.circuit_public_amount())
             .collect();
-        if !tx_proofs.is_empty() && !verify_accumulator_chain(
+        if tx_proofs.is_empty() {
+            if block.header.aggregate_proof != self.last_aggregate_proof {
+                return Err(format!(
+                    "Empty-block accumulator mismatch at #{}: claimed != parent",
+                    block.header.height
+                ));
+            }
+        } else if !verify_accumulator_chain(
             &block.header.aggregate_proof,
             &self.last_aggregate_proof,
             &tx_proofs,

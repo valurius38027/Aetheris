@@ -3020,8 +3020,8 @@ cargo test -p aetheris-crypto --lib                     41/41 ✅
 | 1.4 B-3: aggregate_proofs IPA 化 | ✅ 完成 |
 | 1.5: IPA 区块集成 | ✅ 完成（B-3 范围内） |
 | 1.7: 恢复调用方 | ✅ 完成（没有损坏的调用方） |
-| 1.10: Signed Accumulator | ⏳ 待处理 |
-| 1.11: P2P Proof Gossip | ⏳ 待处理 |
+| 1.10: Signed Accumulator | ✅ Stage 44 |
+| 1.11: P2P Proof Gossip | ✅ Stage 45 |
 | 1.13: Recursive Proof Wrapper → Mainnet | ⏳ 下一步 |
 
 ### 下一步
@@ -3127,5 +3127,37 @@ cargo test -p aetheris-recursive --lib      ✅ 155/155（含 5 个 signed-accum
 | 1.5: IPA 区块集成 | ✅ Stage 43（B-3 范围内） |
 | 1.7: 恢复调用方 | ✅ Stage 43 |
 | 1.10: Signed Accumulator | **✅ Stage 44** |
-| 1.11: P2P Proof Gossip | ⏳ 待处理 |
+| 1.11: P2P Proof Gossip | **✅ Stage 45** |
 | 1.13: Recursive Proof Wrapper → Mainnet | ⏳ 下一步 |
+
+
+---
+
+## Stage 45 — Phase 1.11: P2P Proof Gossip (2026-06-10)
+
+**Scope**: Wire accumulator gossip publication + peer-level rate limiting + validation hardening.
+
+### Changes
+
+| 文件 | 变更 |
+|------|--------|
+| `aetheris-node/src/main.rs` | Mining loop captures included txs and publishes `AggregateProofGossip` on accumulator topic; gossip handler passes aggregator pubkey for O(1) sig check; global rate limiter replaced with per-peer HashMap; `seen_aggregates` capped at 10K; empty gossip skipped; `last_block_proof` synced after `SyncResponse` |
+| `aetheris-node/src/state.rs` | Empty-block accumulator validation: when `tx_proofs.is_empty()`, explicitly verify `aggregate_proof == last_aggregate_proof` |
+
+### Review-found fixes
+
+| # | Severity | Issue | Fix |
+|---|--------|------|--------|
+| 1 | 🔴 CRITICAL | Empty-block accumulator bypass (chain split) | `state.rs` explicit equality check |
+| 2 | ⚠️ MEDIUM | `seen_aggregates` unbounded OOM | Cap at 10K, auto-clear |
+| 3 | ⚠️ MEDIUM | Global rate limiter per-node DoS | Per-peer HashMap rate limiter |
+| 4 | ⚠️ LOW | Empty gossip for coinbase-only blocks | Skip when `gossip_depth == 0` |
+| 5 | ⚠️ LOW | Stale `last_block_proof` after sync | Update after `SyncResponse` |
+
+### Verification
+
+```
+cargo check --workspace                    ✅ zero errors zero warnings
+cargo test -p aetheris-node --lib           ✅ 11/11
+```
+

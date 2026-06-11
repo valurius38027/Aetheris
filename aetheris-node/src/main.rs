@@ -161,7 +161,7 @@ mod tests {
     }
 }
 
-use libp2p::{gossipsub, mdns, swarm::SwarmEvent, kad, identify, autonat, relay};
+use libp2p::{gossipsub, mdns, swarm::SwarmEvent, kad, identify, autonat, relay, PeerId};
 use libp2p::futures::StreamExt;
 use std::error::Error;
 use aetheris_node::p2p::AetherisBehaviourEvent;
@@ -193,6 +193,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let network = &mut swarms;
     network.listen(&format!("/ip4/0.0.0.0/tcp/{}", args.port)).await?;
     network.subscribe_topics()?;
+    let accu_topic = network.accumulator_topic.clone();
     let swarm = &mut network.swarm;
     let topic = network.block_topic.clone();
     let sync_topic = network.sync_topic.clone();
@@ -223,8 +224,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mempool = Arc::new(Mutex::new(Mempool::new()));
     let mut last_block_proof = empty_accumulator();
     let mut seen_aggregates: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut agg_gossip_check = std::time::Instant::now();
-    let mut agg_gossip_count: u32 = 0;
+    let mut per_peer_gossip_limits: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     
     // Mixnet Static Keys — generated from OsRng; not derived from public PeerId
     let mut my_mix_sk = [0u8; 32];
@@ -494,47 +494,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          continue;
                      }
 
-                     // 3. Handle Accumulator Gossip (§1.11)
-                     if let Ok(gossip) = serde_json::from_slice::<AggregateProofGossip>(&message.data) {
-                         // Dedup: skip if we already processed this aggregate_id
-                         let already_seen = !seen_aggregates.insert(gossip.aggregate_id);
-                         if already_seen {
-                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                                 &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
-                             );
-                             continue;
-                         }
-                         // Rate limit: max 50 verify calls per 10s window
-                         let now = std::time::Instant::now();
-                         if now.duration_since(agg_gossip_check).as_secs() >= 10 {
-                             agg_gossip_count = 0;
-                             agg_gossip_check = now;
-                         }
-                         agg_gossip_count += 1;
-                         let ok = if agg_gossip_count > 50 {
-                             false
-                         } else {
-                             verify_accumulator_chain(
-                                 &gossip.accumulator,
-                                 &gossip.prev_accumulator,
-                                 &gossip.proofs,
-                                 &gossip.commitments_list,
-                                 &gossip.public_amounts,
-                                 None,
-                             )
-                         };
-                         if ok {
-                             println!("[AGG] Validated accumulator gossip: depth={}", gossip.depth);
-                         } else if agg_gossip_count > 50 {
-                             println!("[AGG] Rate limit exceeded, rejecting accumulator gossip");
-                         }
-                         let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
-                             &_id, &peer_id,
-                             if ok { gossipsub::MessageAcceptance::Accept }
-                             else { gossipsub::MessageAcceptance::Reject },
-                         );
-                         continue;
-                     }
+                      // 3. Handle Accumulator Gossip (§1.11)
+                      if let Ok(gossip) = serde_json::from_slice::<AggregateProofGossip>(&message.data) {
+                          // Dedup: skip if we already processed this aggregate_id
+                          let already_seen = !seen_aggregates.insert(gossip.aggregate_id);
+                          if already_seen {
+                              let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                  &_id, &peer_id, gossipsub::MessageAcceptance::Accept,
+                              );
+                              continue;
+                          }
+                           // Cap memory: clear seen cache when it grows too large
+                           if seen_aggregates.len() > 10_000 {
+                               seen_aggregates.clear();
+                           }
+                           if per_peer_gossip_limits.len() > 1_000 {
+                               per_peer_gossip_limits.retain(|_, &mut (ts, _): &mut (std::time::Instant, u32)| {
+                                   ts.elapsed().as_secs() < 60
+                               });
+                           }
+                           // Per-peer rate limit: max 50 verify calls per 10s window
+                           let now = std::time::Instant::now();
+                           let (window_start, count) = per_peer_gossip_limits
+                               .entry(peer_id)
+                               .or_insert((now, 0));
+                           if now.duration_since(*window_start).as_secs() >= 10 {
+                               *window_start = now;
+                               *count = 0;
+                           }
+                           *count += 1;
+                           if *count > 50 {
+                               println!("[AGG] Rate limit exceeded from peer {}, rejecting", peer_id);
+                               let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                   &_id, &peer_id, gossipsub::MessageAcceptance::Reject,
+                               );
+                               continue;
+                           }
+                           let agg_pk = ledger.lock().unwrap().aggregator_pk;
+                           let ok = verify_accumulator_chain(
+                               &gossip.accumulator,
+                               &gossip.prev_accumulator,
+                               &gossip.proofs,
+                               &gossip.commitments_list,
+                               &gossip.public_amounts,
+                               agg_pk.as_ref(),
+                           );
+                           if ok {
+                               println!("[AGG] Validated accumulator gossip: depth={}", gossip.depth);
+                           }
+                          let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                              &_id, &peer_id,
+                              if ok { gossipsub::MessageAcceptance::Accept }
+                              else { gossipsub::MessageAcceptance::Reject },
+                          );
+                          continue;
+                      }
 
                      // 4. Handle P2P Sync Messages
                     if let Ok(p2p_msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
@@ -585,12 +599,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 }
                                             }
 
-                                             arbitrator.advance_height();
-                                         }
-                                     }
-                                 }
-                             }
-                             P2PMessage::Transaction(tx) => {
+                                              arbitrator.advance_height();
+                                          }
+                                      }
+                                  }
+                                  // Sync the local accumulator variable to avoid stale chaining
+                                  last_block_proof = ledger_lock.last_aggregate_proof.clone();
+                              }
+                              P2PMessage::Transaction(tx) => {
                                 println!("💸 Received Transaction from P2P network");
                                 if let Err(e) = mempool.lock().unwrap().add_tx(tx) {
                                     println!("❌ Rejected P2P transaction: {}", e);
@@ -619,13 +635,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Generate block aggregate proof via IPA accumulator chain
                     let tx_count = txs.len();
                     let mut agg = last_block_proof.clone();
+                    let mut included_proofs: Vec<Vec<u8>> = Vec::new();
+                    let mut included_commitments: Vec<Vec<[u8; 32]>> = Vec::new();
+                    let mut included_public_amounts: Vec<i64> = Vec::new();
                     for tx in &txs {
                         if tx.public_amount > 0 {
                             continue; // skip coinbase — no ZK proof
                         }
                         let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
                         match signed_accumulate_proof(&agg, &tx.proof, &commitments, tx.circuit_public_amount(), &aggregator_sk) {
-                            Ok(new_agg) => agg = new_agg,
+                            Ok(new_agg) => {
+                                agg = new_agg;
+                                included_proofs.push(tx.proof.clone());
+                                included_commitments.push(commitments);
+                                included_public_amounts.push(tx.circuit_public_amount());
+                            }
                             Err(e) => {
                                 eprintln!("[Miner] Skipping tx with invalid proof: {}", e);
                                 continue;
@@ -633,6 +657,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     let aggregate_proof = agg;
+                    
+                    // §1.11: Build accumulator gossip before overwriting last_block_proof
+                    let gossip_prev = last_block_proof.clone();
+                    let gossip_depth = included_public_amounts.len() as u32;
+                    let accumulator_gossip = AggregateProofGossip {
+                        aggregate_id: *blake3::hash(&aggregate_proof).as_bytes(),
+                        accumulator: aggregate_proof.clone(),
+                        prev_accumulator: gossip_prev,
+                        proofs: included_proofs,
+                        commitments_list: included_commitments,
+                        public_amounts: included_public_amounts,
+                        depth: gossip_depth,
+                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                    };
+                    
                     last_block_proof = aggregate_proof.clone();
 
                     // 3. Propose Block — single timestamp, hash from serialized block
@@ -668,6 +707,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("🚀 Proposing Block #{} with {} txs (VDF Solved!)", current_height, tx_count);
                     if let Ok(data) = serde_json::to_vec(&proposal) {
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
+                    }
+                    
+                    // §1.11: Publish accumulator gossip for pre-validation
+                    if gossip_depth > 0 {
+                        if let Ok(gossip_data) = serde_json::to_vec(&accumulator_gossip) {
+                            let _ = swarm.behaviour_mut().gossipsub.publish(accu_topic.clone(), gossip_data);
+                        }
                     }
                     
                     // 4. Add to local arbitrator (Self-arbitration)
