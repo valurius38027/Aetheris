@@ -3212,3 +3212,48 @@ cargo test -p aetheris-node --lib           ✅ 11/11
 | `cargo test -p aetheris-zkp --lib` | ✅ 119/119 (no regressions) |
 | `cargo test -p aetheris-node --lib` | ✅ 11/11 (no regressions) |
 
+
+---
+
+## Stage 47 — Phase 1.14 S1–S4: Recursive Proof Production + precompute_ipa_witness CRITICAL Fix (2026-06-11)
+
+**Scope**: Wire VestaAccumulateChip IPA verification into an end-to-end prove_recursive/verify_recursive pipeline. Fix precompute_ipa_witness — all round challenges were identical (wrong) due to Blake2bRead::init() not absorbing prefix data into Blake2b state.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| aetheris-recursive/src/pallas_accumulate.rs | **CRITICAL FIX**: precompute_ipa_witness rewritten — replaced Blake2bRead (which stores reader only, NEVER absorbs data) with raw blake2b_simd::Params. Absorb prefix bytes directly, clone+finalize for each challenge. Rejection loop matches Halo2 byte-for-byte: [2] + reject_repr + [0] then finalize. Test test_precompute_ipa_witness_k1 fixed to use same raw Blake2b approach. Unused imports removed (Blake2bRead, Transcript, TranscriptReadBuffer). Added blake2b_simd::Params, EncodedChallenge. |
+| aetheris-recursive/src/prove_recursive.rs | **New** — prove_recursive() constructor (accepts real Halo2 proof bytes, calls precompute_ipa_witness, builds circuit, creates proof). verify_recursive() (loads params+pk+vk, returns Result<bool>). build_recursive_instance() (serializes Fq accumulator + state_root into 7-row instance vector). Roundtrip test test_prove_and_verify_recursive (synthetic data, does NOT exercise precompute_ipa_witness). |
+| aetheris-recursive/src/recursive_proof.rs | Added state_root: [u8; 32] field to RecursiveProofCircuit. Instance column widened from 4 to 7 rows (Fq accumulator [0..3], Fp challenge [3..4], state_root bytes as Fq [4..7]). Default::default() updated — emits l_scaled: vec![zero_point], rhs_witnesses: vec![(FpElement::zero(), FpElement::zero()); 2] (valid points/commas for keygen's verify_ipa_full assertion). |
+| aetheris-recursive/src/lib.rs | Added pub mod prove_recursive; |
+
+### CRITICAL Bug Details
+
+| Issue | Root Cause | Fix |
+|-------|-----------|------|
+| precompute_ipa_witness returned wrong challenges | Blake2bRead::init(prefix) only stores the reader reference — it does NOT absorb prefix bytes into Blake2b state. squeeze_challenge_scalar() computed challenges from Blake2b(personalization \|\| 0x00) only (identical for all rounds). ALL round challenges were identical and wrong. | Rewrote with raw blake2b_simd::Params: absorb personalization \|\| prefix \|\| 0x00, clone+finalize. Rejection loop: state absorbs [2] + reject_repr + [0], then finalize. Byte-matches Halo2's squeeze_challenge() + common_scalar() sequence. |
+| RecursiveProofCircuit::Default used zero scalars for l_scaled/rhs_witnesses | verify_ipa_full asserts ipa_state.l_scaled = zero point (not scalar), ipa_state.rhs_witnesses use (FpElement, FpElement) scalars | Changed to vec![zero_point], vec![(FpElement::zero(), FpElement::zero()); 2] |
+
+### Multi-Agent Review
+
+- **Round 1**: CRITICAL finding — prefix bytes never absorbed into Blake2b state. All 3 reviewers flagged the same issue independently.
+- **Round 2**: All pass ✅✅⚠️ (⚠️ non-blocking: no negative test, no k>1 test, no point-equality asserts)
+
+### Verification
+
+\\\
+cargo check --workspace                    ✅ 0 errors, 0 warnings
+cargo test -p aetheris-recursive --lib     ✅ 182/182 (was 163)
+\\\
+
+### Commit
+
+7ca7941 — 4 files, +884/-50.
+
+### Route Update
+
+| Item | Status |
+|------|--------|
+| 1.14 S1-S4: Recursive Proof Production | ✅ Complete |
+| 1.14 S5: Mainnet integration | ⏳ Next |

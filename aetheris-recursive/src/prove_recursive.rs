@@ -15,6 +15,7 @@ use aetheris_zkp::ipa::commitment::{CommitmentSchemeIPA, ParamsIPA};
 use aetheris_zkp::ipa::prover::ProverIPA;
 use aetheris_zkp::ipa::strategy::SingleStrategyIPA;
 
+use crate::pallas_accumulate::commitment_limbs;
 use crate::recursive_proof::RecursiveProofCircuit;
 
 /// Generate a proving key and verifying key for the recursive proof circuit.
@@ -72,116 +73,16 @@ pub fn verify_recursive_proof(
     }
 }
 
-// ── Host precomputation ──
-//
-// These functions transform an IpaProofWitness into the PallasPoint and witness
-// data required by RecursiveProofCircuit.  They are the host-side counterparts
-// of the #[cfg(test)] helpers in pallas_ipa / pallas_accumulate / recursive_proof.
-
-use core::array;
-
-use ff::{Field, PrimeField};
-use halo2_proofs::{
-    circuit::Value,
-    halo2curves::pasta::Fp,
-};
-use halo2curves::CurveAffine;
-
-use crate::{
-    Limb,
-    non_native_fp::{FpElement, FP_NUM_LIMBS},
-    pallas_ecc::PallasPoint,
-};
-
-/// Big-endian: `0x00...020...0` where the `1` bit is at position 85.
-fn big_limb_base() -> num_bigint::BigUint {
-    num_bigint::BigUint::from_bytes_le(&[
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ])
-}
-
-fn big_to_fq(big: &num_bigint::BigUint) -> Fq {
-    let bytes = big.to_bytes_le();
-    let mut repr = <Fq as PrimeField>::Repr::default();
-    let len = bytes.len().min(repr.as_ref().len());
-    repr.as_mut()[..len].copy_from_slice(&bytes[..len]);
-    <Fq as PrimeField>::from_repr(repr).unwrap()
-}
-
-/// Convert an EpAffine (Pallas) point to a PallasPoint (3-limb Fp-over-Fq).
-pub fn ep_to_pallas_point(p: &EpAffine) -> PallasPoint {
-    let coords = p.coordinates().unwrap();
-    let x_fp = *coords.x();
-    let y_fp = *coords.y();
-    let lbb = big_limb_base();
-    let x_big = num_bigint::BigUint::from_bytes_le(x_fp.to_repr().as_ref());
-    let y_big = num_bigint::BigUint::from_bytes_le(y_fp.to_repr().as_ref());
-    let x_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
-        let lv = (&x_big / &lbb.pow(i as u32)) % &lbb;
-        Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-    });
-    let y_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
-        let lv = (&y_big / &lbb.pow(i as u32)) % &lbb;
-        Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-    });
-    PallasPoint {
-        x: FpElement { limbs: x_limbs },
-        y: FpElement { limbs: y_limbs },
-        x_cell: None,
-        y_cell: None,
-    }
-}
-
-/// Host-side Fp point addition witness: returns (λ, rx, ry) as FpElements.
-pub fn fp_add_witness(p: &PallasPoint, q: &PallasPoint) -> (FpElement, FpElement, FpElement) {
-    let reconstruct = |el: &FpElement| -> Fp {
-        let mut big = num_bigint::BigUint::from(0u32);
-        let base = big_limb_base();
-        for (i, limb) in el.limbs.iter().enumerate() {
-            if let Ok(val) = limb.value.assign() {
-                let lv_big = num_bigint::BigUint::from_bytes_le(val.to_repr().as_ref());
-                big += lv_big * base.pow(i as u32);
-            }
-        }
-        let mut repr = <Fp as PrimeField>::Repr::default();
-        let le = big.to_bytes_le();
-        repr.as_mut()[..le.len()].copy_from_slice(&le);
-        <Fp as PrimeField>::from_repr(repr).unwrap()
-    };
-    let px = reconstruct(&p.x);
-    let py = reconstruct(&p.y);
-    let qx = reconstruct(&q.x);
-    let qy = reconstruct(&q.y);
-
-    let lam = (qy - py) * (qx - px).invert().unwrap();
-    let rx = lam.square() - px - qx;
-    let ry = lam * (px - rx) - py;
-
-    let fp_to_el = |fp: Fp| -> FpElement {
-        let big = num_bigint::BigUint::from_bytes_le(fp.to_repr().as_ref());
-        let base = big_limb_base();
-        let limbs = array::from_fn(|i| {
-            let lv = (&big / &base.pow(i as u32)) % &base;
-            Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-        });
-        FpElement { limbs }
-    };
-
-    (fp_to_el(lam), fp_to_el(rx), fp_to_el(ry))
-}
-
-/// Extract the 6 commitment limb values as `Fq` for the instance column.
-pub fn commitment_limbs(p: &PallasPoint) -> Vec<Fq> {
-    let mut limbs = Vec::with_capacity(2 * FP_NUM_LIMBS);
-    for limb in &p.x.limbs {
-        limbs.push(limb.value.assign().unwrap_or(Fq::ZERO));
-    }
-    for limb in &p.y.limbs {
-        limbs.push(limb.value.assign().unwrap_or(Fq::ZERO));
-    }
+/// Build public instance vector: 6 commitment limbs + 1 state_root Fq.
+pub fn build_recursive_instance(
+    commitment: &crate::pallas_ecc::PallasPoint,
+    state_root: &[u8; 32],
+) -> Vec<Fq> {
+    let mut limbs = commitment_limbs(commitment);
+    let mut repr = <Fq as ff::PrimeField>::Repr::default();
+    repr.as_mut().copy_from_slice(state_root);
+    let sr_fq = <Fq as ff::PrimeField>::from_repr(repr).unwrap();
+    limbs.push(sr_fq);
     limbs
 }
 
@@ -190,6 +91,8 @@ pub fn commitment_limbs(p: &PallasPoint) -> Vec<Fq> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pallas_accumulate::ep_to_pallas_point;
+    use halo2_proofs::halo2curves::pasta::EpAffine;
     use halo2curves::group::prime::PrimeCurveAffine;
     use halo2curves::group::Curve;
     use rand::rngs::OsRng;
@@ -220,14 +123,16 @@ mod tests {
 
         let sum_lr_curve = (l_scaled.to_curve() + r_scaled.to_curve()).to_affine();
         let p_sum_lr = ep_to_pallas_point(&sum_lr_curve);
-        let wit_lr = fp_add_witness(&p_l, &p_r);
-        let wit_accum = fp_add_witness(&p_com, &p_sum_lr);
+        let wit_lr = crate::pallas_accumulate::fp_add_witness(&p_l, &p_r);
+        let wit_accum = crate::pallas_accumulate::fp_add_witness(&p_com, &p_sum_lr);
 
         let rhs_gh_curve = (a_mul_g.to_curve() + r_prime_mul_h.to_curve()).to_affine();
         let p_rhs_gh = ep_to_pallas_point(&rhs_gh_curve);
-        let wit_gh = fp_add_witness(&p_a, &p_rh);
-        let wit_u = fp_add_witness(&p_rhs_gh, &p_ab);
+        let wit_gh = crate::pallas_accumulate::fp_add_witness(&p_a, &p_rh);
+        let wit_u = crate::pallas_accumulate::fp_add_witness(&p_rhs_gh, &p_ab);
 
+        // state_root must be < Fq modulus.
+        let state_root_val: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xab; b };
         let circuit = RecursiveProofCircuit {
             commitment: p_com,
             l_scaled: vec![p_l],
@@ -237,6 +142,7 @@ mod tests {
             ab_eval_mul_u: p_ab,
             lhs_witnesses: vec![wit_lr, wit_accum],
             rhs_witnesses: vec![wit_gh, wit_u],
+            state_root: state_root_val,
         };
 
         // Keygen.
@@ -244,11 +150,11 @@ mod tests {
         let (vk, pk) = build_recursive_keys(&params).expect("keygen failed");
 
         // Prove.
-        let pub_limbs = vec![commitment_limbs(&circuit.commitment)];
+        let pub_limbs = vec![build_recursive_instance(&circuit.commitment, &state_root_val)];
         let proof = prove_recursive(&params, &pk, circuit, pub_limbs).expect("prove_recursive failed");
         assert!(!proof.is_empty(), "proof must not be empty");
 
-        // Verify with correct public inputs (reconstruct commitment from original curve points).
+        // Verify with correct public inputs.
         let commitment_pt_verify = {
             let g2 = EpAffine::generator();
             let h2 = (g2.to_curve() * Fq::from(2u64)).to_affine();
@@ -261,15 +167,22 @@ mod tests {
             let r2 = (h2.to_curve() * Fq::from(3u64)).to_affine();
             (rhs2.to_curve() - l2.to_curve() - r2.to_curve()).to_affine()
         };
-        let pub_limbs_verify = commitment_limbs(&ep_to_pallas_point(&commitment_pt_verify));
-        let valid = verify_recursive_proof(&params, &vk, &proof, vec![pub_limbs_verify]);
+        let pub_limbs_verify = vec![build_recursive_instance(
+            &ep_to_pallas_point(&commitment_pt_verify),
+            &state_root_val,
+        )];
+        let valid = verify_recursive_proof(&params, &vk, &proof, pub_limbs_verify);
         assert!(valid, "verify_recursive_proof must accept valid proof");
 
         // Corrupt the proof — verification must fail.
-        let p_com_corrupt = ep_to_pallas_point(&commitment_pt);
         let mut corrupted = proof.clone();
         corrupted[proof.len() / 2] ^= 0xff;
-        let rejected = verify_recursive_proof(&params, &vk, &corrupted, vec![commitment_limbs(&p_com_corrupt)]);
+        let rejected = verify_recursive_proof(
+            &params,
+            &vk,
+            &corrupted,
+            vec![build_recursive_instance(&ep_to_pallas_point(&commitment_pt), &state_root_val)],
+        );
         assert!(!rejected, "verify must reject corrupted proof");
     }
 }
