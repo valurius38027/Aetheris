@@ -1232,18 +1232,12 @@ impl NonNativeFpChip {
     // ── Invert (witness-with-verify) ───────────────────────────────────────
 
     /// Witness `a^(-1) mod Fp` and verify `a * inv = 1`.
-    /// Returns `FpElement::zero()` when `a = 0` (0 has no inverse; caller
-    /// should avoid querying the result).
+    /// Returns `Err` when `a = 0` (0 has no inverse).
     pub fn invert(
         &self,
         mut layouter: impl Layouter<Fq>,
         a: &FpElement,
     ) -> Result<FpElement, ErrorFront> {
-        // Short-circuit zero input to avoid unsatisfiable constraints
-        // (mul(a=0, inv) = 0 would fail the check_one == 1).
-        if a.is_zero() {
-            return Ok(FpElement::zero());
-        }
 
         // Extended Euclidean Algorithm for modular inverse
         // (BigUint::modpow gives incorrect results for large exponents)
@@ -1728,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fp_invert_zero() {
+    fn test_fp_invert_zero_rejected() {
         const K: u32 = 12;
         #[derive(Default)]
         struct InvertZeroCircuit;
@@ -1751,7 +1745,7 @@ mod tests {
         let circuit = InvertZeroCircuit;
         let prover = MockProver::run(K, &circuit, vec![]).unwrap();
         let result = prover.verify();
-        assert!(result.is_ok(), "Fp invert zero: {:?}", result.err());
+        assert!(result.is_err(), "invert(0) should be unsatisfiable");
     }
 
     // ── range check test ──

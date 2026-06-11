@@ -109,7 +109,7 @@ mod tests {
     use halo2curves::group::Curve;
     use halo2curves::CurveAffine;
 
-    use crate::Limb;
+    use crate::{Limb, non_native_fp::FP_NUM_LIMBS};
 
     // ── Host helpers (same as pallas_ipa::tests) ──
 
@@ -137,11 +137,11 @@ mod tests {
         let lbb = big_limb_base();
         let x_big = num_bigint::BigUint::from_bytes_le(x_fp.to_repr().as_ref());
         let y_big = num_bigint::BigUint::from_bytes_le(y_fp.to_repr().as_ref());
-        let x_limbs: [Limb<Fq>; 3] = array::from_fn(|i| {
+        let x_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
             let lv = (&x_big / &lbb.pow(i as u32)) % &lbb;
             Limb { value: Value::known(big_to_fq(&lv)), cell: None }
         });
-        let y_limbs: [Limb<Fq>; 3] = array::from_fn(|i| {
+        let y_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
             let lv = (&y_big / &lbb.pow(i as u32)) % &lbb;
             Limb { value: Value::known(big_to_fq(&lv)), cell: None }
         });
