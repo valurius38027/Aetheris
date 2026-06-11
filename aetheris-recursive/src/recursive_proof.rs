@@ -1,10 +1,10 @@
 //! Recursive proof circuit — wraps PallasAccumulateChip in a Halo2 circuit.
 //!
 //! Takes host-precomputed intermediate Pallas points and witnesses, assigns
-//! commitment + eval as public inputs, then calls `verify_ipa_pallas`.
+//! commitment + state_root as public inputs, then calls `verify_ipa_pallas`.
 
 use halo2_proofs::{
-    circuit::{Layouter, SimpleFloorPlanner},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     halo2curves::pasta::Fq,
     plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance},
 };
@@ -19,7 +19,7 @@ pub struct RecursiveProofConfig {
     pub acc: PallasAccumulateConfig,
     /// Advice column for assigning public-input limb values.
     pub adv: Column<Advice>,
-    /// Instance column — commitment coordinates (6 Fq limbs).
+    /// Instance column — commitment coordinates (6 Fq limbs) + state_root (1 Fq).
     pub instance: Column<Instance>,
 }
 
@@ -33,6 +33,8 @@ pub struct RecursiveProofCircuit {
     pub ab_eval_mul_u: PallasPoint,
     pub lhs_witnesses: Vec<(FpElement, FpElement, FpElement)>,
     pub rhs_witnesses: Vec<(FpElement, FpElement, FpElement)>,
+    /// 32-byte state root bound as public instance.
+    pub state_root: [u8; 32],
 }
 
 impl Default for RecursiveProofCircuit {
@@ -57,6 +59,7 @@ impl Default for RecursiveProofCircuit {
                 (zero.clone(), zero.clone(), zero.clone()),
                 (zero.clone(), zero.clone(), zero.clone()),
             ],
+            state_root: [0u8; 32],
         }
     }
 }
@@ -86,10 +89,12 @@ impl Circuit<Fq> for RecursiveProofCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fq>,
     ) -> Result<(), ErrorFront> {
-        // Assign commitment coordinate limbs as public instance inputs.
         let num_limbs = FP_NUM_LIMBS;
+        let num_commit_cells = 2 * num_limbs;
+
+        // Assign commitment coordinate limbs as public instance inputs.
         let cells = layouter.assign_region(|| "pub_commitment", |mut region| {
-            let mut cells = Vec::with_capacity(2 * num_limbs);
+            let mut cells = Vec::with_capacity(num_commit_cells + 1);
             for (i, limb) in self.commitment.x.limbs.iter().enumerate() {
                 let cell = region.assign_advice(
                     || format!("com_x_{}", i), config.adv, i, || limb.value,
@@ -102,6 +107,19 @@ impl Circuit<Fq> for RecursiveProofCircuit {
                 )?;
                 cells.push(cell.cell());
             }
+
+            // Assign state_root as 7th instance cell.
+            let mut repr = <Fq as ff::PrimeField>::Repr::default();
+            repr.as_mut().copy_from_slice(&self.state_root);
+            let sr_fq = <Fq as ff::PrimeField>::from_repr(repr).unwrap();
+            let sr_cell = region.assign_advice(
+                || "state_root",
+                config.adv,
+                num_commit_cells,
+                || Value::known(sr_fq),
+            )?;
+            cells.push(sr_cell.cell());
+
             Ok(cells)
         })?;
         for (row, cell) in cells.iter().enumerate() {
@@ -124,107 +142,17 @@ impl Circuit<Fq> for RecursiveProofCircuit {
     }
 }
 
+// ── Tests ──
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::array;
-
+    use crate::pallas_accumulate::{commitment_limbs, ep_to_pallas_point, fp_add_witness};
     use ff::{Field, PrimeField};
-    use halo2_proofs::halo2curves::pasta::{EpAffine, Fp};
-    use halo2_proofs::{
-        circuit::Value,
-        dev::MockProver,
-    };
+    use halo2_proofs::halo2curves::pasta::EpAffine;
+    use halo2_proofs::dev::MockProver;
     use halo2curves::group::prime::PrimeCurveAffine;
     use halo2curves::group::Curve;
-    use halo2curves::CurveAffine;
-
-    use crate::{Limb, non_native_fp::FP_NUM_LIMBS};
-
-    fn big_limb_base() -> num_bigint::BigUint {
-        num_bigint::BigUint::from_bytes_le(&[
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ])
-    }
-
-    fn big_to_fq(big: &num_bigint::BigUint) -> Fq {
-        let bytes = big.to_bytes_le();
-        let mut repr = <Fq as PrimeField>::Repr::default();
-        let len = bytes.len().min(repr.as_ref().len());
-        repr.as_mut()[..len].copy_from_slice(&bytes[..len]);
-        <Fq as PrimeField>::from_repr(repr).unwrap()
-    }
-
-    fn ep_to_pallas_point(p: &EpAffine) -> PallasPoint {
-        let coords = p.coordinates().unwrap();
-        let x_fp = *coords.x();
-        let y_fp = *coords.y();
-        let lbb = big_limb_base();
-        let x_big = num_bigint::BigUint::from_bytes_le(x_fp.to_repr().as_ref());
-        let y_big = num_bigint::BigUint::from_bytes_le(y_fp.to_repr().as_ref());
-        let x_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
-            let lv = (&x_big / &lbb.pow(i as u32)) % &lbb;
-            Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-        });
-        let y_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
-            let lv = (&y_big / &lbb.pow(i as u32)) % &lbb;
-            Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-        });
-        PallasPoint {
-            x: FpElement { limbs: x_limbs },
-            y: FpElement { limbs: y_limbs },
-            x_cell: None, y_cell: None,
-        }
-    }
-
-    fn fp_add_witness(p: &PallasPoint, q: &PallasPoint) -> (FpElement, FpElement, FpElement) {
-        let reconstruct = |el: &FpElement| -> Fp {
-            let mut big = num_bigint::BigUint::from(0u32);
-            let base = big_limb_base();
-            for (i, limb) in el.limbs.iter().enumerate() {
-                if let Ok(val) = limb.value.assign() {
-                    let lv_big = num_bigint::BigUint::from_bytes_le(val.to_repr().as_ref());
-                    big += lv_big * base.pow(i as u32);
-                }
-            }
-            let mut repr = <Fp as PrimeField>::Repr::default();
-            let le = big.to_bytes_le();
-            repr.as_mut()[..le.len()].copy_from_slice(&le);
-            <Fp as PrimeField>::from_repr(repr).unwrap()
-        };
-        let px = reconstruct(&p.x);
-        let py = reconstruct(&p.y);
-        let qx = reconstruct(&q.x);
-        let qy = reconstruct(&q.y);
-        let lam = (qy - py) * (qx - px).invert().unwrap();
-        let rx = lam.square() - px - qx;
-        let ry = lam * (px - rx) - py;
-
-        let fp_to_el = |fp: Fp| -> FpElement {
-            let big = num_bigint::BigUint::from_bytes_le(fp.to_repr().as_ref());
-            let base = big_limb_base();
-            let limbs = array::from_fn(|i| {
-                let lv = (&big / &base.pow(i as u32)) % &base;
-                Limb { value: Value::known(big_to_fq(&lv)), cell: None }
-            });
-            FpElement { limbs }
-        };
-        (fp_to_el(lam), fp_to_el(rx), fp_to_el(ry))
-    }
-
-    fn commitment_limbs(p: &PallasPoint) -> Vec<Fq> {
-        let mut limbs = Vec::with_capacity(2 * FP_NUM_LIMBS);
-        for limb in &p.x.limbs {
-            limbs.push(limb.value.assign().unwrap_or(Fq::ZERO));
-        }
-        for limb in &p.y.limbs {
-            limbs.push(limb.value.assign().unwrap_or(Fq::ZERO));
-        }
-        limbs
-    }
 
     #[test]
     fn test_recursive_proof_k1_valid() {
@@ -259,7 +187,19 @@ mod tests {
         let wit_gh = fp_add_witness(&p_a, &p_rh);
         let wit_u = fp_add_witness(&p_rhs_gh, &p_ab);
 
-        let pub_limbs = commitment_limbs(&p_com);
+        let mut pub_limbs = commitment_limbs(&p_com);
+        // state_root must be < Fq modulus; use a small value.
+        let sr_bytes: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0xab;
+            b
+        };
+        let sr_fq = {
+            let mut repr = <Fq as PrimeField>::Repr::default();
+            repr.as_mut()[..1].copy_from_slice(&sr_bytes[..1]);
+            <Fq as PrimeField>::from_repr(repr).unwrap()
+        };
+        pub_limbs.push(sr_fq);
         let circuit = RecursiveProofCircuit {
             commitment: p_com,
             l_scaled: vec![p_l],
@@ -269,6 +209,7 @@ mod tests {
             ab_eval_mul_u: p_ab,
             lhs_witnesses: vec![wit_lr, wit_accum],
             rhs_witnesses: vec![wit_gh, wit_u],
+            state_root: sr_bytes,
         };
 
         let prover = MockProver::run(16, &circuit, vec![pub_limbs]).unwrap();
@@ -311,6 +252,18 @@ mod tests {
 
         let mut wrong_limbs = commitment_limbs(&p_com);
         wrong_limbs[0] += Fq::ONE;
+        // state_root must be < Fq modulus.
+        let sr_bytes: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0xab;
+            b
+        };
+        let sr_fq = {
+            let mut repr = <Fq as PrimeField>::Repr::default();
+            repr.as_mut()[..1].copy_from_slice(&sr_bytes[..1]);
+            <Fq as PrimeField>::from_repr(repr).unwrap()
+        };
+        wrong_limbs.push(sr_fq);
         let circuit = RecursiveProofCircuit {
             commitment: p_com,
             l_scaled: vec![p_l],
@@ -320,6 +273,7 @@ mod tests {
             ab_eval_mul_u: p_ab,
             lhs_witnesses: vec![wit_lr, wit_accum],
             rhs_witnesses: vec![wit_gh, wit_u],
+            state_root: sr_bytes,
         };
 
         let prover = MockProver::run(16, &circuit, vec![wrong_limbs]).unwrap();
