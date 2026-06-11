@@ -145,6 +145,144 @@ impl VestaAccumulateChip {
             challenges,
         )
     }
+
+    /// Full in-circuit IPA verification.
+    ///
+    /// Verifies the equation:
+    ///   `commitment + Σ(x_inv·L_i + x·R_i) = a·G_final + r'·H + (ab-eval)·U`
+    pub fn verify_ipa_full(
+        &self,
+        mut layouter: impl Layouter<Fq>,
+        commitment: &VestaPoint,
+        eval: &Limb<Fq>,
+        a_final: &Limb<Fq>,
+        r_prime: &Limb<Fq>,
+        l_points: &[VestaPoint],
+        r_points: &[VestaPoint],
+        lr_offsets: &[VestaPoint],
+        challenges: &[Limb<Fq>],
+        fold_result: &VestaIpaResult,
+        g_final_offset: &VestaPoint,
+        h_point: &VestaPoint,
+        h_offset: &VestaPoint,
+        u_point: &VestaPoint,
+        u_offset: &VestaPoint,
+    ) -> Result<(), ErrorFront> {
+        let k = challenges.len();
+        assert_eq!(l_points.len(), k);
+        assert_eq!(r_points.len(), k);
+        assert_eq!(lr_offsets.len(), 2 * k);
+
+        let ecc = &self.ipa.ecc;
+        let fq = &self.ipa.fq;
+
+        // 1. a*b - eval  (no native sub, so compute a*b + (-eval))
+        let a_mul_b = fq.mul(
+            layouter.namespace(|| "a_mul_b"),
+            a_final,
+            &fold_result.b_final,
+            "a_mul_b",
+        )?;
+        let neg_one = fq.assign_constant(
+            layouter.namespace(|| "neg_one"),
+            -Fq::ONE,
+            "neg_one",
+        )?;
+        let neg_eval = fq.mul(
+            layouter.namespace(|| "neg_eval"),
+            eval,
+            &neg_one,
+            "neg_eval",
+        )?;
+        let ab_minus_eval = fq.add(
+            layouter.namespace(|| "ab_minus_eval"),
+            &a_mul_b,
+            &neg_eval,
+            "ab_minus_eval",
+        )?;
+
+        // 2. RHS = a·G_final + r'·H + (ab-eval)·U
+        let rhs_a = ecc.scalar_mul(
+            layouter.namespace(|| "a_mul_gfinal"),
+            &fold_result.g_final,
+            g_final_offset,
+            a_final.value,
+            "a_mul_gfinal",
+        )?;
+        let rhs_ar = ecc.scalar_mul(
+            layouter.namespace(|| "r_prime_mul_h"),
+            h_point,
+            h_offset,
+            r_prime.value,
+            "r_prime_mul_h",
+        )?;
+        let rhs_u = ecc.scalar_mul(
+            layouter.namespace(|| "ab_minus_eval_mul_u"),
+            u_point,
+            u_offset,
+            ab_minus_eval.value,
+            "ab_minus_eval_mul_u",
+        )?;
+
+        let rhs_temp = ecc.point_add(
+            layouter.namespace(|| "rhs_add_ar"),
+            &rhs_a,
+            &rhs_ar,
+            "rhs_a_plus_ar",
+        )?;
+        let rhs = ecc.point_add(
+            layouter.namespace(|| "rhs_add_u"),
+            &rhs_temp,
+            &rhs_u,
+            "rhs_add_u",
+        )?;
+
+        // 3. LHS = commitment + Σ(x_inv·L_i + x·R_i)
+        let mut lhs = commitment.clone();
+        for i in 0..k {
+            let x_inv = fq.invert(
+                layouter.namespace(|| format!("x_inv_{}", i)),
+                &challenges[i],
+                &format!("x_inv_{}", i),
+            )?;
+            let li_term = ecc.scalar_mul(
+                layouter.namespace(|| format!("l_{}_term", i)),
+                &l_points[i],
+                &lr_offsets[2 * i],
+                x_inv.value,
+                &format!("l_{}", i),
+            )?;
+            let ri_term = ecc.scalar_mul(
+                layouter.namespace(|| format!("r_{}_term", i)),
+                &r_points[i],
+                &lr_offsets[2 * i + 1],
+                challenges[i].value,
+                &format!("r_{}", i),
+            )?;
+            let lr_sum = ecc.point_add(
+                layouter.namespace(|| format!("lr_sum_{}", i)),
+                &li_term,
+                &ri_term,
+                &format!("lr_sum_{}", i),
+            )?;
+            lhs = ecc.point_add(
+                layouter.namespace(|| format!("lhs_add_{}", i)),
+                &lhs,
+                &lr_sum,
+                &format!("lhs_add_{}", i),
+            )?;
+        }
+
+        // 4. constrain LHS == RHS
+        ecc.constrain_equal_points(
+            layouter.namespace(|| "verify_ipa_eq"),
+            &lhs,
+            &rhs,
+            "verify_ipa_eq",
+        )?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -153,32 +291,37 @@ mod tests {
     use crate::ipa_transcript::{challenge_prefix_bytes, point_transcript_bytes, scalar_transcript_bytes};
     use ff::{Field, FromUniformBytes, PrimeField};
     use halo2_proofs::halo2curves::pasta::EqAffine;
-    use halo2_proofs::{
-        circuit::SimpleFloorPlanner,
-        dev::MockProver,
-        plonk::Circuit,
-    };
+    use halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit};
     use halo2curves::group::prime::PrimeCurveAffine;
-    use halo2curves::group::Curve;
+    use halo2curves::group::{Curve, Group};
     use halo2curves::CurveAffine;
     use num_bigint::BigUint;
 
-    /// Split a byte stream into challenge-specific prefixes by 0x00 markers.
-    fn squeeze_prefixes(stream: &[u8], k: usize) -> Vec<Vec<u8>> {
-        let mut prefixes = Vec::with_capacity(k);
-        let mut chal_count = 0usize;
-        for i in 0..stream.len() {
-            if stream[i] == 0x00 {
-                chal_count += 1;
-                if chal_count <= k {
-                    prefixes.push(stream[..=i].to_vec());
-                }
-                if chal_count >= k {
-                    break;
-                }
-            }
+    const SCALAR_ENCODED_SIZE: usize = 33;
+    const POINT_ENCODED_SIZE: usize = 65;
+    const CHALLENGE_PREFIX_SIZE: usize = 1;
+
+    /// Compute the byte-stream position of the i-th squeeze marker (0 = theta).
+    fn squeeze_position(idx: usize) -> usize {
+        if idx == 0 {
+            SCALAR_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE - 1
+        } else {
+            squeeze_position(idx - 1) + 1 + POINT_ENCODED_SIZE + POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE - 1
         }
-        prefixes
+    }
+
+    /// Extract challenge prefixes from an IPA-trace byte stream by known positions.
+    fn extract_ipa_prefixes(stream: &[u8]) -> Vec<Vec<u8>> {
+        // stream has k+1 squeezes: theta + k round challenges.
+        // Total squeezes = (stream.len() - SCALAR_ENCODED_SIZE) / (2 * POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE)
+        let num_squeezes = 1 + (stream.len() - SCALAR_ENCODED_SIZE - CHALLENGE_PREFIX_SIZE)
+            / (2 * POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE);
+        (0..num_squeezes)
+            .map(|i| {
+                let pos = squeeze_position(i);
+                stream[..=pos].to_vec()
+            })
+            .collect()
     }
 
     /// Hash a byte prefix through Blake2b and produce an Fq challenge.
@@ -336,10 +479,8 @@ mod tests {
             let r_aff = r.to_affine();
 
             let mut byte_stream = Vec::new();
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(n as u64)));
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(point));
-            byte_stream.extend_from_slice(&point_transcript_bytes(commitment).unwrap());
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(eval));
+            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k as u64)));
+            byte_stream.extend_from_slice(&challenge_prefix_bytes());
             for idx in 0..l_points.len() {
                 byte_stream.extend_from_slice(&point_transcript_bytes(l_points[idx]).unwrap());
                 byte_stream.extend_from_slice(&point_transcript_bytes(r_points[idx]).unwrap());
@@ -349,9 +490,10 @@ mod tests {
             byte_stream.extend_from_slice(&point_transcript_bytes(r_aff).unwrap());
             byte_stream.extend_from_slice(&challenge_prefix_bytes());
 
-            let prefixes = squeeze_prefixes(&byte_stream, k);
-            let chal_idx = l_points.len();
-            let x = blake2b_prefix_challenge(&prefixes[chal_idx]);
+            let prefixes = extract_ipa_prefixes(&byte_stream);
+            // prefixes[0] = theta, prefixes[1..] = round challenges
+            let round_idx = l_points.len();  // 0-indexed round number
+            let x = blake2b_prefix_challenge(&prefixes[round_idx + 1]);  // +1 to skip theta
             let x_inv = x.invert().unwrap();
 
             let mut a_new = Vec::with_capacity(half);
@@ -446,17 +588,17 @@ mod tests {
             let k = self.witness.challenges.len();
 
             let mut byte_stream = Vec::new();
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(self.witness.generators.len() as u64)));
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(self.witness.point));
-            byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.commitment).unwrap());
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(self.witness.eval));
+            let k_u64 = k as u64;
+            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k_u64)));
+            byte_stream.extend_from_slice(&challenge_prefix_bytes());
             for i in 0..k {
                 byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.l_points[i]).unwrap());
                 byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.r_points[i]).unwrap());
                 byte_stream.extend_from_slice(&challenge_prefix_bytes());
             }
 
-            let prefixes = squeeze_prefixes(&byte_stream, k);
+            let all_prefixes = extract_ipa_prefixes(&byte_stream);
+            let prefixes: Vec<Vec<u8>> = all_prefixes[1..].to_vec();  // skip theta
 
             let chal_limbs: Vec<Limb<Fq>> = self
                 .witness
@@ -572,4 +714,342 @@ mod tests {
         let prover = MockProver::run(17, &circuit, vec![]).unwrap();
         assert!(prover.verify().is_err(), "expected rejection for corrupt challenge");
     }
+
+    struct VerifyIpaWitness {
+        generators: Vec<EqAffine>,
+        point: Fq,
+        challenges: Vec<Fq>,
+        l_points: Vec<EqAffine>,
+        r_points: Vec<EqAffine>,
+        commitment: EqAffine,
+        eval: Fq,
+        a_final: Fq,
+        host_g_final: EqAffine,
+        r_prime: Fq,
+        h_point: EqAffine,
+        u_point: EqAffine,
+    }
+
+    #[derive(Clone)]
+    struct VerifyIpaConfig {
+        acc: VestaAccumulateConfig,
+    }
+
+    struct VerifyIpaTest {
+        witness: VerifyIpaWitness,
+        corrupt_r_prime: bool,
+    }
+
+    impl Circuit<Fq> for VerifyIpaTest {
+        type Config = VerifyIpaConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                witness: VerifyIpaWitness {
+                    generators: vec![EqAffine::generator()],
+                    point: Fq::ZERO,
+                    challenges: vec![],
+                    l_points: vec![],
+                    r_points: vec![],
+                    commitment: EqAffine::generator(),
+                    eval: Fq::ZERO,
+                    a_final: Fq::ZERO,
+                    host_g_final: EqAffine::generator(),
+                    r_prime: Fq::ZERO,
+                    h_point: EqAffine::generator(),
+                    u_point: EqAffine::generator(),
+                },
+                corrupt_r_prime: false,
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+            VerifyIpaConfig {
+                acc: VestaAccumulateConfig::configure(meta),
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fq>,
+        ) -> Result<(), ErrorFront> {
+            let chip = VestaAccumulateChip::new(&config.acc);
+            let k = self.witness.challenges.len();
+
+            // Build byte stream for challenge derivation (IPA-only trace matching PallasIpaProofTrace)
+            let mut byte_stream = Vec::new();
+            let k_u64 = k as u64;
+            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k_u64)));
+            byte_stream.extend_from_slice(&challenge_prefix_bytes());
+            for i in 0..k {
+                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.l_points[i]).unwrap());
+                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.r_points[i]).unwrap());
+                byte_stream.extend_from_slice(&challenge_prefix_bytes());
+            }
+            let all_prefixes = extract_ipa_prefixes(&byte_stream);
+            let prefixes: Vec<Vec<u8>> = all_prefixes[1..].to_vec();  // skip theta
+
+            let chal_limbs: Vec<Limb<Fq>> = self
+                .witness
+                .challenges
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    chip.ipa
+                        .fq
+                        .assign_constant(
+                            layouter.namespace(|| format!("chal_{}", i)),
+                            *c,
+                            &format!("chal_{}", i),
+                        )
+                        .unwrap()
+                })
+                .collect();
+
+            let bound_chals = chip.squeeze_challenges(
+                layouter.namespace(|| "squeeze"),
+                &config.acc,
+                &prefixes,
+                &chal_limbs,
+            )?;
+
+            let point_limb = chip.ipa.fq.assign_constant(
+                layouter.namespace(|| "point"),
+                self.witness.point,
+                "point",
+            )?;
+
+            let g_val: Vec<VestaPoint> =
+                self.witness.generators.iter().map(|g| to_vesta_point(g)).collect();
+            let offset_points = flatten_offsets(&self.witness.generators, &self.witness.challenges);
+
+            let fold_result = chip.fold_and_constrain(
+                layouter.namespace(|| "fold"),
+                &point_limb,
+                &g_val,
+                &offset_points,
+                &bound_chals,
+            )?;
+
+            // L/R points as VestaPoints
+            let l_vals: Vec<VestaPoint> = self.witness.l_points.iter().map(|p| to_vesta_point(p)).collect();
+            let r_vals: Vec<VestaPoint> = self.witness.r_points.iter().map(|p| to_vesta_point(p)).collect();
+            let commitment_point = to_vesta_point(&self.witness.commitment);
+
+            // L/R offsets
+            let two_pow_254 = BigUint::from(2u128).pow(254);
+            let mut repr = <Fq as PrimeField>::Repr::default();
+            let le = two_pow_254.to_bytes_le();
+            repr.as_mut()[..le.len()].copy_from_slice(&le);
+            let two_pow_254_fq = Fq::from_repr(repr).unwrap();
+            let two_pow_254_fp = fq_as_fp(two_pow_254_fq);
+
+            let mut lr_offsets = Vec::with_capacity(2 * k);
+            for i in 0..k {
+                let l_scaled = (self.witness.l_points[i].to_curve() * two_pow_254_fp).to_affine();
+                lr_offsets.push(to_vesta_point(&l_scaled));
+                let r_scaled = (self.witness.r_points[i].to_curve() * two_pow_254_fp).to_affine();
+                lr_offsets.push(to_vesta_point(&r_scaled));
+            }
+
+            // g_final offset
+            let g_final_scaled = (self.witness.host_g_final.to_curve() * two_pow_254_fp).to_affine();
+            let g_final_offset = to_vesta_point(&g_final_scaled);
+
+            // H and U from witness
+            let h_scaled = (self.witness.h_point.to_curve() * two_pow_254_fp).to_affine();
+            let u_scaled = (self.witness.u_point.to_curve() * two_pow_254_fp).to_affine();
+            let h_offset = to_vesta_point(&h_scaled);
+            let u_offset = to_vesta_point(&u_scaled);
+            let h_point = to_vesta_point(&self.witness.h_point);
+            let u_point = to_vesta_point(&self.witness.u_point);
+
+            let eval_limb = chip.ipa.fq.assign_constant(
+                layouter.namespace(|| "eval"),
+                self.witness.eval,
+                "eval",
+            )?;
+            let a_final_limb = chip.ipa.fq.assign_constant(
+                layouter.namespace(|| "a_final"),
+                self.witness.a_final,
+                "a_final",
+            )?;
+            let r_prime_val = if self.corrupt_r_prime {
+                self.witness.r_prime + Fq::ONE
+            } else {
+                self.witness.r_prime
+            };
+            let r_prime_limb = chip.ipa.fq.assign_constant(
+                layouter.namespace(|| "r_prime"),
+                r_prime_val,
+                "r_prime",
+            )?;
+
+            chip.verify_ipa_full(
+                layouter.namespace(|| "verify_ipa"),
+                &commitment_point,
+                &eval_limb,
+                &a_final_limb,
+                &r_prime_limb,
+                &l_vals,
+                &r_vals,
+                &lr_offsets,
+                &bound_chals,
+                &fold_result,
+                &g_final_offset,
+                &h_point,
+                &h_offset,
+                &u_point,
+                &u_offset,
+            )?;
+
+            Ok(())
+        }
+    }
+
+    /// Build a base VerifyIpaWitness from the standard test witness.
+    fn base_verify_witness() -> VerifyIpaWitness {
+        let w = build_test_witness();
+        let (host_b_final, host_g_final) =
+            host_fold(w.point, &w.generators, &w.challenges);
+        let gen = EqAffine::generator();
+
+        let mut q = w.commitment.to_curve();
+        for i in 0..w.challenges.len() {
+            let x = w.challenges[i];
+            let x_inv = x.invert().unwrap();
+            q = (q + w.l_points[i].to_curve() * fq_as_fp(x_inv)
+                   + w.r_points[i].to_curve() * fq_as_fp(x)).to_affine().to_curve();
+        }
+        let u_scalar = w.a_final * host_b_final - w.eval;
+        let a_g_final_curve = host_g_final.to_curve() * fq_as_fp(w.a_final);
+        let u_term = gen.to_curve() * fq_as_fp(u_scalar);
+        let target = q - a_g_final_curve - u_term;
+        let target_aff = target.to_affine();
+        let (h_point, r_prime) = if bool::from(target.is_identity()) {
+            (gen, Fq::ZERO)
+        } else {
+            (target_aff, Fq::ONE)
+        };
+        let u_point = gen;
+
+        VerifyIpaWitness {
+            generators: w.generators,
+            point: w.point,
+            challenges: w.challenges,
+            l_points: w.l_points,
+            r_points: w.r_points,
+            commitment: w.commitment,
+            eval: w.eval,
+            a_final: w.a_final,
+            host_g_final,
+            r_prime,
+            h_point,
+            u_point,
+        }
+    }
+
+    #[test]
+    fn test_verify_ipa_full_passes() {
+        let vw = base_verify_witness();
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        match prover.verify() {
+            Ok(()) => {}
+            Err(e) => panic!("verify_ipa_full failed: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_verify_ipa_full_rejects_corrupt_r_prime() {
+        let vw = base_verify_witness();
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: true,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "expected rejection for corrupt r_prime"
+        );
+    }
+
+    #[test]
+    fn test_verify_ipa_full_rejects_corrupt_eval() {
+        let mut vw = base_verify_witness();
+        vw.eval = vw.eval + Fq::ONE;
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "expected rejection for corrupt eval"
+        );
+    }
+
+    #[test]
+    fn test_verify_ipa_full_rejects_corrupt_a_final() {
+        let mut vw = base_verify_witness();
+        vw.a_final = vw.a_final + Fq::ONE;
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "expected rejection for corrupt a_final"
+        );
+    }
+
+    #[test]
+    fn test_verify_ipa_full_rejects_corrupt_l_point() {
+        let mut vw = base_verify_witness();
+        vw.l_points[0] = EqAffine::generator();
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "expected rejection for corrupt L point"
+        );
+    }
+
+    #[test]
+    fn test_verify_ipa_full_rejects_corrupt_r_point() {
+        let mut vw = base_verify_witness();
+        vw.r_points[0] = EqAffine::generator();
+        let circuit = VerifyIpaTest {
+            witness: vw,
+            corrupt_r_prime: false,
+        };
+        let prover = MockProver::run(17, &circuit, vec![]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "expected rejection for corrupt R point"
+        );
+    }
+
+    // ─── Integration: real IPA proof bytes → VerifyIpaTest circuit ───
+    //
+    // NOTE: A direct pipeline from aetheris-zkp's ProverIPA<EpAffine> (Vesta,
+    // scalar Fq) into the Pallas-based VerifyIpaTest circuit (points EqAffine,
+    // circuit field Fq) is infeasible without a major refactor. The proof's
+    // scalars (Fq for Vesta, Fp for Pallas) live in different fields —
+    // byte-reinterpretation does not preserve inverses or the IPA accumulator
+    // equation.  A future integration could:
+    //   1. Port the circuit to Vesta (EpAffine) so field types match natively
+    //   2. Or write a standalone prover that operates on Pallas (EqAffine)
+    //      with Fp scalars and a companion circuit over Fp.
+    // For now, correctness of the circuit is validated by the synthetic-proof
+    // tests above.
 }

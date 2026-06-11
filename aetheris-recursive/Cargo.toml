@@ -33,3 +33,5 @@ ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = { workspace = true }
+halo2_backend = { path = "../aetheris-zkp/vendor/halo2/halo2_backend" }
+halo2_middleware = { path = "../aetheris-zkp/vendor/halo2/halo2_middleware" }

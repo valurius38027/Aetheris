@@ -1818,6 +1818,7 @@ impl EccChip {
 
 pub mod diagnostics;
 pub mod ipa_transcript;
+pub mod proof_import;
 pub mod non_native_fq;
 pub mod transcript_blake2b;
 pub mod transcript_blake2b_circuit;

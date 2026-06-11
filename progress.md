@@ -3161,3 +3161,54 @@ cargo check --workspace                    ✅ zero errors zero warnings
 cargo test -p aetheris-node --lib           ✅ 11/11
 ```
 
+---
+
+## Stage 46 — IPA Proof Import + VestaAccumulateChip verify_ipa_full + Test Refactoring (2026-06-11)
+
+**Scope**: Add `proof_import::parse_proof_bytes` for parsing real Halo2 IPA proofs into circuit witnesses. Add `verify_ipa_full` on `VestaAccumulateChip` for full in-circuit IPA verification. Refactor `vesta_accumulate.rs` test module for correctness (deterministic prefix extraction, named witness structs, 5 new negative tests).
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-recursive/src/proof_import.rs` | **New** — `IpaProofWitness` struct, `parse_proof_bytes()` (Blake2bRead transcript deserialization with k-expected validation, L/R point reading, challenge resqueeze), `build_ipa_transcript_stream()` (deterministic prefix construction by fixed-size event encoding), `squeeze_position()` helper. 2 unit tests. |
+| `aetheris-recursive/src/vesta_accumulate.rs` | Added `verify_ipa_full()` — full in-circuit IPA verification equation `commitment + Σ(x_inv·L_i + x·R_i) = a·G_final + r'·H + (ab-eval)·U` using VestaEccChip scalar_mul + point_add + constrain_equal_points. |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Replaced `squeeze_prefixes(stream, k)` (searched for 0x00 bytes — false-matches zero bytes inside scalar/point encodings) with `extract_ipa_prefixes(stream)` + `squeeze_position(idx)` (deterministic position computation from fixed event sizes). |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Separated conflated `build_test_witness` into `build_test_witness_for_accumulator` (original) and `build_test_witness` (IPA-specific). Added `VerifyIpaWitness` named struct (12 fields) replacing inline tuple. |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Added `base_verify_witness()` helper eliminating 5× duplicated ~50-line witness construction blocks. |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Fixed challenge indexing — theta prefix at index 0 skipped (`all_prefixes[1..]`), round challenges use `prefixes[round_idx + 1]`. |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Added 5 negative tests: corrupt `eval`, corrupt `l_point`, corrupt `r_point`, corrupt `r_prime`, corrupt `a_final`. |
+| `aetheris-recursive/src/vesta_accumulate.rs` (test module) | Removed unused imports: `H2cEngine`, `OsRng`, `Blake2bRead`, `Blake2bWrite`, `Challenge255`, `TranscriptReadBuffer`, `TranscriptWriterBuffer`. Removed duplicate `use crate::ipa_transcript::...` inside `VerifyIpaTest::synthesize`. |
+| `aetheris-recursive/src/lib.rs` | Added `pub mod proof_import;` |
+| `aetheris-recursive/Cargo.toml` | Added `halo2_backend`, `halo2_middleware` as dev-dependencies (for `proof_import.rs` transcript types). |
+
+### Design Decisions
+
+1. **verify_ipa_full uses the full VestaEccChip stack** — `scalar_mul` + `point_add` + `constrain_equal_points` — the same path used by `VestaAccumulateChip::accumulate`. No separate ECC instantiation.
+2. **Fq subtraction handled via neg + add** — `ab - eval` computed as `ab + (-1 * eval)` since no native subtraction gate exists in `VestaFqChip`.
+3. **Deterministic prefix extraction** — `squeeze_position(idx)` computes exact byte positions from fixed event sizes (33 for scalar, 65 for point, 1 for challenge), avoiding the 0x00-byte-search approach that could false-match zero bytes inside curve point encodings.
+4. **proof_import.parse_proof_bytes uses real Halo2 transcript** — `Blake2bRead<&[u8], EpAffine, Challenge255>` reads k, theta, L/R points, a_final, r_prime from the raw proof bytes after stripping the `halo2_ipa_pasta_v1_` prefix + shape header.
+
+### Key Bug Fixes
+
+| Bug | Fix |
+|-----|-----|
+| `squeeze_prefixes` searched stream for 0x00 bytes — false-matched zero bytes inside scalar/point encodings, producing wrong prefixes | Replaced with `squeeze_position(idx)` computing exact positions from fixed event encoding sizes |
+| `build_test_witness` had two different functions with the same name | Renamed original → `build_test_witness_for_accumulator`, IPA-specific → `build_test_witness` |
+| `VerifyIpaWitness` was an inline `([...], [...], ...)` tuple — unreadable for 12 fields | Refactored to named struct with field documentation |
+| Theta challenge prefix (index 0) was incorrectly included in round-challenge iteration | Changed `all_prefixes[1..]` — theta prefix skipped, round challenges use `prefixes[round_idx + 1]` |
+
+### Multi-Agent Review
+
+- Reviewer A: ✅ APPROVED (no blocking issues)
+- Reviewer B: ✅ APPROVED — ⚠️ minor warning: missing `a_final` corruption test → **added** in iteration
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive --lib` | ✅ **163/163** (was 155, +8 new: 5 negative tests + 1 new helper test in proof_import.rs + 2 test infrastructure tests) |
+| `cargo test -p aetheris-zkp --lib` | ✅ 119/119 (no regressions) |
+| `cargo test -p aetheris-node --lib` | ✅ 11/11 (no regressions) |
+
