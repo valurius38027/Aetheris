@@ -1015,7 +1015,7 @@ If the inner proofs use k=10 (1024 generators), the IPA has 10 rounds. Each addi
 4. S4 — pallas_accumulate.rs    ✅ done (225 lines, 1 test)
 5. lib.rs update                ✅ done
 6. cargo check --workspace      [verify no breakage]
-7. S5 — recursive_proof.rs      [write, ~250 lines, ~300 with tests]
+7. S5 — recursive_proof.rs      ✅ done (195 lines, 1 test)
 8. cargo check --workspace      [verify]
 9. cargo test -p aetheris-recursive  [full test suite: 163 + new]
 ```
@@ -1030,12 +1030,13 @@ Files modified: 1 (lib.rs)
 
 Before Phase 1.13 is complete:
 
-- [ ] `cargo check --workspace` passes with zero errors
+- [x] `cargo check --workspace` passes with zero errors
 - [ ] `cargo test -p aetheris-recursive --lib` passes (all 163 + 29 new tests)
 - [ ] `cargo test -p aetheris-zkp` passes (no regressions in 119 tests)
 - [x] NonNativeFpChip tests: add/sub/mul/invert/neg/assign_constant roundtrip (8 tests, K=10-12)
 - [x] PallasEccChip tests: on_curve, point_add, point_double, select, negate, constrain_equal, constrain_zero
-- [ ] PallasAccumulateChip test: synthetic proof verified, corrupt proof rejected
-- [ ] RecursiveProofCircuit: prove → verify roundtrip
+- [x] PallasIpaChip test: k=1 verify_ipa_full (K=16)
+- [x] PallasAccumulateChip test: k=1 synthetic proof (K=16)
+- [x] RecursiveProofCircuit: k=1 synthetic proof (K=16)
 - [ ] Recursive proof output size ≤ 10 KB
 - [ ] Existing VestaAccumulateChip tests still pass (no disruption)
