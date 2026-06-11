@@ -58,6 +58,7 @@ impl VestaFqConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct VestaFqChip {
     config: VestaFqConfig,
 }

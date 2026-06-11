@@ -1833,6 +1833,13 @@ pub mod vesta_accumulate;
 pub mod vesta_range;
 
 pub mod vesta_transcript;
+
+pub mod non_native_fp;
+pub mod pallas_ecc;
+pub mod pallas_ipa;
+pub mod pallas_accumulate;
+pub mod recursive_proof;
+
 #[derive(Clone, Debug)]
 pub struct Limb<F: Field> {
     pub value: Value<F>,
