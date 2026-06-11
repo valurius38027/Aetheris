@@ -1011,7 +1011,7 @@ If the inner proofs use k=10 (1024 generators), the IPA has 10 rounds. Each addi
 ```
 1. S1 — non_native_fp.rs       ✅ done (1619 lines, 8 tests)
 2. S2 — pallas_ecc.rs           ✅ done (570 lines, tests included)
-3. S3 — pallas_ipa.rs           [write, ~100 lines] ← NEXT
+3. S3 — pallas_ipa.rs           ✅ done (128 lines, 1 test)
 4. S4 — pallas_accumulate.rs    [write, ~350 lines, ~600 with tests]
 5. lib.rs update                ✅ done
 6. cargo check --workspace      [verify no breakage]
