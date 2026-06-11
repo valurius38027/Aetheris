@@ -1839,6 +1839,7 @@ pub mod pallas_ecc;
 pub mod pallas_ipa;
 pub mod pallas_accumulate;
 pub mod recursive_proof;
+pub mod prove_recursive;
 
 #[derive(Clone, Debug)]
 pub struct Limb<F: Field> {

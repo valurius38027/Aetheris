@@ -38,26 +38,25 @@ pub struct RecursiveProofCircuit {
 impl Default for RecursiveProofCircuit {
     fn default() -> Self {
         let zero = FpElement::zero();
+        let zero_point = PallasPoint {
+            x: zero.clone(), y: zero.clone(),
+            x_cell: None, y_cell: None,
+        };
         Self {
-            commitment: PallasPoint {
-                x: zero.clone(), y: zero.clone(),
-                x_cell: None, y_cell: None,
-            },
-            l_scaled: vec![], r_scaled: vec![],
-            a_mul_gfinal: PallasPoint {
-                x: zero.clone(), y: zero.clone(),
-                x_cell: None, y_cell: None,
-            },
-            r_prime_mul_h: PallasPoint {
-                x: zero.clone(), y: zero.clone(),
-                x_cell: None, y_cell: None,
-            },
-            ab_eval_mul_u: PallasPoint {
-                x: FpElement::zero(), y: FpElement::zero(),
-                x_cell: None, y_cell: None,
-            },
-            lhs_witnesses: vec![],
-            rhs_witnesses: vec![],
+            commitment: zero_point.clone(),
+            l_scaled: vec![zero_point.clone()],
+            r_scaled: vec![zero_point.clone()],
+            a_mul_gfinal: zero_point.clone(),
+            r_prime_mul_h: zero_point.clone(),
+            ab_eval_mul_u: zero_point.clone(),
+            lhs_witnesses: vec![
+                (zero.clone(), zero.clone(), zero.clone()),
+                (zero.clone(), zero.clone(), zero.clone()),
+            ],
+            rhs_witnesses: vec![
+                (zero.clone(), zero.clone(), zero.clone()),
+                (zero.clone(), zero.clone(), zero.clone()),
+            ],
         }
     }
 }

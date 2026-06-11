@@ -28,10 +28,10 @@ rayon = "1.8"
 blake3 = { workspace = true }
 subtle = "2.6"
 ed25519-dalek = { workspace = true }
+halo2_backend = { path = "../aetheris-zkp/vendor/halo2/halo2_backend" }
 # Using a more standard poseidon implementation if available, or just mock it for now
 # poseidon = "0.3" 
 
 [dev-dependencies]
 rand_chacha = { workspace = true }
-halo2_backend = { path = "../aetheris-zkp/vendor/halo2/halo2_backend" }
 halo2_middleware = { path = "../aetheris-zkp/vendor/halo2/halo2_middleware" }
