@@ -2,7 +2,13 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, signed_accumulate_proof, genesis_recursive_state_bytes};
+use aetheris_recursive::{
+    prove_block_recursive, compute_tx_witness, parse_recursive_state,
+    build_accumulate_keys, genesis_recursive_state_bytes,
+    INSTANCE_PREFIX_BYTES, EqAffine, Fq, Field, PrimeCurveAffine,
+    AggregateProofGossip, verify_accumulator_chain,
+};
+use aetheris_recursive::circuit_accumulate::{compute_generator_and_offset, TxWitness};
 use ed25519_dalek::SigningKey;
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
@@ -193,7 +199,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let network = &mut swarms;
     network.listen(&format!("/ip4/0.0.0.0/tcp/{}", args.port)).await?;
     network.subscribe_topics()?;
-    let accu_topic = network.accumulator_topic.clone();
     let swarm = &mut network.swarm;
     let topic = network.block_topic.clone();
     let sync_topic = network.sync_topic.clone();
@@ -629,47 +634,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let txs = mempool.lock().unwrap().take_all();
                     let state_root = ledger.lock().unwrap().get_state_root();
                     
-                    // Generate block aggregate proof via IPA accumulator chain
+                    // Generate O(1) recursive SNARK proving the accumulator transition
                     let tx_count = txs.len();
-                    let mut agg = last_block_proof.clone();
-                    let mut included_proofs: Vec<Vec<u8>> = Vec::new();
-                    let mut included_commitments: Vec<Vec<[u8; 32]>> = Vec::new();
-                    let mut included_public_amounts: Vec<i64> = Vec::new();
+                    let (q_old, transcript_old, depth_old) = match parse_recursive_state(&last_block_proof) {
+                        Some(s) => s,
+                        None => {
+                            println!("[Miner] Failed to parse recursive state, using genesis");
+                            (EqAffine::generator(), Fq::ZERO, 0u32)
+                        }
+                    };
+                    let (_gen_pt, gen_off) = compute_generator_and_offset();
+                    let mut witnesses: Vec<TxWitness> = Vec::new();
                     for tx in &txs {
                         if tx.public_amount > 0 {
                             continue; // skip coinbase — no ZK proof
                         }
                         let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
-                        match signed_accumulate_proof(&agg, &tx.proof, &commitments, tx.circuit_public_amount(), &aggregator_sk) {
-                            Ok(new_agg) => {
-                                agg = new_agg;
-                                included_proofs.push(tx.proof.clone());
-                                included_commitments.push(commitments);
-                                included_public_amounts.push(tx.circuit_public_amount());
-                            }
-                            Err(e) => {
-                                eprintln!("[Miner] Skipping tx with invalid proof: {}", e);
-                                continue;
-                            }
-                        }
+                        let w = compute_tx_witness(
+                            &tx.proof,
+                            &commitments,
+                            tx.circuit_public_amount(),
+                            &gen_off,
+                        );
+                        witnesses.push(w);
                     }
-                    let aggregate_proof = agg;
-                    
-                    // §1.11: Build accumulator gossip before overwriting last_block_proof
-                    let gossip_prev = last_block_proof.clone();
-                    let gossip_depth = included_public_amounts.len() as u32;
-                    let accumulator_gossip = AggregateProofGossip {
-                        aggregate_id: *blake3::hash(&aggregate_proof).as_bytes(),
-                        accumulator: aggregate_proof.clone(),
-                        prev_accumulator: gossip_prev,
-                        proofs: included_proofs,
-                        commitments_list: included_commitments,
-                        public_amounts: included_public_amounts,
-                        depth: gossip_depth,
-                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                    let num_txs = witnesses.len();
+                    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(15);
+                    let (_vk, pk) = match build_accumulate_keys(&params, num_txs) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("[Miner] Keygen failed: {}", e);
+                            continue;
+                        }
+                    };
+                    let (recursive_proof, _q_new, _transcript_new, _depth_new) = match prove_block_recursive(
+                        &params, &pk, q_old, transcript_old, depth_old, witnesses,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[Miner] prove_block_recursive failed: {}", e);
+                            continue;
+                        }
                     };
                     
-                    last_block_proof = aggregate_proof.clone();
+                    last_block_proof = recursive_proof[..INSTANCE_PREFIX_BYTES].to_vec();
 
                     // 3. Propose Block — single timestamp, hash from serialized block
                     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -682,7 +690,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             vdf_proof: vdf_proof.clone(),
                             height: current_height,
                             difficulty: current_difficulty,
-                            recursive_proof: vec![],
+                            recursive_proof: recursive_proof.clone(),
                         },
                         transactions: txs.clone(),
                     };
@@ -703,13 +711,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("🚀 Proposing Block #{} with {} txs (VDF Solved!)", current_height, tx_count);
                     if let Ok(data) = serde_json::to_vec(&proposal) {
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
-                    }
-                    
-                    // §1.11: Publish accumulator gossip for pre-validation
-                    if gossip_depth > 0 {
-                        if let Ok(gossip_data) = serde_json::to_vec(&accumulator_gossip) {
-                            let _ = swarm.behaviour_mut().gossipsub.publish(accu_topic.clone(), gossip_data);
-                        }
                     }
                     
                     // 4. Add to local arbitrator (Self-arbitration)

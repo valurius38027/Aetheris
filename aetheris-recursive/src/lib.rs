@@ -44,12 +44,13 @@ use halo2_proofs::{
 // alias was misleading: Pallas EC operations, not Vesta's, are the ones
 // native to this circuit. Note that the curve equation `y² = x³ + 5` is
 // the same for Pallas and Vesta because both share b=5.)
-use halo2curves::group::prime::PrimeCurveAffine;
+pub use halo2curves::group::prime::PrimeCurveAffine;
 use halo2curves::group::Curve;
-use halo2curves::pasta::{EpAffine as PallasAffine, Fp, Fq};
+use halo2curves::pasta::{EpAffine as PallasAffine, Fp};
+pub use halo2curves::pasta::{EqAffine, Fq};
 use halo2curves::CurveAffine;
 
-use ff::{Field, PrimeField};
+pub use ff::{Field, PrimeField};
 use libp2p::PeerId;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1844,8 +1845,10 @@ pub mod recursive_proof;
 pub mod prove_recursive;
 pub use prove_recursive::{
     prove_block_recursive, verify_block_recursive_proof, verify_accumulate_proof,
-    build_accumulate_keys, genesis_recursive_state_bytes, INSTANCE_PREFIX_BYTES, compute_tx_witness,
+    build_accumulate_keys, genesis_recursive_state_bytes, INSTANCE_PREFIX_BYTES,
+    PROOF_PREFIX_BYTES, compute_tx_witness, parse_recursive_state,
 };
+
 
 #[derive(Clone, Debug)]
 pub struct Limb<F: Field> {

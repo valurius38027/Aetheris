@@ -106,6 +106,8 @@ pub fn build_recursive_instance(
 
 /// Size of the instance prefix in the proof format: Q.x(32) + Q.y(32) + transcript(32) + depth(4).
 pub const INSTANCE_PREFIX_BYTES: usize = 100;
+/// Full proof prefix including `num_txs` field: Q.x(32) || Q.y(32) || transcript(32) || depth(4) || num_txs(4)
+pub const PROOF_PREFIX_BYTES: usize = 104;
 
 /// Return the canonical genesis recursive accumulator state as serialized bytes.
 /// Format matches the proof prefix: [Q.x(32) || Q.y(32) || transcript(32) || depth(4)].
@@ -126,16 +128,19 @@ pub fn verify_block_recursive_proof(
     proof: &[u8],
     _state_root: &[u8; 32],
 ) -> bool {
-    if proof.len() < INSTANCE_PREFIX_BYTES {
+    if proof.len() < PROOF_PREFIX_BYTES {
         eprintln!("verify_block_recursive_proof: proof too short ({})", proof.len());
         return false;
     }
-    let (prefix, proof_body) = proof.split_at(INSTANCE_PREFIX_BYTES);
+    let (prefix, proof_body) = proof.split_at(PROOF_PREFIX_BYTES);
     let qx_repr: [u8; 32] = prefix[..32].try_into().unwrap();
     let qy_repr: [u8; 32] = prefix[32..64].try_into().unwrap();
     let transcript_slice: [u8; 32] = prefix[64..96].try_into().unwrap();
     let mut depth_bytes = [0u8; 4];
     depth_bytes.copy_from_slice(&prefix[96..100]);
+    let mut num_txs_bytes = [0u8; 4];
+    num_txs_bytes.copy_from_slice(&prefix[100..104]);
+    let num_txs = u32::from_le_bytes(num_txs_bytes) as usize;
 
     use ff::FromUniformBytes;
     use halo2_proofs::halo2curves::pasta::Fq;
@@ -150,10 +155,9 @@ pub fn verify_block_recursive_proof(
 
     let instances = vec![vec![q_x, q_y, transcript_new, depth_new]];
 
-    // Use K=16 keygen accommodating up to ~4 non-coinbase txs.
-    // The `state_root` param is retained for API compat but unused by the new circuit.
-    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(16);
-    let (vk, _pk) = match build_accumulate_keys(&params, 4) {
+    // Match the prover's K=15 and exact tx count so circuit structure is identical.
+    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(15);
+    let (vk, _pk) = match build_accumulate_keys(&params, num_txs) {
         Ok(k) => k,
         Err(_) => return false,
     };
@@ -321,6 +325,7 @@ pub fn prove_block_recursive(
     let (q_new, transcript_new, depth_new) =
         compute_expected_accumulator_output(q_old, transcript_old, depth_old, &txs);
 
+    let num_txs = txs.len();
     let (gen_pt, off_pt) = compute_generator_and_offset();
     let q_old_pt = eq_to_vesta_point(&q_old);
     let q_new_pt = eq_to_vesta_point(&q_new);
@@ -355,14 +360,15 @@ pub fn prove_block_recursive(
         &mut transcript,
     )?;
 
-    // Prepend public instances: [Q.x(32) || Q.y(32) || transcript(32) || depth(4)]
+    // Prepend public instances: [Q.x(32) || Q.y(32) || transcript(32) || depth(4) || num_txs(4)]
     // so the verifier can parse them without external knowledge.
     let proof_body = transcript.finalize();
-    let mut prefixed = Vec::with_capacity(32 + 32 + 32 + 4 + proof_body.len());
+    let mut prefixed = Vec::with_capacity(32 + 32 + 32 + 4 + 4 + proof_body.len());
     prefixed.extend_from_slice(coords.x().to_repr().as_ref());
     prefixed.extend_from_slice(coords.y().to_repr().as_ref());
     prefixed.extend_from_slice(transcript_new.to_repr().as_ref());
     prefixed.extend_from_slice(&(depth_new as u32).to_le_bytes());
+    prefixed.extend_from_slice(&(num_txs as u32).to_le_bytes());
     prefixed.extend_from_slice(&proof_body);
 
     Ok((prefixed, q_new, transcript_new, depth_new))
@@ -397,6 +403,41 @@ pub fn verify_accumulate_proof(
             false
         },
     }
+}
+
+/// Parse a recursive-state byte slice (format: Q.x(32) || Q.y(32) || transcript(32) || depth(4))
+/// into (EqAffine, Fq, u32). Returns `None` on malformed input.
+pub fn parse_recursive_state(state: &[u8]) -> Option<(EqAffine, Fq, u32)> {
+    use ff::PrimeField;
+    use halo2_proofs::halo2curves::pasta::EqAffine;
+    if state.len() < INSTANCE_PREFIX_BYTES {
+        return None;
+    }
+    let qx_repr: [u8; 32] = state[..32].try_into().ok()?;
+    let qy_repr: [u8; 32] = state[32..64].try_into().ok()?;
+    let transcript: [u8; 32] = state[64..96].try_into().ok()?;
+    let mut depth_bytes = [0u8; 4];
+    depth_bytes.copy_from_slice(&state[96..100]);
+    let depth = u32::from_le_bytes(depth_bytes);
+    let qx = Fq::from_repr(qx_repr);
+    if bool::from(qx.is_none()) {
+        return None;
+    }
+    let qy = Fq::from_repr(qy_repr);
+    if bool::from(qy.is_none()) {
+        return None;
+    }
+    let q_opt = EqAffine::from_xy(qx.unwrap(), qy.unwrap());
+    if bool::from(q_opt.is_none()) {
+        return None;
+    }
+    let q = q_opt.unwrap();
+    let transcript_fq = {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&transcript);
+        Fq::from_uniform_bytes(&buf)
+    };
+    Some((q, transcript_fq, depth))
 }
 
 /// Build a `TxWitness` from a `Transaction`, computing IPE via the same
@@ -627,7 +668,8 @@ mod tests {
             transcript_new,
             Fq::from(depth_new as u64),
         ]];
-        let valid = verify_accumulate_proof(&params, &vk, &proof, instances.clone());
+        let proof_body = &proof[PROOF_PREFIX_BYTES..];
+        let valid = verify_accumulate_proof(&params, &vk, proof_body, instances.clone());
         assert!(valid, "verify_accumulate_proof must accept valid proof for 1 tx");
 
         // Also verify with host-computed instances
@@ -638,11 +680,12 @@ mod tests {
             transcript_new_host,
             Fq::from(depth_new_host as u64),
         ]];
-        let valid_host = verify_accumulate_proof(&params, &vk, &proof, host_instances);
+        let valid_host = verify_accumulate_proof(&params, &vk, proof_body, host_instances);
         assert!(valid_host, "verify must also accept with host-computed instances");
 
-        let mut corrupted = proof.clone();
-        corrupted[proof.len() / 2] ^= 0xff;
+        let mut corrupted = proof_body.to_vec();
+        let idx = corrupted.len() / 2;
+        corrupted[idx] ^= 0xff;
         let rejected = verify_accumulate_proof(&params, &vk, &corrupted, instances);
         assert!(!rejected, "verify must reject corrupted proof");
     }
@@ -734,11 +777,13 @@ mod tests {
             transcript_new,
             Fq::from(depth_new as u64),
         ]];
-        let valid = verify_accumulate_proof(&params, &vk, &proof, instances.clone());
+        let proof_body = &proof[PROOF_PREFIX_BYTES..];
+        let valid = verify_accumulate_proof(&params, &vk, proof_body, instances.clone());
         assert!(valid, "verify_accumulate_proof must accept valid proof for 0 txs");
 
-        let mut corrupted = proof.clone();
-        corrupted[proof.len() / 2] ^= 0xff;
+        let mut corrupted = proof_body.to_vec();
+        let idx = corrupted.len() / 2;
+        corrupted[idx] ^= 0xff;
         let rejected = verify_accumulate_proof(&params, &vk, &corrupted, instances);
         assert!(!rejected, "verify must reject corrupted proof");
     }

@@ -6,7 +6,11 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use aetheris_zkp::{ZKProofSystem, ZkProverSystem};
-use aetheris_recursive::accumulate_proof;
+use aetheris_recursive::{
+    prove_block_recursive, compute_tx_witness, parse_recursive_state,
+    build_accumulate_keys, EqAffine, Fq, PrimeCurveAffine, Field,
+};
+use aetheris_recursive::circuit_accumulate::{compute_generator_and_offset, TxWitness};
 use bip39::{Mnemonic};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore};
 use aes_gcm::aead::{Aead, OsRng};
@@ -1695,34 +1699,49 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 }
             }
 
-            // 4. Build the IPA accumulator chain (off-lock; no state.ledger needed).
+            // 4. Build O(1) recursive SNARK proving the accumulator transition.
             //    Coinbase txs (public_amount > 0) are consensus-validated and NOT folded.
-            let mut acc = last_recursive_state;
-            let mut aggregation_failed = false;
+            let (q_old, transcript_old, depth_old) = match parse_recursive_state(&last_recursive_state) {
+                Some(s) => s,
+                None => {
+                    println!("[MINER] Failed to parse recursive state, using genesis");
+                    (EqAffine::generator(), Fq::ZERO, 0u32)
+                }
+            };
+            let (_gen_pt, gen_off) = compute_generator_and_offset();
+            let mut witnesses: Vec<TxWitness> = Vec::new();
             for tx in &core_txs {
                 if tx.is_coinbase() {
                     continue;
                 }
-                let tx_commitments: Vec<[u8; 32]> =
+                let commitments: Vec<[u8; 32]> =
                     tx.outputs.iter().map(|o| o.commitment).collect();
-                match accumulate_proof(
-                    &acc,
+                let w = compute_tx_witness(
                     &tx.proof,
-                    &tx_commitments,
+                    &commitments,
                     tx.circuit_public_amount(),
-                ) {
-                    Ok(new_acc) => acc = new_acc,
-                    Err(e) => {
-                        println!("[MINER] Aggregation failed: {}", e);
-                        aggregation_failed = true;
-                        break;
-                    }
+                    &gen_off,
+                );
+                witnesses.push(w);
+            }
+            let num_txs = witnesses.len();
+            let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(15);
+            let (_vk, pk) = match build_accumulate_keys(&params, num_txs) {
+                Ok(k) => k,
+                Err(e) => {
+                    println!("[MINER] Keygen failed: {}", e);
+                    continue;
                 }
-            }
-            if aggregation_failed {
-                continue;
-            }
-            let _aggregate_proof = acc;
+            };
+            let (recursive_proof, _q_new, _transcript_new, _depth_new) = match prove_block_recursive(
+                &params, &pk, q_old, transcript_old, depth_old, witnesses,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[MINER] prove_block_recursive failed: {}", e);
+                    continue;
+                }
+            };
 
             // Compute block_hash from canonical block struct
             let temp_block = aetheris_core::Block {
@@ -1734,7 +1753,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     vdf_proof: vdf_proof.clone(),
                     height: current_height,
                     difficulty: current_difficulty,
-                    recursive_proof: vec![],
+                    recursive_proof: recursive_proof.clone(),
                 },
                 transactions: core_txs.clone(),
             };
@@ -1785,7 +1804,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     vdf_proof,
                     height: current_height,
                     difficulty: current_difficulty,
-                    recursive_proof: vec![],
+                    recursive_proof: recursive_proof.clone(),
                 },
                 transactions: core_txs,
             };
