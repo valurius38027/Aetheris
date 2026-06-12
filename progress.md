@@ -3371,6 +3371,43 @@ The economic model is designed to be consistent with the whitepaper's core princ
 
 ---
 
+## Stage 51 — §B: Complete Poseidon Hash Migration (2026-06-12)
+
+**Scope**: Replace all host-side blake3 hashes with Poseidon (nullifier, merkle root, accumulator reference). Add `poseidon_hash_chain` helper. Make `poseidon_hash` robust to non-canonical inputs.
+
+Per `FINAL_ARCHITECTURAL_PLAN.md §B`:
+- §B.1a: `create_nullifier` blake3 → `poseidon_nullifier`
+- §B.1b: `build_merkle_root` blake3 → `IncrementalMerkleTree`
+- §B.1c: Accumulator transcript/challenge/pi_commitment blake3 → Poseidon
+- §B.2: `poseidon_hash_chain` (chaining support for CircuitAccumulate)
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| **`aetheris-zkp/src/poseidon_fq.rs`** | Added `FromUniformBytes` import. `poseidon_hash`/`poseidon_nullifier`: `from_repr` → `from_uniform_bytes` (tolerates non-canonical inputs). Added `poseidon_hash_chain()` with 4 tests |
+| **`aetheris-zkp/src/halo2_pasta.rs`** | Added `poseidon_fq` + `IncrementalMerkleTree` imports. `create_nullifier`: blake3 → `poseidon_nullifier(sk[..32], index)`. `build_merkle_root`: blake3 tree → `IncrementalMerkleTree` |
+| **`aetheris-recursive/src/accumulator.rs`** | Genesis: blake3(domain\|genesis) → `poseidon_hash(domain_fq, genesis_fq)`. Step 5: `inner_proof_hash_eff` XOR → `poseidon_hash(proof_hash, cmt_hash)`. Step 7: challenge = blake3(domain\|transcript\|ipe) → `poseidon_hash_chain([domain, transcript, ipe])`. Step 9: transcript_new = blake3(domain\|transcript\|challenge\|Q\|ipe) → `poseidon_hash_chain([domain, transcript, challenge, Q, ipe])`. `hash_to_curve_nums_bytes`: outer blake3 → Poseidon domain binding. Added `domain_tag_to_fq_bytes`, `tag_to_fq_bytes`, `uniform_bytes_to_fp` helpers. Renamed `fp_from_blake3`→`uniform_bytes_to_fp` |
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-zkp --lib` | ✅ 123/123 (was 119; +4 `poseidon_hash_chain` tests) |
+| `cargo test -p aetheris-recursive --lib accumulator` | ✅ 16/16 (includes `block_aggregator` tests) |
+| `cargo test -p aetheris-core` | ✅ 25/25 |
+| `cargo test -p aetheris-crypto` | ✅ 41/41 |
+
+### Design Notes
+
+- `poseidon_hash` uses `Fq::from_uniform_bytes` instead of `from_repr` — handles non-canonical byte inputs (≥ Fq modulus) from blake3 outputs or tampered serialized state without panicking.
+- `hash_to_curve_nums_bytes` canonicalizes its seed input via `poseidon_hash`'s `from_uniform_bytes` before the try-and-increment loop.
+- Step 5 keeps blake3 for byte reduction of arbitrary-length proof/commitment lists (two-phase: blake3→32B→Poseidon).
+- `create_commitment` NOT changed — its blake3 use is hash-to-scalar for blinding, not a Merkle/commitment hash. Will be replaced in §E if needed.
+
+---
+
 ## Stage 49 — Phase 1.14 S5-a/b: Recursive Proof Node Integration (BlockHeader + Consensus) (2026-06-12)
 
 **Scope**: Bridge the recursive proof system into the node — add `recursive_proof` field to `BlockHeader`, store `VerifyingKey` in `LedgerState`, verify recursive proofs during block validation.

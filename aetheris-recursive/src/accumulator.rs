@@ -12,10 +12,10 @@
 //! Fq (`FINAL_ARCHITECTURAL_PLAN.md §A`). The inner proof's IPA commitment
 //! curve remains Pallas.
 
-use aetheris_zkp::{halo2_pasta::Halo2PastaBackend, trait_::TxCommitments, ZkProverSystem};
+use aetheris_zkp::{halo2_pasta::Halo2PastaBackend, poseidon_fq, trait_::TxCommitments, ZkProverSystem};
 use ff::{Field, FromUniformBytes, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve, GroupEncoding};
-use halo2_proofs::halo2curves::pasta::{EqAffine, Fp};
+use halo2_proofs::halo2curves::pasta::{EqAffine, Fp, Fq};
 use subtle::CtOption;
 
 /// Domain separator for the accumulator's transcript state.
@@ -64,7 +64,7 @@ impl std::fmt::Display for AccumulatorError {
         match self {
             Self::BadPrefix => write!(f, "inner proof has wrong wire-format prefix"),
             Self::InnerProofInvalid(h) => {
-                write!(f, "inner proof verify_conservation failed (blake3: {})", h)
+                write!(f, "inner proof verify_conservation failed (proof_hash: {})", h)
             }
             Self::DepthOverflow => write!(
                 f,
@@ -82,7 +82,7 @@ impl std::error::Error for AccumulatorError {}
 /// accumulated inner proofs.
 ///
 /// `Q` is a Vesta group element (the "rolling IPA commitment"). `transcript`
-/// is a 32-byte blake3 hash that absorbs the proof hash and the previous
+/// is a 32-byte Poseidon hash that absorbs the proof hash and the previous
 /// accumulator state. `depth` is the number of accumulated proofs.
 ///
 /// Serialization: use `to_bytes()` / `from_bytes()` (custom wire format with
@@ -106,13 +106,12 @@ impl Default for AccumulatorIPA {
 
 impl AccumulatorIPA {
     /// Initial accumulator state: `Q` = identity (point at infinity),
-    /// `transcript` = `blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || "genesis")`,
+    /// `transcript` = `poseidon_hash(domain_fq_bytes, genesis_fq_bytes)`,
     /// `depth` = 0.
     pub fn new() -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
-        hasher.update(b"genesis");
-        let transcript = hasher.finalize().into();
+        let domain_fq_bytes = domain_tag_to_fq_bytes(ACCUMULATOR_TRANSCRIPT_DOMAIN);
+        let genesis_bytes = tag_to_fq_bytes(b"genesis");
+        let transcript = poseidon_fq::poseidon_hash(&domain_fq_bytes, &genesis_bytes);
         Self {
             Q: EqAffine::identity(),
             transcript,
@@ -126,16 +125,15 @@ impl AccumulatorIPA {
     /// Steps (out-of-circuit):
     ///   1. Verify prefix on the proof bytes.
     ///   2. Call `verify_conservation` to ensure the proof is well-formed.
-    ///   3. Compute `inner_proof_hash = blake3(proof)`.
-    ///   4. XOR-mix `inner_proof_hash` with commitment hash + `public_amount` to form
-    ///      `inner_proof_hash_eff` (commitment binding, Phase 1.5).
-    ///   5. Compute `pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)`.
-    ///   6. Compute `challenge = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
-    ///      || inner_proof_hash_eff)`, reduced to `Fp` (Vesta scalar).
-    ///   7. `Q_new = Q + challenge * pi_commitment` (Vesta scalar mul + add).
-    ///   8. `transcript_new = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
-    ///      || challenge_repr || Q_new_compressed || inner_proof_hash_eff)`.
-    ///   9. `depth += 1`.
+    ///   3. Compute `inner_proof_hash = blake3(proof)` (two-phase: byte reduction → Poseidon).
+    ///   4. Compute `commitment_hash = blake3(commitments || public_amount)`.
+    ///   5. `inner_proof_hash_eff = Poseidon(inner_proof_hash, commitment_hash)`.
+    ///   6. Compute `pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)`.
+    ///   7. Compute `challenge = Poseidon_hash_chain(domain, transcript, ipe)`,
+    ///      reduced to `Fp` (Vesta scalar).
+    ///   8. `Q_new = Q + challenge * pi_commitment` (Vesta scalar mul + add).
+    ///   9. `transcript_new = Poseidon_hash_chain(domain, transcript, challenge, Q, ipe)`.
+    ///  10. `depth += 1`.
     ///
     /// Returns the new accumulator state; `self` is consumed (struct is `Copy`-able by value).
     pub fn accumulate(
@@ -199,10 +197,10 @@ impl AccumulatorIPA {
             )));
         }
 
-        // 5. inner_proof_hash_eff = blake3(proof || commitment_hash || public_amount_le)
-        //    The commitment binding is the Phase 1.5 / ISSUE-1.4.E fix.
+        // 5. inner_proof_hash_eff = poseidon_hash(proof_hash, commitment_hash)
+        //    Two-phase: blake3 reduces arbitrary-length proof → 32B, then Poseidon binds.
         let inner_proof_hash = blake3::hash(proof);
-        let commitment_hasher = {
+        let commitment_hash = {
             let mut h = blake3::Hasher::new();
             h.update(&[0xC0u8]); // domain: commitment list (vs. proof 0xA0)
             h.update(&(output_commitments.len() as u32).to_le_bytes());
@@ -212,17 +210,12 @@ impl AccumulatorIPA {
             h.update(&public_amount.to_le_bytes());
             h.finalize()
         };
-        let mut inner_proof_hash_eff = [0u8; 32];
-        // Mix the two 32-byte hashes via XOR (preserves preimage resistance;
-        // both inputs are uniformly random 32-byte strings).
-        for i in 0..32 {
-            inner_proof_hash_eff[i] =
-                inner_proof_hash.as_bytes()[i] ^ commitment_hasher.as_bytes()[i];
-        }
+        let inner_proof_hash_eff =
+            poseidon_fq::poseidon_hash(inner_proof_hash.as_bytes(), commitment_hash.as_bytes());
 
         // 6. pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)
         //    Phase 1.4: NUMS-style try-and-increment hash-to-curve.
-        //    - Take blake3(PI_COMMITMENT_DOMAIN || inner_proof_hash_eff) -> 32 bytes
+        //    - Take Poseidon(PI_COMMITMENT_DOMAIN_fq, inner_proof_hash_eff) -> 32 bytes
         //    - Mix in a 32-bit counter (length-tag to prevent ambiguity)
         //    - Reduce mod Fp (Vesta scalar field, native for EqAffine scalar mul)
         //      via `from_uniform_bytes` (NOT `from_repr`, which is canonical-only
@@ -233,16 +226,16 @@ impl AccumulatorIPA {
         //    Phase 1.5: also includes output_commitments binding via
         //    `inner_proof_hash_eff` (the chain can no longer be replayed
         //    with different commitments).
-        let pi_commitment = hash_to_curve_nums_eff(&inner_proof_hash, &inner_proof_hash_eff);
+        let pi_commitment = hash_to_curve_nums_eff(&inner_proof_hash_eff);
 
-        // 7. challenge = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
-        //    || inner_proof_hash_eff), reduced to Fp (Vesta scalar) via `from_uniform_bytes`.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
-        hasher.update(&self.transcript);
-        hasher.update(&inner_proof_hash_eff);
-        let challenge_hash = hasher.finalize();
-        let challenge = fp_from_blake3(challenge_hash.as_bytes());
+        // 7. challenge = poseidon_hash_chain([domain, transcript, ipe]),
+        //    reduced to Fp (Vesta scalar, for EqAffine scalar mul).
+        let domain_fq_bytes = domain_tag_to_fq_bytes(ACCUMULATOR_TRANSCRIPT_DOMAIN);
+        let challenge = uniform_bytes_to_fp(&poseidon_fq::poseidon_hash_chain(&[
+            domain_fq_bytes,
+            self.transcript,
+            inner_proof_hash_eff,
+        ]));
 
         // 8. Q_new = Q + challenge * pi_commitment.
         //    Both Q and pi_commitment are Vesta points (EqAffine). Scalar
@@ -254,19 +247,18 @@ impl AccumulatorIPA {
         let q_new_proj = self.Q + t_aff;
         let q_new = q_new_proj.to_affine();
 
-        // 9. transcript_new = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN
-        //    || transcript || challenge_repr || Q_new_compressed)
-        //    Phase 1.5: include `inner_proof_hash_eff` (commits to proof +
-        //    commitments + public_amount) so the transcript is binding
-        //    over the full input, not just the proof bytes.
+        // 9. transcript_new = poseidon_hash_chain([domain, transcript, challenge,
+        //    Q_new_compressed, inner_proof_hash_eff]).
         let q_new_compressed = q_new.to_bytes();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
-        hasher.update(&self.transcript);
-        hasher.update(&challenge.to_repr());
-        hasher.update(&q_new_compressed);
-        hasher.update(&inner_proof_hash_eff);
-        let transcript_new: [u8; 32] = hasher.finalize().into();
+        let domain_fq_bytes = domain_tag_to_fq_bytes(ACCUMULATOR_TRANSCRIPT_DOMAIN);
+        let challenge_repr: [u8; 32] = challenge.to_repr();
+        let transcript_new = poseidon_fq::poseidon_hash_chain(&[
+            domain_fq_bytes,
+            self.transcript,
+            challenge_repr,
+            q_new_compressed,
+            inner_proof_hash_eff,
+        ]);
 
         Ok(Self {
             Q: q_new,
@@ -445,11 +437,9 @@ impl AccumulatorIPA {
 ///
 /// `inner_proof_hash_eff` is the 32-byte value that commits to the
 /// inner proof + output commitments + public_amount (see `accumulate`
-/// step 5). The pre-Phase-1.5 single-argument form `hash_to_curve_nums`
-/// is retained for tests and other bindings (it uses `inner_proof_hash`
-/// directly).
+/// step 5). The outer domain binding uses Poseidon.
 ///
-/// We hash it with the domain separator to get a 32-byte seed, mix in a
+/// We hash it with the domain separator (Poseidon) to get a 32-byte seed, mix in a
 /// 32-bit counter (length-tag to prevent ambiguity), and reduce mod Fp
 /// (Vesta scalar field) via `from_uniform_bytes`. Multiply by the
 /// Vesta generator to get a Vesta point. If the result is the
@@ -464,30 +454,18 @@ impl AccumulatorIPA {
 /// `accumulate()` is called by a permissioned aggregator, not a public
 /// untrusted caller. A future Phase (1.5, see ISSUE-1.4.B) will replace
 /// this with a constant-time SSWU2 implementation.
-fn hash_to_curve_nums_eff(
-    _inner_proof_hash: &blake3::Hash,
-    inner_proof_hash_eff: &[u8; 32],
-) -> EqAffine {
+fn hash_to_curve_nums_eff(inner_proof_hash_eff: &[u8; 32]) -> EqAffine {
     hash_to_curve_nums_bytes(inner_proof_hash_eff)
 }
 
-#[cfg(test)]
-fn hash_to_curve_nums(proof_hash: &blake3::Hash) -> EqAffine {
-    hash_to_curve_nums_bytes(proof_hash.as_bytes())
-}
-
 fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EqAffine {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(PI_COMMITMENT_DOMAIN);
-    hasher.update(seed_in);
-    let h = hasher.finalize();
-    let mut seed32 = [0u8; 32];
-    seed32.copy_from_slice(h.as_bytes());
+    let domain_fq_bytes = domain_tag_to_fq_bytes(PI_COMMITMENT_DOMAIN);
+    let seed = poseidon_fq::poseidon_hash(&domain_fq_bytes, seed_in);
     let mut counter: u32 = 0;
     loop {
         let mut mixed32 = [0u8; 32];
         mixed32[..4].copy_from_slice(&counter.to_le_bytes());
-        mixed32[4..].copy_from_slice(&seed32[..28]);
+        mixed32[4..].copy_from_slice(&seed[..28]);
         let mut input64 = [0u8; 64];
         input64[..32].copy_from_slice(&mixed32);
         let c = Fp::from_uniform_bytes(&input64);
@@ -504,7 +482,24 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EqAffine {
     }
 }
 
-/// Reduce a 32-byte blake3 output to an `Fp` field element (Vesta scalar).
+/// Convert a domain tag (arbitrary bytes) to a 32-byte Fq field element
+/// for use as a Poseidon domain separator.
+fn domain_tag_to_fq_bytes(tag: &[u8]) -> [u8; 32] {
+    let h = blake3::hash(tag);
+    let mut uniform = [0u8; 64];
+    uniform[..32].copy_from_slice(h.as_bytes());
+    Fq::from_uniform_bytes(&uniform).to_repr()
+}
+
+/// Convert a short tag (like "genesis") to a 32-byte Fq field element.
+fn tag_to_fq_bytes(tag: &[u8]) -> [u8; 32] {
+    let h = blake3::hash(tag);
+    let mut uniform = [0u8; 64];
+    uniform[..32].copy_from_slice(h.as_bytes());
+    Fq::from_uniform_bytes(&uniform).to_repr()
+}
+
+/// Reduce a 32-byte hash output to an `Fp` field element (Vesta scalar).
 ///
 /// **CRITICAL:** we use `Fp::from_uniform_bytes(&[u8; 64])` (mod-p
 /// reduction of a 512-bit value) rather than `Fp::from_repr` (which
@@ -517,8 +512,7 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EqAffine {
 /// and a malicious aggregator could grind the proof's nonce to force the
 /// trivial update. `from_uniform_bytes` is total (never returns zero
 /// for a non-zero 64-byte input) and gives a uniform Fp sample.
-fn fp_from_blake3(bytes: &[u8]) -> Fp {
-    debug_assert_eq!(bytes.len(), 32, "blake3 output is 32 bytes");
+fn uniform_bytes_to_fp(bytes: &[u8; 32]) -> Fp {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(bytes);
     Fp::from_uniform_bytes(&buf)
@@ -645,8 +639,8 @@ mod tests {
     #[test]
     fn hash_to_curve_nums_is_deterministic() {
         let h = blake3::hash(b"test proof bytes");
-        let p1 = hash_to_curve_nums(&h);
-        let p2 = hash_to_curve_nums(&h);
+        let p1 = hash_to_curve_nums_bytes(h.as_bytes());
+        let p2 = hash_to_curve_nums_bytes(h.as_bytes());
         assert_eq!(p1.to_bytes(), p2.to_bytes());
         assert!(!bool::from(p1.is_identity()));
     }
@@ -655,8 +649,8 @@ mod tests {
     fn hash_to_curve_nums_differs_for_different_inputs() {
         let h1 = blake3::hash(b"proof_a");
         let h2 = blake3::hash(b"proof_b");
-        let p1 = hash_to_curve_nums(&h1);
-        let p2 = hash_to_curve_nums(&h2);
+        let p1 = hash_to_curve_nums_bytes(h1.as_bytes());
+        let p2 = hash_to_curve_nums_bytes(h2.as_bytes());
         assert_ne!(p1.to_bytes(), p2.to_bytes());
     }
 
@@ -686,20 +680,22 @@ mod tests {
     /// `validate_proof_chain`-style: same `proofs` list with one byte
     /// flipped should produce a different accumulator. We can't easily
     /// call `accumulate()` here without a real proof, but we can call
-    /// the lower-level `hash_to_curve_nums` and `fp_from_blake3` to
+    /// the lower-level `hash_to_curve_nums` and `uniform_bytes_to_fp` to
     /// demonstrate that small input changes produce different outputs
     /// — which is the binding property the chain relies on.)
     #[test]
     fn hash_to_curve_nums_binds_to_input() {
         let h1 = blake3::hash(b"proof_v1");
         let h2 = blake3::hash(b"proof_v2"); // one byte different
-        let p1 = hash_to_curve_nums(&h1);
-        let p2 = hash_to_curve_nums(&h2);
+        let p1 = hash_to_curve_nums_bytes(h1.as_bytes());
+        let p2 = hash_to_curve_nums_bytes(h2.as_bytes());
         assert_ne!(p1.to_bytes(), p2.to_bytes());
 
-        // Same for fp_from_blake3 (challenge reduction).
-        let c1 = fp_from_blake3(h1.as_bytes());
-        let c2 = fp_from_blake3(h2.as_bytes());
+        // Same for uniform_bytes_to_fp (challenge reduction).
+        let bytes1: [u8; 32] = *h1.as_bytes();
+        let bytes2: [u8; 32] = *h2.as_bytes();
+        let c1 = uniform_bytes_to_fp(&bytes1);
+        let c2 = uniform_bytes_to_fp(&bytes2);
         assert_ne!(c1, c2);
     }
 
@@ -710,12 +706,11 @@ mod tests {
     /// different output commitments or public_amounts.
     #[test]
     fn hash_to_curve_nums_eff_binds_to_commitment() {
-        let h_proof = blake3::hash(b"proof_v1");
         let h_eff_1 = [0x01u8; 32];
         let mut h_eff_2 = h_eff_1;
         h_eff_2[31] = 0x02; // one bit flipped
-        let p1 = hash_to_curve_nums_eff(&h_proof, &h_eff_1);
-        let p2 = hash_to_curve_nums_eff(&h_proof, &h_eff_2);
+        let p1 = hash_to_curve_nums_eff(&h_eff_1);
+        let p2 = hash_to_curve_nums_eff(&h_eff_2);
         assert_ne!(p1.to_bytes(), p2.to_bytes());
     }
 }

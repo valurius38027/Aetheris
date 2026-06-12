@@ -1,3 +1,4 @@
+use halo2_middleware::ff::FromUniformBytes;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::halo2curves::pasta::Fq;
@@ -186,19 +187,22 @@ fn apply_mds(state: &mut [Fq; 3], mds: &[[Fq; 3]; 3]) {
 }
 
 pub fn poseidon_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let spec = PoseidonFqSpec::new(8, 56);
-    let mut state = [
-        Fq::from_repr(*left).expect("poseidon_hash: left is canonical Fq"),
-        Fq::from_repr(*right).expect("poseidon_hash: right is canonical Fq"),
-        Fq::ZERO,
-    ];
+    let spec = ensure_poseidon_spec();
+    let mut uniform = [0u8; 64];
+    uniform[..32].copy_from_slice(left);
+    let left_fq = Fq::from_uniform_bytes(&uniform);
+    uniform[..32].copy_from_slice(right);
+    let right_fq = Fq::from_uniform_bytes(&uniform);
+    let mut state = [left_fq, right_fq, Fq::ZERO];
     poseidon_permute(&spec, &mut state);
     state[0].to_repr()
 }
 
 pub fn poseidon_nullifier(sk: &[u8; 32], index: u64) -> [u8; 32] {
-    let spec = PoseidonFqSpec::new(8, 56);
-    let sk_fq = Fq::from_repr(*sk).expect("poseidon_nullifier: sk is canonical Fq");
+    let spec = ensure_poseidon_spec();
+    let mut uniform = [0u8; 64];
+    uniform[..32].copy_from_slice(sk);
+    let sk_fq = Fq::from_uniform_bytes(&uniform);
     let index_fq = Fq::from(index);
     let mut state = [sk_fq, index_fq, Fq::ZERO];
     poseidon_permute(&spec, &mut state);
@@ -209,6 +213,23 @@ static POSEIDON_SPEC: std::sync::OnceLock<PoseidonFqSpec> = std::sync::OnceLock:
 
 pub fn ensure_poseidon_spec() -> &'static PoseidonFqSpec {
     POSEIDON_SPEC.get_or_init(|| PoseidonFqSpec::new(8, 56))
+}
+
+/// Merkle-Damgård chain over Poseidon-256 (t=3, rate=2).
+/// `elements[0]` is the initial state. For each subsequent element:
+/// `h_i = Poseidon(h_{i-1}, elements[i])`.
+/// Returns the 32-byte chain output.
+/// Panics if `elements` is empty.
+pub fn poseidon_hash_chain(elements: &[[u8; 32]]) -> [u8; 32] {
+    assert!(
+        !elements.is_empty(),
+        "poseidon_hash_chain: elements must not be empty"
+    );
+    let mut chain = elements[0];
+    for el in &elements[1..] {
+        chain = poseidon_hash(&chain, el);
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -254,11 +275,59 @@ mod tests {
     }
 
     #[test]
+    fn test_poseidon_hash_non_canonical_input() {
+        // from_uniform_bytes wraps non-canonical inputs instead of rejecting.
+        let non_canon = [0xFFu8; 32]; // definitely ≥ Fq modulus
+        let canonical = make_fq_repr(42);
+        let h1 = poseidon_hash(&non_canon, &canonical);
+        let h2 = poseidon_hash(&non_canon, &canonical);
+        assert_eq!(h1, h2, "non-canonical input must be deterministic");
+
+        // Different canonical left should still differ
+        let canonical_alt = make_fq_repr(43);
+        let h3 = poseidon_hash(&canonical_alt, &canonical);
+        assert_ne!(h2, h3, "different input must produce different output");
+    }
+
+    #[test]
     fn test_poseidon_permute_identity() {
         let spec = PoseidonFqSpec::new(8, 56);
         let state = [Fq::ZERO, Fq::ZERO, Fq::ZERO];
         let mut out = state;
         poseidon_permute(&spec, &mut out);
         assert_ne!(out, state, "Zero input should NOT produce zero output");
+    }
+
+    #[test]
+    fn test_poseidon_hash_chain_single() {
+        let el = make_fq_repr(42);
+        let result = poseidon_hash_chain(&[el]);
+        assert_eq!(result, el, "Single-element chain returns the element itself");
+    }
+
+    #[test]
+    fn test_poseidon_hash_chain_two() {
+        let a = make_fq_repr(1);
+        let b = make_fq_repr(2);
+        let chain = poseidon_hash_chain(&[a, b]);
+        let direct = poseidon_hash(&a, &b);
+        assert_eq!(chain, direct, "Two-element chain equals poseidon_hash(a, b)");
+    }
+
+    #[test]
+    fn test_poseidon_hash_chain_three() {
+        let a = make_fq_repr(1);
+        let b = make_fq_repr(2);
+        let c = make_fq_repr(3);
+        let chain = poseidon_hash_chain(&[a, b, c]);
+        let h1 = poseidon_hash(&a, &b);
+        let expected = poseidon_hash(&h1, &c);
+        assert_eq!(chain, expected, "Three-element chain = H(H(a,b), c)");
+    }
+
+    #[test]
+    #[should_panic(expected = "elements must not be empty")]
+    fn test_poseidon_hash_chain_empty() {
+        poseidon_hash_chain(&[]);
     }
 }

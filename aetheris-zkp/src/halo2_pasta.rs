@@ -28,6 +28,8 @@ use crate::ipa::prover::ProverIPA;
 use crate::ipa::strategy::{SingleStrategyIPA, AccumulatorStrategyIPA};
 use crate::trait_::ZkProverSystem;
 use crate::membership_circuit::MembershipCircuit;
+use crate::poseidon_fq;
+use crate::merkle_tree::IncrementalMerkleTree;
 
 const PROVING_K: u32 = 11;
 
@@ -147,10 +149,10 @@ pub fn create_commitment(amount: u64, blinding: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn create_nullifier(sk: &[u8], commitment_index: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(sk);
-    hasher.update(&commitment_index.to_le_bytes());
-    hasher.finalize().into()
+    let sk_32: &[u8; 32] = sk[..32]
+        .try_into()
+        .expect("create_nullifier: sk must be at least 32 bytes");
+    poseidon_fq::poseidon_nullifier(sk_32, commitment_index)
 }
 
 #[derive(Clone, Debug)]
@@ -344,25 +346,11 @@ impl Circuit<Fq> for ValueConservationCircuit {
 }
 
 pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return blake3::hash(b"empty_tx_list").into();
+    let mut tree = IncrementalMerkleTree::new();
+    for leaf in leaves {
+        tree.append(*leaf);
     }
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
-        for chunk in layer.chunks(2) {
-            let mut h = blake3::Hasher::new();
-            h.update(&chunk[0]);
-            if chunk.len() > 1 {
-                h.update(&chunk[1]);
-            } else {
-                h.update(&chunk[0]);
-            }
-            next.push(h.finalize().into());
-        }
-        layer = next;
-    }
-    layer[0]
+    *tree.root()
 }
 
 pub struct Halo2PastaBackend;
