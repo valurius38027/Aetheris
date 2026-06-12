@@ -448,7 +448,25 @@ Phase 4  生产就绪    ─→  文档/清理
   - `aetheris_get_recursive_state_root(proof: *const u8, len: usize, out: *mut [u8; 32]) -> i32`
 - **向后兼容**: 旧 node (无 recursive proof) 仍能 verify accumulator 链 (回退 §1.5-1.8 trusted 模式)
 
-### 1.15 Soft Fork Activation (~1 周)
+### 1.15 Economic Model Finalization (~1 周)
+
+> 从旧经济模型（50 AET 减半、21M 创世预分配、零手续费）迁移至新模型（线性排放、Fair Launch、手续费燃烧）。
+
+- **核心代码变更**：
+  - 替换 `calculate_block_reward_atoms` 为线性递减函数
+  - 重写 `create_genesis_block`：移除 mint/transfer 交易，创世空区块
+  - 移除 `is_address_frozen()`、`aetheris_get_genesis_phrase()`、创世扫描逻辑
+  - 放开 `validate_issuance_rules` 中非 coinbase `public_amount > 0` 的限制（复用为手续费）
+  - 添加手续费燃烧：$\text{coinbase} = \max(0, \text{block\_reward} - \sum \text{tx\_fees})$
+- **文档统一**：
+  - `whitepaper.md` 新增 §5 经济模型
+  - `math_spec.md` 新增 §6 排放公式
+  - `protocol_design_ruling.md` 新增 §7 Tokenomics
+  - `mainnet_execution_plan.md` 添加本阶段
+- **验证**：`cargo check --workspace` ✅；所有类型一致的测试通过（线性奖励值需更新）
+- **向后兼容**：此变更为硬分叉，修改创世哈希和共识规则
+
+### 1.16 Soft Fork Activation (~1 周)
 - **新 Block::header 字段**: `recursive_proof: Option<Vec<u8>>` (None = trusted 模式)
 - **共识规则**:
   - block 有 `recursive_proof` → 必须 verify 成功 (用 §1.12+§1.13) 才接受

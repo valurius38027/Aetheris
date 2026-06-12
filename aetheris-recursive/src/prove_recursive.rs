@@ -86,6 +86,30 @@ pub fn build_recursive_instance(
     limbs
 }
 
+/// Verify a block's recursive proof against its state_root and accumulator state.
+///
+/// Extracts the IPA commitment from `accumulator_bytes`, builds the public
+/// instance vector, and calls `verify_recursive_proof`. Regenerates params
+/// and VK on every call — callers should cache these for production use.
+pub fn verify_block_recursive_proof(
+    proof: &[u8],
+    state_root: &[u8; 32],
+    accumulator_bytes: &[u8],
+) -> bool {
+    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(16);
+    let acc = match crate::accumulator::AccumulatorIPA::from_bytes(accumulator_bytes) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let pallas_point = crate::pallas_accumulate::ep_to_pallas_point(&acc.Q);
+    let instances = vec![build_recursive_instance(&pallas_point, state_root)];
+    let (vk, _pk) = match build_recursive_keys(&params) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    verify_recursive_proof(&params, &vk, proof, instances)
+}
+
 // ── Tests ──
 
 #[cfg(test)]

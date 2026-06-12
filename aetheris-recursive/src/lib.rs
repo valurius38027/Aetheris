@@ -1840,6 +1840,7 @@ pub mod pallas_ipa;
 pub mod pallas_accumulate;
 pub mod recursive_proof;
 pub mod prove_recursive;
+pub use prove_recursive::verify_block_recursive_proof;
 
 #[derive(Clone, Debug)]
 pub struct Limb<F: Field> {

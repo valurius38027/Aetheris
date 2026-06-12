@@ -270,6 +270,12 @@ P1 — 曲线迁移 + 递归积累（架构升级）
   ├─ B-2: 重构 aetheris-recursive: 移除 NonNativeChip, 实现原生 Halo2 IPA 积累
   └─ B-3: 替换 aggregate_proofs 从 Merkle 哈希到 IPA 积累方案
 
+P1.5 — 经济模型定版
+  ├─ 线性排放公式实现（替换减半函数）
+  ├─ 创世区块重构（移除 mint/transfer 预分配）
+  ├─ 手续费燃烧机制（复用 public_amount）
+  └─ 文档统一（whitepaper/math_spec/protocol_design_ruling 同步）
+
 P2 — 交易/区块完整性
   ├─ H-2: MEMPOOL 类型修复 (WalletTransaction → core::Transaction)
   ├─ L-1: Transaction 类型清理 (拆分或统一)
@@ -402,11 +408,53 @@ aetheris-zkp:
 
 
 
-## 6. 裁决变更记录
+## 7. 经济模型终裁
+
+### 7.1 核心裁决
+
+| 维度 | 裁决 | 理由 |
+|------|------|------|
+| 排放方式 | **线性递减**：$\text{reward}(h) = \max(0, R_0 (1 - h/N))$ | 数学公平，无阶跃减半的前置加载问题 |
+| 预分配 | **零预挖 (Fair Launch)** | 与"数学约束而非经济激励"哲学一致 |
+| 手续费 | **100% 燃烧，复用 `public_amount`** | 不改 ZK 电路，防 spam，不激励矿工 |
+| Staking | **不引入** | PoT 无需质押，安全性来自 VDF 串行性 |
+| 总供给 | **~21,000,000 AET** | $\frac{R_0 N}{2}$ 数学上限 |
+
+### 7.2 参数表
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| $R_0$ (初始奖励) | 100,000,000 atoms (1 AET) | 区块 0 的 coinbase |
+| $N$ (排放区块) | 42,000,000 | 约 13.3 年 (10s/块) |
+| MIN_TX_FEE | 10,000 atoms (0.0001 AET) | 最小交易手续费 |
+| FEE_PER_BYTE | 100 atoms (0.000001 AET) | 超额字节费率 |
+| 手续费去向 | 100% 燃烧 | $\text{coinbase} = \text{reward} - \sum \text{fees}$ |
+
+### 7.3 对协议架构的影响
+
+- **`public_amount` 语义扩展**：非 coinbase 交易允许 `public_amount > 0`（代表手续费），经 ZK 守恒电路约束
+- **创世区块简化**：无 mint/transfer 交易，空区块启动
+- **coinbase 奖励减少**：手续费从奖励中扣除，等量 AET 永久退出流通
+- **共识规则更新**：`validate_issuance_rules` 中 coinbase 校验改为 `reward - total_fees`
+
+### 7.4 排除设计
+
+| 排除项 | 原因 |
+|--------|------|
+| 阶梯减半 (Bitcoin-style) | 阶跃函数导致的前置加载与公平启动目标矛盾 |
+| 预分配 (Foundation/Dev funds) | 与 Fair Launch 哲学矛盾 |
+| Staking / Validator 奖励 | PoT 的 permissionless 特性不需要经济质押 |
+| 手续费附加证明 (separate fee circuit) | 不必要的复杂度，public_amount 复用已充分 |
+| 代币增发 (uncapped supply) | $N$ 之后排放归零，供给上限 21M |
+
+---
+
+## 8. 裁决变更记录
 
 | 日期 | 变更 | 原因 |
 |------|------|------|
 | 2026-06-02 | 初始定稿 | 综合 5 份规格文档 + 5-agent 审计，消除曲线/递归/范围三处矛盾 |
+| 2026-06-12 | 新增 §7 经济模型终裁 | Fair launch 经济模型定版：线性排放、零预挖、手续费燃烧 |
 
 ---
 

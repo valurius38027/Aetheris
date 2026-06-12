@@ -56,7 +56,7 @@ The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[p
 - `protocol_design_ruling.md` — final design decisions (Pasta curves, IPA accumulation, ZK abstraction)
 - `aetheris-recursive/B-2_plan.md` — active implementation plan for native IPA accumulation on Vesta
 - `math_spec.md` — VDF, class group, record model math
-- `genesis.json` — genesis config (network, VDF difficulty, allocations)
+- `genesis.json` — genesis config (network, VDF difficulty)
 - `gen_crs.ps1` — CRS generation for Halo2 params
 
 ## Commands

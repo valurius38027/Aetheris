@@ -151,24 +151,11 @@ struct OwnedUTXO {
 use aetheris_core::{EXPECTED_GENESIS_HASH, ATOMS_PER_AET, calculate_block_reward_atoms};
 
 #[derive(Serialize, Deserialize, Debug)]
-struct GenesisAllocation {
-    comment: String,
-    viewing_key: String,
-    amount: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct GenesisConfig {
     network: String,
     genesis_time: String,
     consensus_params: HashMap<String, u64>,
-    allocations: Vec<GenesisAllocation>,
 }
-
-#[cfg(debug_assertions)]
-const TEST_SEED_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
-#[cfg(debug_assertions)]
-const TEST_DEV_MNEMONIC: &str = "crystal sudden zero dynamic unique secret manual adjust orbit current focus total";
 
 fn load_genesis_config() -> Option<GenesisConfig> {
     let config_path = std::path::Path::new("genesis.json");
@@ -181,178 +168,34 @@ fn load_genesis_config() -> Option<GenesisConfig> {
 }
 
 fn create_genesis_block() -> aetheris_core::Block {
-    // 1. Try to load external config, fallback to default constants
+    // Fair launch: empty genesis block with no pre-mine transactions.
+    // All AET are created via VDF mining rewards starting from height 0.
     let config = load_genesis_config();
-    
-    // Use timestamp from config or fallback
     let genesis_timestamp = config.as_ref()
         .and_then(|c| {
-            // Parse ISO 8601 timestamp to Unix seconds
             chrono::DateTime::parse_from_rfc3339(&c.genesis_time)
                 .ok()
                 .map(|dt| dt.timestamp() as u64)
         })
-        .unwrap_or(1771035455); 
-
-    // Default Viewing Keys (derived from test mnemonics for backward compatibility in tests)
-    let mut seed_viewing_key = [0u8; 32];
-    let mut dev_viewing_key = [0u8; 32];
-    
-    if let Some(ref cfg) = config {
-        if cfg.allocations.len() >= 2 {
-            hex::decode_to_slice(&cfg.allocations[0].viewing_key, &mut seed_viewing_key).unwrap_or_default();
-            hex::decode_to_slice(&cfg.allocations[1].viewing_key, &mut dev_viewing_key).unwrap_or_default();
-        }
-    } else {
-        #[cfg(debug_assertions)]
-        {
-            let vk = blake3::hash(&[TEST_SEED_MNEMONIC.as_bytes(), b"aetheris-viewing-key"].concat());
-            seed_viewing_key.copy_from_slice(vk.as_bytes());
-
-            let vk = blake3::hash(&[TEST_DEV_MNEMONIC.as_bytes(), b"aetheris-viewing-key"].concat());
-            dev_viewing_key.copy_from_slice(vk.as_bytes());
-        }
-        #[cfg(not(debug_assertions))]
-        panic!("No genesis config found. Use --config to specify genesis allocations.");
-    }
-    
-    // 2. Initial Mint: System -> Genesis Seed (21M AET)
-    let mint_amount = config.as_ref()
-        .map(|c| c.allocations[0].amount)
-        .unwrap_or(21_000_000 * ATOMS_PER_AET);
-        
-    let mint_blinding = [0u8; 32];
-    let mint_commitment = aetheris_zkp::create_commitment(mint_amount, &mint_blinding);
-    
-    let mint_proof = ZKProofSystem::prove_conservation(
-        &[], // No inputs
-        &[mint_amount],
-        &[],
-        &[mint_blinding],
-        &[mint_commitment],
-        -(mint_amount as i64),
-    );
-
-    let (epk_mint, ciphertext_mint) = aetheris_zkp::ZKProofSystem::encrypt_output(
-        &seed_viewing_key,
-        mint_amount,
-        &mint_blinding
-    );
-
-    let mint_tx = aetheris_core::Transaction {
-        inputs: vec![],
-        outputs: vec![aetheris_core::ShieldedOutput {
-            commitment: mint_commitment,
-            ephemeral_key: epk_mint,
-            ciphertext: ciphertext_mint,
-        }],
-        public_amount: mint_amount,
-        proof: mint_proof,
-    };
-
-    // 3. Genesis Transfer: Genesis Seed -> Developer (5M AET)
-    let transfer_amount = config.as_ref()
-        .map(|c| c.allocations[1].amount)
-        .unwrap_or(5_000_000 * ATOMS_PER_AET);
-        
-    let dev_blinding = [1u8; 32];
-    let change_blinding = [2u8; 32];
-    let dev_commitment = aetheris_zkp::create_commitment(transfer_amount, &dev_blinding);
-    let change_amount = mint_amount - transfer_amount;
-    let change_commitment = aetheris_zkp::create_commitment(change_amount, &change_blinding);
-
-    let transfer_proof = ZKProofSystem::prove_conservation(
-        &[mint_amount],
-        &[transfer_amount, change_amount],
-        &[mint_blinding],
-        &[dev_blinding, change_blinding],
-        &[dev_commitment, change_commitment],  // C-1: output commitments only
-        0,
-    );
-
-    let (epk_dev, ciphertext_dev) = aetheris_zkp::ZKProofSystem::encrypt_output(
-        &dev_viewing_key,
-        transfer_amount,
-        &dev_blinding
-    );
-
-    let (epk_change, ciphertext_change) = aetheris_zkp::ZKProofSystem::encrypt_output(
-        &seed_viewing_key,
-        change_amount,
-        &change_blinding
-    );
-
-    let transfer_tx = aetheris_core::Transaction {
-        inputs: vec![mint_commitment], // Using commitment as nullifier placeholder for genesis
-        outputs: vec![
-            aetheris_core::ShieldedOutput {
-                commitment: dev_commitment,
-                ephemeral_key: epk_dev,
-                ciphertext: ciphertext_dev,
-            },
-            aetheris_core::ShieldedOutput {
-                commitment: change_commitment,
-                ephemeral_key: epk_change,
-                ciphertext: ciphertext_change,
-            }
-        ],
-        public_amount: 0,
-        proof: transfer_proof,
-    };
-
-    let txs = vec![mint_tx, transfer_tx];
-    // Build the IPA accumulator chain for the genesis block. The mint tx is
-    // a coinbase (public_amount > 0) and is NOT folded into the chain
-    // (consensus-validated). Only the transfer tx is folded. The chain
-    // starts from `empty_accumulator()` (the genesis sentinel).
-    let mut acc = empty_accumulator();
-    for tx in &txs {
-        if tx.public_amount > 0 {
-            // coinbase: skip
-            continue;
-        }
-        let tx_commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
-        acc = match accumulate_proof(
-            &acc,
-            &tx.proof,
-            &tx_commitments,
-            tx.circuit_public_amount(),
-        ) {
-            Ok(new_acc) => new_acc,
-            Err(e) => {
-                println!("[FFI] CRITICAL: Genesis aggregate proof failed: {}", e);
-                acc
-            }
-        };
-    }
+        .unwrap_or(1771035455);
 
     aetheris_core::Block {
         header: aetheris_core::BlockHeader {
             parent_hash: [0u8; 32],
-            // S-1: state_root for an empty pre-state must match what
-            // aetheris-node's H-1 validation expects in
-            // `LedgerState::get_state_root()` (= `build_merkle_root(&[])`).
-            // The previous hardcoded `[0u8; 32]` was a pre-existing bug that
-            // caused `apply_block` to return `Err("State root mismatch: ...")`
-            // on every wallet import. `build_merkle_root(&[])` is the
-            // canonical empty-state sentinel (`blake3("empty_tx_list")`).
             state_root: aetheris_zkp::build_merkle_root(&[]),
             timestamp: genesis_timestamp,
             vdf_result: vec![0u8; 32],
             vdf_proof: vec![0u8; 32],
-            aggregate_proof: acc,
+            aggregate_proof: empty_accumulator(),
             height: 0,
             difficulty: aetheris_core::VDF_DIFFICULTY,
+            recursive_proof: None,
         },
-        transactions: txs,
+        transactions: vec![],
     }
 }
 
-// Helper to check if an address is frozen (Original Genesis Seed)
-// Frozen address pk_d = 9bd56a0ecdf078384cab79a56f0a85d41a0a4905436df2a49f04373dc5c0d770
-fn is_address_frozen(address: &str) -> bool {
-    address == "aet19bd56a0ecdf078384cab79a56f0a85d41a0a4905436df2a49f04373dc5c0d770"
-}
+// Fair launch: no frozen addresses (no pre-mine).
 
 use aetheris_node::consensus::{BlockProposal, MathematicalArbitrator};
 use aetheris_node::mixnet::LoopixMixer;
@@ -660,6 +503,7 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                                                     aggregate_proof: winner.aggregate_proof,
                                                                     height: winner.height,
                                                                     difficulty: winner.difficulty,
+                                                                    recursive_proof: None,
                                                                 },
                                                                 transactions: winner.transactions,
                                                             };
@@ -1760,6 +1604,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             aggregate_proof,
             height: ledger.height,
             difficulty: current_difficulty,
+            recursive_proof: None,
         },
         transactions: txs,
     };
@@ -1860,7 +1705,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             let mut acc = last_aggregate_proof;
             let mut aggregation_failed = false;
             for tx in &core_txs {
-                if tx.public_amount > 0 {
+                if tx.is_coinbase() {
                     continue;
                 }
                 let tx_commitments: Vec<[u8; 32]> =
@@ -1895,6 +1740,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     aggregate_proof: aggregate_proof.clone(),
                     height: current_height,
                     difficulty: current_difficulty,
+                    recursive_proof: None,
                 },
                 transactions: core_txs.clone(),
             };
@@ -1947,6 +1793,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     aggregate_proof,
                     height: current_height,
                     difficulty: current_difficulty,
+                    recursive_proof: None,
                 },
                 transactions: core_txs,
             };
@@ -1984,7 +1831,13 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             }
 
             // 9. REWARD UPDATE UNDER STATE LOCK
-            let reward = calculate_block_reward_atoms(new_height);
+            // Coinbase = block_reward - total_fees (fee burning)
+            let block_reward = calculate_block_reward_atoms(new_height);
+            let total_fees: u64 = block_for_apply.transactions.iter()
+                .filter(|tx| !tx.is_coinbase())
+                .map(|tx| tx.public_amount)
+                .sum();
+            let coinbase = block_reward.saturating_sub(total_fees);
             {
                 let mut state = STATE.lock().unwrap();
                 let ledger = state.ledger.as_mut().unwrap();
@@ -1993,12 +1846,12 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     .map(|b| String::from_utf8(b.to_vec()).unwrap().parse().unwrap_or(0))
                     .unwrap_or(0);
 
-                let new_balance = current_balance.saturating_add(reward);
+                let new_balance = current_balance.saturating_add(coinbase);
                 ledger.db.insert(b"balance_atoms", new_balance.to_string().as_bytes()).unwrap();
 
                 let history_update = json!({
                     "type": "Coinbase Reward",
-                    "amount_atoms": reward as i64,
+                    "amount_atoms": coinbase as i64,
                     "address": "System",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                     "status": "Confirmed",
@@ -2016,8 +1869,10 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 ledger.db.flush().unwrap();
             }
 
-            println!("[MINER] Block #{} Mined and Applied! Reward: {} AET.",
-                new_height, reward as f64 / ATOMS_PER_AET as f64);
+            println!("[MINER] Block #{} Mined and Applied! Coinbase: {:.8} AET (reward {:.8} - fees {:.8})",
+                new_height, coinbase as f64 / ATOMS_PER_AET as f64,
+                block_reward as f64 / ATOMS_PER_AET as f64,
+                total_fees as f64 / ATOMS_PER_AET as f64);
         }
 
         println!("[MINER] Background mining thread stopped.");
@@ -2061,15 +1916,7 @@ pub extern "C" fn aetheris_send_transaction(to_address: *const c_char, amount_ae
     let ledger = state.ledger.as_ref().unwrap();
     let db = &ledger.db;
 
-    // 1. FREEZE CHECK
-    if is_address_frozen(&state.address) {
-        let err_msg = format!("ERROR: Address {} is FROZEN. Outgoing transactions are prohibited.", state.address);
-        println!("[FFI] {}", err_msg);
-        set_error(&err_msg);
-        return false;
-    }
-
-    // 2. BALANCE CHECK (Pre-verification)
+    // 1. BALANCE CHECK (Pre-verification)
     let current_balance_atoms: u64 = db.get(b"balance_atoms").unwrap()
         .map(|b| String::from_utf8(b.to_vec()).unwrap().parse().unwrap_or(0))
         .unwrap_or(0);

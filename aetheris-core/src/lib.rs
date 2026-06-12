@@ -11,19 +11,10 @@ pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10; // Adjust difficulty every 1
 pub const MAX_VDF_SPEED: u64 = 5_000_000; // Max 5M iterations/sec (Anti-acceleration threshold)
 pub const MAX_INPUTS: usize = 5;
 pub const MAX_OUTPUTS: usize = 5;
-// S-3: Recomputed 2026-06-06 from `genesis_identity_hash(&create_genesis_block())`
-// using the DEFAULT test config (no `genesis.json` present in CWD):
-//   - timestamp = 1771035455
-//   - parent_hash = [0u8; 32]
-//   - mint = 21_000_000 * ATOMS_PER_AET  (blinding [0u8; 32])
-//   - dev  =  5_000_000 * ATOMS_PER_AET  (blinding [1u8; 32])
-//   - change = 16_000_000 * ATOMS_PER_AET (blinding [2u8; 32])
-// The previous value was stale (last set 2026-06-01 for a non-deterministic
-// hash algorithm that included random ZKP proof bytes). This constant is
-// locked by `aetheris-ffi::tests::test_genesis_hash_locked` — if you change
-// `create_genesis_block`'s default parameters, re-run that test to obtain
-// the new value.
-pub const EXPECTED_GENESIS_HASH: &str = "63644c4285ce95b5c9abc7cb1dbc8b473cf3c1ebfcaeb783f5399281f1b433fe";
+// EXPECTED_GENESIS_HASH — recompute after changing create_genesis_block.
+// Fair launch genesis: empty block (no mint/transfer transactions).
+// Recompute with: cargo test -p aetheris-ffi --lib test_genesis_hash_locked -- --test-threads=1
+pub const EXPECTED_GENESIS_HASH: &str = "93c42fa7c611220c565b6792a30d113bbe8176d34fbfa1698cc0bb8b705fa536";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShieldedOutput {
@@ -80,6 +71,7 @@ pub struct BlockHeader {
     pub aggregate_proof: Vec<u8>, // Recursive SNARK aggregating all TX proofs
     pub height: u64,
     pub difficulty: u64,      // Current VDF difficulty
+    pub recursive_proof: Option<Vec<u8>>, // Halo2 recursive SNARK (None = trusted fallback)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,13 +91,21 @@ pub enum P2PMessage {
 
 pub const ATOMS_PER_AET: u64 = 100_000_000;
 
+/// Total blocks over which the block reward linearly decreases to zero.
+/// 42,000,000 blocks ≈ 13.3 years at 10 seconds/block.
+/// Total supply = INITIAL_BLOCK_REWARD_ATOMS * EMISSION_BLOCKS / 2 ≈ 21,000,000 AET.
+pub const EMISSION_BLOCKS: u64 = 42_000_000;
+
+/// Initial block reward at height 0: 1 AET (100,000,000 atoms).
+pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = ATOMS_PER_AET;
+
+/// Linear emission: reward decreases from 1 AET at height 0 to 0 at EMISSION_BLOCKS.
 pub fn calculate_block_reward_atoms(height: u64) -> u64 {
-    let initial_reward = 50 * ATOMS_PER_AET;
-    let halvings = height / 210_000;
-    if halvings >= 64 {
+    if height >= EMISSION_BLOCKS {
         return 0;
     }
-    initial_reward >> halvings
+    let remaining = EMISSION_BLOCKS - height;
+    ((remaining as u128) * (INITIAL_BLOCK_REWARD_ATOMS as u128) / (EMISSION_BLOCKS as u128)) as u64
 }
 
 /// C-4: Deterministic genesis identity hash — excludes proof bytes and
@@ -145,6 +145,7 @@ mod tests {
             aggregate_proof: vec![0xCC; 64],
             height,
             difficulty: VDF_DIFFICULTY,
+            recursive_proof: None,
         }
     }
 
@@ -356,5 +357,29 @@ mod tests {
         let tx = mk_tx(vec![], 0);
         assert!(!tx.is_coinbase());
         assert_eq!(tx.circuit_public_amount(), 0);
+    }
+
+    #[test]
+    fn test_linear_emission_initial_reward() {
+        assert_eq!(calculate_block_reward_atoms(0), INITIAL_BLOCK_REWARD_ATOMS);
+    }
+
+    #[test]
+    fn test_linear_emission_midpoint() {
+        let mid = EMISSION_BLOCKS / 2;
+        assert_eq!(calculate_block_reward_atoms(mid), INITIAL_BLOCK_REWARD_ATOMS / 2);
+    }
+
+    #[test]
+    fn test_linear_emission_end() {
+        assert_eq!(calculate_block_reward_atoms(EMISSION_BLOCKS), 0);
+        assert_eq!(calculate_block_reward_atoms(EMISSION_BLOCKS + 1), 0);
+    }
+
+    #[test]
+    fn test_linear_emission_monotonic() {
+        for h in (0..EMISSION_BLOCKS).step_by(1_000_000) {
+            assert!(calculate_block_reward_atoms(h) >= calculate_block_reward_atoms(h + 1));
+        }
     }
 }

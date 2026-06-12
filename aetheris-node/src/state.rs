@@ -1,7 +1,7 @@
 use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
-use aetheris_recursive::{empty_accumulator, verify_accumulator_chain};
+use aetheris_recursive::{empty_accumulator, verify_accumulator_chain, verify_block_recursive_proof};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +35,9 @@ pub struct LedgerState {
     /// Aggregator's ed25519 verifying key for O(1) signed-accumulator checks.
     /// `None` = fall back to O(n) proof replay.
     pub aggregator_pk: Option<VerifyingKey>,
+    /// Halo2 recursive proof verification key (serialized bytes).
+    /// `None` = fall back to accumulator chain replay.
+    pub recursive_vk_bytes: Option<Vec<u8>>,
 }
 
 impl LedgerState {
@@ -55,6 +58,7 @@ impl LedgerState {
             current_difficulty: VDF_DIFFICULTY,
             timestamps: Vec::new(),
             aggregator_pk: None,
+            recursive_vk_bytes: None,
         };
         state.restore_aggregator_pk();
         state.restore_from_db();
@@ -391,6 +395,13 @@ impl LedgerState {
             return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
         }
 
+        // S5-b: Verify recursive proof if present (backward compat: None = accumulator chain)
+        if let Some(ref proof) = block.header.recursive_proof {
+            if !verify_block_recursive_proof(proof, &block.header.state_root, &block.header.aggregate_proof) {
+                return Err(format!("Recursive proof verification failed for block #{}", block.header.height));
+            }
+        }
+
         // C-3: Validate issuance rules before any state mutation
         self.validate_issuance_rules(&block, block.header.height)?;
 
@@ -553,6 +564,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -592,6 +604,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![coinbase_tx],
         };
@@ -618,6 +631,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -668,6 +682,7 @@ mod tests {
                 aggregate_proof: correct_acc.to_bytes(),
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![tx],
         };
@@ -714,6 +729,7 @@ mod tests {
                 aggregate_proof: vec![],
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![tx],
         };
@@ -752,6 +768,7 @@ mod tests {
                 aggregate_proof: vec![],
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -769,6 +786,7 @@ mod tests {
                 aggregate_proof: vec![],
                 height: 1,
                 difficulty: 10_000_000, 
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -821,6 +839,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -863,6 +882,7 @@ mod tests {
                 aggregate_proof: agg_proof,
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![coinbase_tx],
         };
@@ -892,6 +912,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -930,6 +951,7 @@ mod tests {
                 aggregate_proof: agg_proof,
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![coinbase_tx],
         };
@@ -1010,6 +1032,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -1048,6 +1071,7 @@ mod tests {
                 aggregate_proof: agg_a.clone(),
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![coinbase_tx.clone()],
         };
@@ -1076,6 +1100,7 @@ mod tests {
                 aggregate_proof: agg_b,
                 height: 1,
                 difficulty: 100,
+                recursive_proof: None,
             },
             transactions: vec![coinbase_tx],
         };

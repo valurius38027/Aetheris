@@ -96,6 +96,7 @@ mod tests {
                 aggregate_proof: vec![],
                 height: 0,
                 difficulty: 10,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -114,6 +115,7 @@ mod tests {
             current_difficulty: 10,
             timestamps: Vec::new(),
             aggregator_pk: None,
+            recursive_vk_bytes: None,
         };
         let test_state_root = state.get_state_root();
 
@@ -127,6 +129,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 10,
+                recursive_proof: None,
             },
             transactions: vec![],
         };
@@ -444,6 +447,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         aggregate_proof: winner.aggregate_proof.clone(),
                                         height: winner.height,
                                         difficulty: winner.difficulty,
+                                        recursive_proof: None,
                                     };
                                      let block = Block { header, transactions: winner.transactions.clone() }; 
                                      
@@ -686,6 +690,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             aggregate_proof: aggregate_proof.clone(),
                             height: current_height,
                             difficulty: current_difficulty,
+                            recursive_proof: None,
                         },
                         transactions: txs.clone(),
                     };

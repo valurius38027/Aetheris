@@ -3249,11 +3249,111 @@ cargo test -p aetheris-recursive --lib     ✅ 182/182 (was 163)
 
 ### Commit
 
-7ca7941 — 4 files, +884/-50.
+`c327771` — 4 files, +439/-310.
 
 ### Route Update
 
 | Item | Status |
 |------|--------|
 | 1.14 S1-S4: Recursive Proof Production | ✅ Complete |
-| 1.14 S5: Mainnet integration | ⏳ Next |
+| 1.14 S5: Mainnet integration | ⏳ Next (blocked by 1.15) |
+| 1.15: Economic Model Finalization | ✅ Documented, code pending |
+
+---
+
+## Stage 48 — Phase 1.15: Economic Model Finalization (2026-06-12)
+
+**Scope**: Replace the old economic model (50 AET halving, 21M genesis pre-mine, zero fees) with a unified Fair Launch model (linear emission, zero pre-mine, fee burning).
+
+### Documents Created/Updated
+
+| Document | Change | Status |
+|----------|--------|--------|
+| `whitepaper.md` | Added §5 Economic Model — Fair Launch, linear emission, fee burn, parameter table | ✅ |
+| `math_spec.md` | Added §6 Emission Formula — $reward(h) = \max(0, R_0(1-h/N))$, parameter table | ✅ |
+| `protocol_design_ruling.md` | Added §7 Tokenomics — core rulings, parameter table, excluded designs; updated priority list with P1.5; added change log entry | ✅ |
+| `mainnet_execution_plan.md` | Added §1.15 Economic Model Finalization stage | ✅ |
+| `implementation_roadmap.md` | Updated D-2 from "incentive model" to "fee burn" | ✅ |
+| `AGENTS.md` | Updated genesis.json description (no allocations) | ✅ |
+| `progress.md` | This stage | ✅ |
+
+### Economic Model Parameters
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+| Emission | Step halving (50→25→12.5...) | Linear: 1 → 0 over 42M blocks |
+| Pre-mine | 21M AET (16M foundation + 5M dev) | 0 (Fair Launch) |
+| Total supply | ~42M (21M pre-mine + ~21M mining) | ~21M (all mined) |
+| Emission duration | ~4.3 years (64 halvings) | ~13.3 years (linear to zero) |
+| Transaction fees | None | 0.0001 AET/KB min, 100% burned |
+| Staking | None | None (unchanged) |
+| Frozen address | Genesis seed address frozen | Removed |
+| Genesis phrase | Exposed via FFI | Removed |
+| Conservation circuit | `public_amount=0` for non-coinbase | `public_amount>0` allowed (fee) |
+
+### Architecture Philosophy
+
+The economic model is designed to be consistent with the whitepaper's core principle: **"Aetheris 的安全性建立在数学约束而非经济激励之上"**.
+
+- **Linear emission**: Mathematically predictable, no privileged early epochs
+- **Zero pre-mine**: No privileged entities at genesis
+- **Fee burning**: Not a profit center, just spam prevention via deflation
+- **No staking**: Permissionless VDF mining, security from VDF sequentiality not stake
+
+### Code Changes (Rust Protocol Layer)
+
+| File | Change |
+|------|--------|
+| `aetheris-core/src/lib.rs` | `calculate_block_reward_atoms` → linear emission; `EXPECTED_GENESIS_HASH` updated to `93c42fa7...` |
+| `aetheris-node/src/state.rs` | Genesis validation: empty block (2-tx check removed); `validate_issuance_rules`: coinbase = reward - fees, non-coinbase `public_amount>0` OK; Accumulator filter: `!tx.is_coinbase()` instead of `public_amount<=0` |
+| `aetheris-ffi/src/lib.rs` | `create_genesis_block`: empty, no mint/transfer; `GenesisConfig` simplified (no `allocations`); `TEST_SEED_MNEMONIC`/`TEST_DEV_MNEMONIC` removed; miner uses `is_coinbase()` filter; fee burning (coinbase = reward - total_fees); `is_address_frozen` removed; `tx_history` type fix |
+| `genesis.json` | `block_reward`: 5000000000→100000000; allocations removed |
+
+### Multi-Agent Review (Post-Implementation Phase)
+
+| Finding | Severity | Fix |
+|---------|----------|-----|
+| `test_genesis_import` asserts old 3-commitment/1-nullifier genesis structure | ❌ ISSUE | Updated to 0 commitments, 0 nullifiers |
+| Accumulator filter uses `public_amount<=0` (filters out fee-paying txs) | ⚠️ WARNING | Changed to `!tx.is_coinbase()` |
+| Outdated doc comment `public_amount==0` | ⚠️ WARNING | Updated to `> 0` representing fees |
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ |
+| aetheris-core 25/25 | ✅ |
+| aetheris-node 11/11 + 2 + 2 | ✅ |
+| FFI test_genesis_hash_locked | ✅ |
+
+---
+
+## Stage 49 — Phase 1.14 S5-a/b: Recursive Proof Node Integration (BlockHeader + Consensus) (2026-06-12)
+
+**Scope**: Bridge the recursive proof system into the node — add `recursive_proof` field to `BlockHeader`, store `VerifyingKey` in `LedgerState`, verify recursive proofs during block validation.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `aetheris-core/src/lib.rs` | `BlockHeader` added `recursive_proof: Option<Vec<u8>>`; `dummy_header` updated |
+| `aetheris-node/src/state.rs` | `LedgerState` added `recursive_vk_bytes: Option<Vec<u8>>`; `apply_block_with_validation` calls `verify_block_recursive_proof()` if block has proof |
+| `aetheris-node/src/main.rs` | All `BlockHeader` + `LedgerState` constructions updated |
+| `aetheris-ffi/src/lib.rs` | All `BlockHeader` constructions updated with `recursive_proof: None` |
+| `aetheris-recursive/src/prove_recursive.rs` | Added `verify_block_recursive_proof()` — deserializes accumulator, builds public instances, calls `verify_recursive_proof()` |
+| `aetheris-recursive/src/lib.rs` | Re-exported `verify_block_recursive_proof` |
+
+### Design Decisions
+
+- **Backward compatible**: `recursive_proof: None` = trusted fallback (accumulator chain replay). Block with `Some(...)` is verified via recursive proof.
+- **`verify_block_recursive_proof`** regenerates params + VK on each call (keygen is expensive; caching deferred to S5-d).
+- **Consensus unchanged**: recursive proof is an *additional* check on top of existing accumulator chain verification, not a replacement.
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ |
+| aetheris-core 25/25 | ✅ |
+| aetheris-node 11/11 + 2 + 2 | ✅ |
+| FFI test_genesis_hash_locked | ✅ |

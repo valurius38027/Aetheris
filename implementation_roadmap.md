@@ -41,7 +41,7 @@
 | # | 项目 | 说明 |
 |---|------|------|
 | D-1 | 递归证明端到端测试 | `aetheris-recursive` 完整递归链路集成测试（当前仅单元测试） |
-| D-2 | 激励模型 | 聚合节点奖励分配、交易费模型 |
+| D-2 | 手续费燃烧 | 100% 手续费燃烧（已定版，见 protocol_design_ruling §7）|
 | D-3 | 创世仪式 | 真正创世种子生成（非硬编码）、多方参与 Ceremony、公布 `EXPECTED_GENESIS_HASH` |
 | D-4 | 区块格式版本化 | BlockHeader 添加 `version` 字段，支持向后兼容升级 |
 
