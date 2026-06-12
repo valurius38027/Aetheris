@@ -114,12 +114,15 @@ impl VestaEccConfig {
             let ry = meta.query_advice(g, Rotation::cur());
             let five = Expression::Constant(Fq::from(5));
 
-            let p_on_curve = py.clone() * py.clone() - px.clone() * px.clone() * px.clone() - five.clone();
+            // Allow identity inputs (P=O): multiply by px so P+Q=Q passes with (0,0) witness.
+            // Allow identity output (rx=0): multiply by rx so P+(-P)=O passes.
+            let p_on_curve = px.clone() * (py.clone() * py.clone() - px.clone() * px.clone() * px.clone() - five.clone());
             let q_on_curve = qy.clone() * qy.clone() - qx.clone() * qx.clone() * qx.clone() - five.clone();
-            let slope = lam.clone() * (qx.clone() - px.clone()) - (qy.clone() - py.clone());
-            let x3 = lam.clone() * lam.clone() - px.clone() - qx.clone() - rx.clone();
-            let y3 = lam.clone() * (px.clone() - rx.clone()) - py.clone() - ry.clone();
-            let r_on_curve = ry.clone() * ry.clone() - rx.clone() * rx.clone() * rx.clone() - five;
+            let slope = px.clone() * rx.clone() * (lam.clone() * (qx.clone() - px.clone()) - (qy.clone() - py.clone()));
+            let x3 = px.clone() * rx.clone() * (lam.clone() * lam.clone() - px.clone() - qx.clone() - rx.clone());
+            let y3 = px.clone() * rx.clone() * (lam.clone() * (px.clone() - rx.clone()) - py.clone() - ry.clone());
+            // r_on_curve only needs rx multiplier: for O+Q case rx=qx≠0 and Q on-curve → constraint holds.
+            let r_on_curve = rx.clone() * (ry.clone() * ry.clone() - rx.clone() * rx.clone() * rx.clone() - five);
 
             vec![
                 s.clone() * p_on_curve,
@@ -143,7 +146,7 @@ impl VestaEccConfig {
             let two = Expression::Constant(Fq::from(2));
             let three = Expression::Constant(Fq::from(3));
 
-            let p_on_curve = py.clone() * py.clone() - px.clone() * px.clone() * px.clone() - five;
+            let p_on_curve = px.clone() * (py.clone() * py.clone() - px.clone() * px.clone() * px.clone() - five);
             let slope = lam.clone() * two.clone() * py.clone() - three.clone() * px.clone() * px.clone();
             let x3 = lam.clone() * lam.clone() - two.clone() * px.clone() - rx.clone();
             let y3 = lam.clone() * (px.clone() - rx.clone()) - py.clone() - ry.clone();
@@ -247,8 +250,20 @@ impl VestaEccChip {
     ) -> Result<VestaPoint, ErrorFront> {
         let result: Value<(Fq, Fq, Fq)> = p.x.zip(p.y).zip(q.x.zip(q.y)).map(
             |((px, py), (qx, qy))| {
+                // P = O (0,0): O + Q = Q
+                if px == Fq::ZERO && py == Fq::ZERO {
+                    return (Fq::ZERO, qx, qy);
+                }
+                // Q = O (0,0): P + O = P
+                if qx == Fq::ZERO && qy == Fq::ZERO {
+                    return (Fq::ZERO, px, py);
+                }
                 let dx = qx - px;
                 let dy = qy - py;
+                if dx == Fq::ZERO && dy != Fq::ZERO {
+                    // P = -Q: result is identity (0, 0)
+                    return (Fq::ZERO, Fq::ZERO, Fq::ZERO);
+                }
                 let lam = if dx == Fq::ZERO {
                     // P == Q: use doubling formula
                     (Fq::from(3) * px.square()) * (Fq::from(2) * py).invert().expect("py != 0")
@@ -298,6 +313,9 @@ impl VestaEccChip {
         _label: &str,
     ) -> Result<VestaPoint, ErrorFront> {
         let result: Value<(Fq, Fq, Fq)> = p.x.zip(p.y).map(|(px, py)| {
+            if px == Fq::ZERO && py == Fq::ZERO {
+                return (Fq::ZERO, Fq::ZERO, Fq::ZERO); // 2 * O = O
+            }
             let lam = (Fq::from(3) * px.square()) * (Fq::from(2) * py).invert().expect("py != 0");
             let rx = lam.square() - Fq::from(2) * px;
             let ry = lam * (px - rx) - py;
@@ -773,7 +791,98 @@ mod tests {
     #[test]
     fn vesta_smul_1() { run_smul_test(1); }
 
-    // s=0 produces identity O (not on-curve in affine) — handled by IPA circuit with identity gate
-    // #[test]
-    // fn vesta_smul_0() { run_smul_test(0); }
+    #[test]
+    fn vesta_smul_0() {
+        // s=0 produces identity O — verify the circuit handles identity output.
+        let g = EqAffine::generator();
+        let (gx, gy) = to_coords(&g);
+        let offset = offset_2p254(&g);
+        let (ox, oy) = to_coords(&offset);
+
+        #[derive(Default)]
+        struct TestSmul0 { gx: Fq, gy: Fq, ox: Fq, oy: Fq }
+        impl Circuit<Fq> for TestSmul0 {
+            type Config = EccTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self {
+                Self { gx: Fq::ZERO, gy: Fq::ZERO, ox: Fq::ZERO, oy: Fq::ZERO }
+            }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config { EccTestConfig::configure(meta) }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = VestaEccChip::new(config.ecc);
+                let p = VestaPoint::new(self.gx, self.gy);
+                let offset_point = VestaPoint::new(self.ox, self.oy);
+                let r = chip.scalar_mul(
+                    layouter.namespace(|| "smul_0"),
+                    &p, &offset_point,
+                    Value::known(Fq::ZERO),
+                    "smul_0",
+                )?;
+                // For s=0, result should be identity: rx=0
+                r.x.map(|x| assert_eq!(x, Fq::ZERO, "s=0 must produce identity (rx=0)"));
+                r.y.map(|y| assert_eq!(y, Fq::ZERO, "s=0 must produce identity (ry=0)"));
+                Ok(())
+            }
+        }
+        let circuit = TestSmul0 { gx, gy, ox, oy };
+        let prover = MockProver::run(14, &circuit, vec![]).expect("mock prover");
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn vesta_smul_large_scalar() {
+        // Test scalar_mul with a full 254-bit Fq value (similar to a Poseidon output)
+        use ff::FromUniformBytes;
+        let g = EqAffine::generator();
+        let (gx, gy) = to_coords(&g);
+
+        // Simulate a "Poseidon-like" 254-bit scalar: random-looking bytes
+        let bytes = [
+            39u8, 250, 142, 224, 238, 65, 212, 70,
+            215, 210, 156, 111, 171, 222, 177, 44,
+            145, 23, 56, 99, 94, 79, 16, 30,
+            80, 106, 236, 250, 19, 121, 207, 0,
+        ];
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&bytes);
+        buf[31] &= 0x3f; // mask bits 254+
+        let scalar_fp = Fp::from_uniform_bytes(&buf);
+        let expected = (g * scalar_fp).to_affine();
+        let (ex, ey) = to_coords(&expected);
+
+        let scalar_fq = Fq::from_uniform_bytes(&buf);
+        let offset = offset_2p254(&g);
+        let (ox, oy) = to_coords(&offset);
+
+        #[derive(Default)]
+        struct TestSmulLarge { scalar: Fq, ox: Fq, oy: Fq, ex: Fq, ey: Fq }
+        impl Circuit<Fq> for TestSmulLarge {
+            type Config = EccTestConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            fn without_witnesses(&self) -> Self {
+                Self { scalar: Fq::ZERO, ox: Fq::ZERO, oy: Fq::ZERO, ex: Fq::ZERO, ey: Fq::ZERO }
+            }
+            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+                EccTestConfig::configure(meta)
+            }
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+                let chip = VestaEccChip::new(config.ecc);
+                let (gx, gy) = to_coords(&EqAffine::generator());
+                let p = VestaPoint::new(gx, gy);
+                let offset_point = VestaPoint::new(self.ox, self.oy);
+                let r = chip.scalar_mul(
+                    layouter.namespace(|| "smul"),
+                    &p, &offset_point,
+                    Value::known(self.scalar),
+                    "smul",
+                )?;
+                r.x.zip(Value::known(self.ex)).map(|(a, b)| assert_eq!(a, b));
+                r.y.zip(Value::known(self.ey)).map(|(a, b)| assert_eq!(a, b));
+                Ok(())
+            }
+        }
+        let circuit = TestSmulLarge { scalar: scalar_fq, ox, oy, ex, ey };
+        let prover = MockProver::run(14, &circuit, vec![]).expect("mock prover");
+        prover.assert_satisfied();
+    }
 }

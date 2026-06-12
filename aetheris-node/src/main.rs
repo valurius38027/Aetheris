@@ -96,7 +96,7 @@ mod tests {
                 aggregate_proof: vec![],
                 height: 0,
                 difficulty: 10,
-                recursive_proof: None,
+                recursive_proof: vec![],
             },
             transactions: vec![],
         };
@@ -129,7 +129,7 @@ mod tests {
                 aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 10,
-                recursive_proof: None,
+                recursive_proof: vec![],
             },
             transactions: vec![],
         };
@@ -447,7 +447,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         aggregate_proof: winner.aggregate_proof.clone(),
                                         height: winner.height,
                                         difficulty: winner.difficulty,
-                                        recursive_proof: None,
+                                        recursive_proof: vec![],
                                     };
                                      let block = Block { header, transactions: winner.transactions.clone() }; 
                                      
@@ -690,7 +690,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             aggregate_proof: aggregate_proof.clone(),
                             height: current_height,
                             difficulty: current_difficulty,
-                            recursive_proof: None,
+                            recursive_proof: vec![],
                         },
                         transactions: txs.clone(),
                     };

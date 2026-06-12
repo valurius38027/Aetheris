@@ -68,10 +68,10 @@ pub struct BlockHeader {
     pub timestamp: u64,
     pub vdf_result: Vec<u8>,  // Mathematical result of VDF
     pub vdf_proof: Vec<u8>,   // Wesolowski or ZK proof of VDF
-    pub aggregate_proof: Vec<u8>, // Recursive SNARK aggregating all TX proofs
+    pub aggregate_proof: Vec<u8>, // IPA accumulator chain proof
     pub height: u64,
     pub difficulty: u64,      // Current VDF difficulty
-    pub recursive_proof: Option<Vec<u8>>, // Halo2 recursive SNARK (None = trusted fallback)
+    pub recursive_proof: Vec<u8>, // Halo2 recursive SNARK (empty = trusted fallback)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,7 +145,7 @@ mod tests {
             aggregate_proof: vec![0xCC; 64],
             height,
             difficulty: VDF_DIFFICULTY,
-            recursive_proof: None,
+            recursive_proof: vec![],
         }
     }
 

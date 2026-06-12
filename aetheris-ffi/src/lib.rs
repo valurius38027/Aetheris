@@ -189,7 +189,7 @@ fn create_genesis_block() -> aetheris_core::Block {
             aggregate_proof: empty_accumulator(),
             height: 0,
             difficulty: aetheris_core::VDF_DIFFICULTY,
-            recursive_proof: None,
+            recursive_proof: vec![],
         },
         transactions: vec![],
     }
@@ -503,7 +503,7 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                                                     aggregate_proof: winner.aggregate_proof,
                                                                     height: winner.height,
                                                                     difficulty: winner.difficulty,
-                                                                    recursive_proof: None,
+                                                                    recursive_proof: vec![],
                                                                 },
                                                                 transactions: winner.transactions,
                                                             };
@@ -1604,7 +1604,7 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             aggregate_proof,
             height: ledger.height,
             difficulty: current_difficulty,
-            recursive_proof: None,
+            recursive_proof: vec![],
         },
         transactions: txs,
     };
@@ -1740,7 +1740,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     aggregate_proof: aggregate_proof.clone(),
                     height: current_height,
                     difficulty: current_difficulty,
-                    recursive_proof: None,
+                    recursive_proof: vec![],
                 },
                 transactions: core_txs.clone(),
             };
@@ -1793,7 +1793,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     aggregate_proof,
                     height: current_height,
                     difficulty: current_difficulty,
-                    recursive_proof: None,
+                    recursive_proof: vec![],
                 },
                 transactions: core_txs,
             };

@@ -1,22 +1,40 @@
 //! Recursive proof production and verification.
 //!
-//! Bridges `RecursiveProofCircuit` (Phase 1.13) with the Halo2 IPA proof
-//! pipeline from `aetheris-zkp`, enabling real recursive SNARK production.
+//! ## Old pipeline (deprecated, Pallas-based)
+//! - `build_recursive_keys`, `prove_recursive`, `verify_recursive_proof`
+//! - `verify_block_recursive_proof` — placeholder, retains signature for state.rs
+//!
+//! ## New pipeline (§C, Vesta-native)
+//! - `build_accumulate_keys` — keygen for `AccumulatorCircuit`
+//! - `prove_block_recursive` — produce accumulator recursive proof
+//! - `verify_accumulate_proof` — verify accumulator proof
 
+use ff::{Field, FromUniformBytes, PrimeField};
+use group::prime::PrimeCurveAffine;
+use group::Curve;
 use halo2_backend::plonk::verifier::verify_proof_with_strategy;
 use halo2_backend::poly::VerificationStrategy;
 use halo2_proofs::{
+    circuit::Value,
     plonk::{create_proof, keygen_pk, keygen_vk, Error, ProvingKey, VerifyingKey},
     transcript::{Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
-use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
+use halo2_proofs::halo2curves::pasta::{EpAffine, EqAffine, Fp, Fq};
+use halo2curves::CurveAffine;
 
 use aetheris_zkp::ipa::commitment::{CommitmentSchemeIPA, ParamsIPA};
 use aetheris_zkp::ipa::prover::ProverIPA;
 use aetheris_zkp::ipa::strategy::SingleStrategyIPA;
 
+use crate::circuit_accumulate::{
+    AccumulatorCircuit, TxWitness, MAX_ITER,
+    TRANSCRIPT_DOMAIN_FQ, compute_generator_and_offset,
+};
 use crate::pallas_accumulate::commitment_limbs;
 use crate::recursive_proof::RecursiveProofCircuit;
+use crate::vesta_ecc::VestaPoint;
+
+// ── Old pipeline (deprecated, kept for backward compat) ──
 
 /// Generate a proving key and verifying key for the recursive proof circuit.
 pub fn build_recursive_keys(
@@ -87,10 +105,6 @@ pub fn build_recursive_instance(
 }
 
 /// Verify a block's recursive proof against its state_root and accumulator state.
-///
-/// Extracts the IPA commitment from `accumulator_bytes`, builds the public
-/// instance vector, and calls `verify_recursive_proof`. Regenerates params
-/// and VK on every call — callers should cache these for production use.
 pub fn verify_block_recursive_proof(
     proof: &[u8],
     state_root: &[u8; 32],
@@ -110,15 +124,241 @@ pub fn verify_block_recursive_proof(
     verify_recursive_proof(&params, &vk, proof, instances)
 }
 
+// ── New pipeline (§C: Vesta-native AccumulatorCircuit) ──
+
+/// Host-side Poseidon compression: (left, right) → state[0].
+fn host_poseidon_fq(left: Fq, right: Fq) -> Fq {
+    let spec = aetheris_zkp::poseidon_fq::ensure_poseidon_spec();
+    let mut state = [left, right, Fq::ZERO];
+    aetheris_zkp::poseidon_fq::poseidon_permute(spec, &mut state);
+    state[0]
+}
+
+/// Convert an Fq scalar to an Fp scalar matching the circuit's scalar_mul
+/// bit handling (only uses bits 0..253, ignoring bits 254+).
+fn fq_to_fp_scalar(fq: Fq) -> Fp {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(fq.to_repr().as_ref());
+    buf[31] &= 0x3f;
+    Fp::from_uniform_bytes(&buf)
+}
+
+/// Extract a known Fq from a `Value<Fq>`. The layout is guaranteed to match
+/// `Option<Fq>` (single-field struct), so transmute is sound.
+fn known_fq(v: Value<Fq>) -> Fq {
+    let opt: Option<Fq> = unsafe { std::mem::transmute(v) };
+    opt.expect("expected Known Fq value")
+}
+
+/// Convert an `EqAffine` point to a `VestaPoint`.
+fn eq_to_vesta_point(pt: &EqAffine) -> VestaPoint {
+    let coords = pt.coordinates().unwrap();
+    VestaPoint::new(*coords.x(), *coords.y())
+}
+
+/// Compute the expected accumulator output after processing `txs`,
+/// using host-side arithmetic that mirrors `AccumulatorCircuit::synthesize`.
+///
+/// Returns `(q_new, transcript_new, depth_new)`.
+fn compute_expected_accumulator_output(
+    q_old: EqAffine,
+    transcript_old: Fq,
+    depth_old: u32,
+    txs: &[TxWitness],
+) -> (EqAffine, Fq, u32) {
+    let mut q_cur = q_old;
+    let mut transcript_cur = transcript_old;
+    let mut depth_cur = depth_old;
+
+    for tx in txs {
+        let ipe = known_fq(tx.ipe);
+
+        let mut c_sel = Fq::ZERO;
+        for i in 0..MAX_ITER {
+            if known_fq(tx.sel[i]) == Fq::ONE {
+                c_sel = known_fq(tx.c[i]);
+                break;
+            }
+        }
+
+        // pi_commitment = G * c_sel (Vesta scalar mul: Fp scalar)
+        let c_fp = fq_to_fp_scalar(c_sel);
+        let pi_commitment = (EqAffine::generator() * c_fp).to_affine();
+
+        // Challenge = Poseidon(Poseidon(TRANSCRIPT_DOMAIN_FQ, transcript_cur), ipe)
+        let chal_tmp = host_poseidon_fq(TRANSCRIPT_DOMAIN_FQ, transcript_cur);
+        let challenge = host_poseidon_fq(chal_tmp, ipe);
+
+        // Q_new = Q_cur + challenge * pi_commitment
+        let chal_fp = fq_to_fp_scalar(challenge);
+        let scaled = (pi_commitment.to_curve() * chal_fp).to_affine();
+        let q_new = (q_cur.to_curve() + scaled.to_curve()).to_affine();
+
+        // Transcript chain
+        let coords = q_new.coordinates().unwrap();
+        let h1 = host_poseidon_fq(transcript_cur, challenge);
+        let h2 = host_poseidon_fq(*coords.x(), ipe);
+        let transcript_new = host_poseidon_fq(h1, h2);
+
+        q_cur = q_new;
+        transcript_cur = transcript_new;
+        depth_cur += 1;
+    }
+
+    (q_cur, transcript_cur, depth_cur)
+}
+
+/// Generate proving key and verifying key for `AccumulatorCircuit`.
+///
+/// `num_txs` must equal the length of the txs slice that will be passed to
+/// `prove_block_recursive`. The keygen circuit must have the same structure
+/// (same number of Poseidon calls, scalar_mul iterations, etc.) as the
+/// proving circuit.
+///
+/// Note: uses `ParamsIPA<EpAffine>` (Pallas IPA) because the IPA scheme's
+/// scalar field must match the circuit's field (Fq). Vesta's scalar field is
+/// Fp, which would require `Circuit<Fp>`, but our circuit operates over Fq
+/// (Vesta's base field = Pallas's scalar field).
+pub fn build_accumulate_keys(
+    params: &ParamsIPA<EpAffine>,
+    num_txs: usize,
+) -> Result<(VerifyingKey<EpAffine>, ProvingKey<EpAffine>), Error> {
+    let (gen_pt, off_pt) = compute_generator_and_offset();
+    let gen_coords = EqAffine::generator().coordinates().unwrap();
+    let gx = *gen_coords.x();
+    let gy = *gen_coords.y();
+    let dummy_tx = TxWitness {
+        ipe: Value::known(Fq::ONE),
+        c: [
+            Value::known(Fq::ONE),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+        ],
+        sel: [
+            Value::known(Fq::ONE),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+            Value::known(Fq::ZERO),
+        ],
+        pi_commitment_offset: off_pt.clone(),
+    };
+    let circuit = AccumulatorCircuit {
+        q_old: VestaPoint::new(gx, gy),
+        transcript_old: Value::known(Fq::ZERO),
+        depth_old: Value::known(Fq::ZERO),
+        txs: vec![dummy_tx; num_txs],
+        q_new: VestaPoint::new(gx, gy),
+        transcript_new: Value::known(Fq::ZERO),
+        depth_new: Value::known(Fq::ZERO),
+        generator: gen_pt,
+        gen_offset: off_pt,
+    };
+    let vk = keygen_vk(params, &circuit)?;
+    let pk = keygen_pk(params, vk.clone(), &circuit)?;
+    Ok((vk, pk))
+}
+
+/// Produce an O(1) recursive SNARK proving the accumulator transition
+/// from `(q_old, transcript_old, depth_old)` to `(q_new, transcript_new,
+/// depth_new)` across all transactions in `txs`.
+///
+/// The accumulator operates on the Vesta curve (EqAffine), while the outer
+/// IPA proof is over Pallas (EpAffine). This is sound because Pasta 2-cycle
+/// gives Fq = Pallas scalar field = Vesta base field = circuit field.
+///
+/// Public instances (4 Fq cells):
+///   inst[0] = Q_new.x
+///   inst[1] = Q_new.y
+///   inst[2] = transcript_new
+///   inst[3] = Fq::from(depth_new)
+pub fn prove_block_recursive(
+    params: &ParamsIPA<EpAffine>,
+    pk: &ProvingKey<EpAffine>,
+    q_old: EqAffine,
+    transcript_old: Fq,
+    depth_old: u32,
+    txs: Vec<TxWitness>,
+) -> Result<(Vec<u8>, EqAffine, Fq, u32), Error> {
+    let (q_new, transcript_new, depth_new) =
+        compute_expected_accumulator_output(q_old, transcript_old, depth_old, &txs);
+
+    let (gen_pt, off_pt) = compute_generator_and_offset();
+    let q_old_pt = eq_to_vesta_point(&q_old);
+    let q_new_pt = eq_to_vesta_point(&q_new);
+
+    let circuit = AccumulatorCircuit {
+        q_old: q_old_pt,
+        transcript_old: Value::known(transcript_old),
+        depth_old: Value::known(Fq::from(depth_old as u64)),
+        txs,
+        q_new: q_new_pt,
+        transcript_new: Value::known(transcript_new),
+        depth_new: Value::known(Fq::from(depth_new as u64)),
+        generator: gen_pt,
+        gen_offset: off_pt,
+    };
+
+    let coords = q_new.coordinates().unwrap();
+    let instances = vec![vec![
+        *coords.x(),
+        *coords.y(),
+        transcript_new,
+        Fq::from(depth_new as u64),
+    ]];
+
+    let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
+    create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+        params,
+        pk,
+        &[circuit],
+        &[instances],
+        rand::rngs::OsRng,
+        &mut transcript,
+    )?;
+
+    Ok((transcript.finalize(), q_new, transcript_new, depth_new))
+}
+
+/// Verify an accumulator recursive proof against the claimed public instances.
+///
+/// `instances` must be `vec![vec![q_new_x, q_new_y, transcript_new, depth_new_fq]]`.
+pub fn verify_accumulate_proof(
+    params: &ParamsIPA<EpAffine>,
+    vk: &VerifyingKey<EpAffine>,
+    proof: &[u8],
+    instances: Vec<Vec<Fq>>,
+) -> bool {
+    let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(proof);
+    match verify_proof_with_strategy::<
+        CommitmentSchemeIPA<EpAffine>,
+        _,
+        Challenge255<EpAffine>,
+        Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>,
+        SingleStrategyIPA<'_, EpAffine>,
+    >(
+        params,
+        vk,
+        SingleStrategyIPA::new(params),
+        &[instances],
+        &mut transcript,
+    ) {
+        Ok(strategy) => strategy.finalize(),
+        Err(e) => {
+            eprintln!("verify_accumulate_proof error: {:?}", e);
+            false
+        },
+    }
+}
+
 // ── Tests ──
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pallas_accumulate::ep_to_pallas_point;
-    use halo2_proofs::halo2curves::pasta::EpAffine;
-    use halo2curves::group::prime::PrimeCurveAffine;
-    use halo2curves::group::Curve;
     use rand::rngs::OsRng;
 
     #[test]
@@ -155,7 +395,6 @@ mod tests {
         let wit_gh = crate::pallas_accumulate::fp_add_witness(&p_a, &p_rh);
         let wit_u = crate::pallas_accumulate::fp_add_witness(&p_rhs_gh, &p_ab);
 
-        // state_root must be < Fq modulus.
         let state_root_val: [u8; 32] = { let mut b = [0u8; 32]; b[0] = 0xab; b };
         let circuit = RecursiveProofCircuit {
             commitment: p_com,
@@ -169,16 +408,13 @@ mod tests {
             state_root: state_root_val,
         };
 
-        // Keygen.
         let params = ParamsIPA::<EpAffine>::setup(16, &mut OsRng, "test_recursive");
         let (vk, pk) = build_recursive_keys(&params).expect("keygen failed");
 
-        // Prove.
         let pub_limbs = vec![build_recursive_instance(&circuit.commitment, &state_root_val)];
         let proof = prove_recursive(&params, &pk, circuit, pub_limbs).expect("prove_recursive failed");
         assert!(!proof.is_empty(), "proof must not be empty");
 
-        // Verify with correct public inputs.
         let commitment_pt_verify = {
             let g2 = EpAffine::generator();
             let h2 = (g2.to_curve() * Fq::from(2u64)).to_affine();
@@ -198,7 +434,6 @@ mod tests {
         let valid = verify_recursive_proof(&params, &vk, &proof, pub_limbs_verify);
         assert!(valid, "verify_recursive_proof must accept valid proof");
 
-        // Corrupt the proof — verification must fail.
         let mut corrupted = proof.clone();
         corrupted[proof.len() / 2] ^= 0xff;
         let rejected = verify_recursive_proof(
@@ -207,6 +442,175 @@ mod tests {
             &corrupted,
             vec![build_recursive_instance(&ep_to_pallas_point(&commitment_pt), &state_root_val)],
         );
+        assert!(!rejected, "verify must reject corrupted proof");
+    }
+
+    #[test]
+    fn test_prove_and_verify_accumulate_single_tx() {
+        // 1-tx case: prove_block_recursive + verify_accumulate_proof round-trip
+        let q_old = EqAffine::generator();
+        let transcript_old = Fq::from(42);
+        let depth_old = 7;
+
+        let (_gen_pt, off_pt) = compute_generator_and_offset();
+        let tx = TxWitness {
+            ipe: Value::known(Fq::ONE),
+            c: [
+                Value::known(Fq::ONE),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+            ],
+            sel: [
+                Value::known(Fq::ONE),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+            ],
+            pi_commitment_offset: off_pt,
+        };
+
+        // Use K=15 to ensure enough rows for 1 tx circuit (scalar_mul loops are large)
+        let params = ParamsIPA::<EpAffine>::setup(15, &mut OsRng, "test_accumulate_single");
+        let (vk, pk) = build_accumulate_keys(&params, 1).expect("keygen failed");
+
+        // Independently compute expected output for cross-check
+        let (q_new_host, transcript_new_host, depth_new_host) =
+            compute_expected_accumulator_output(q_old, transcript_old, depth_old, &[tx.clone()]);
+        assert_eq!(depth_new_host, 8, "single tx should increment depth by 1");
+
+        let (proof, q_new, transcript_new, depth_new) =
+            prove_block_recursive(&params, &pk, q_old, transcript_old, depth_old, vec![tx])
+                .expect("prove_block_recursive failed");
+        assert!(!proof.is_empty(), "proof must not be empty");
+
+        // Cross-check: prover output must match host-side computation
+        assert_eq!(q_new, q_new_host, "prover q_new must match host computation");
+        assert_eq!(transcript_new, transcript_new_host, "prover transcript_new must match");
+        assert_eq!(depth_new, depth_new_host, "prover depth_new must match");
+
+        let coords = q_new.coordinates().unwrap();
+        let instances = vec![vec![
+            *coords.x(),
+            *coords.y(),
+            transcript_new,
+            Fq::from(depth_new as u64),
+        ]];
+        let valid = verify_accumulate_proof(&params, &vk, &proof, instances.clone());
+        assert!(valid, "verify_accumulate_proof must accept valid proof for 1 tx");
+
+        // Also verify with host-computed instances
+        let host_coords = q_new_host.coordinates().unwrap();
+        let host_instances = vec![vec![
+            *host_coords.x(),
+            *host_coords.y(),
+            transcript_new_host,
+            Fq::from(depth_new_host as u64),
+        ]];
+        let valid_host = verify_accumulate_proof(&params, &vk, &proof, host_instances);
+        assert!(valid_host, "verify must also accept with host-computed instances");
+
+        let mut corrupted = proof.clone();
+        corrupted[proof.len() / 2] ^= 0xff;
+        let rejected = verify_accumulate_proof(&params, &vk, &corrupted, instances);
+        assert!(!rejected, "verify must reject corrupted proof");
+    }
+
+    #[test]
+    fn test_prove_and_verify_accumulate_debug() {
+        // Debug: use compute_expected_accumulator_output to get the correct
+        // expected instances, then verify the circuit matches.
+        let (_gen_pt, off_pt) = compute_generator_and_offset();
+        let tx = TxWitness {
+            ipe: Value::known(Fq::ONE),
+            c: [
+                Value::known(Fq::ONE),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+            ],
+            sel: [
+                Value::known(Fq::ONE),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO),
+            ],
+            pi_commitment_offset: off_pt.clone(),
+        };
+
+        let q_old = EqAffine::generator();
+        let transcript_old = Fq::from(42);
+        let depth_old = 7;
+
+        let (q_new_host, transcript_new_host, depth_new_host) =
+            compute_expected_accumulator_output(q_old, transcript_old, depth_old, &[tx.clone()]);
+
+        let qn_coords = q_new_host.coordinates().unwrap();
+        println!("q_new (host) x = {:?}", qn_coords.x().to_repr());
+        println!("transcript_new (host) = {:?}", transcript_new_host.to_repr());
+        println!("depth_new (host) = {}", depth_new_host);
+
+        let q_old_pt = eq_to_vesta_point(&q_old);
+        let q_new_pt = eq_to_vesta_point(&q_new_host);
+        let circuit_check = AccumulatorCircuit {
+            q_old: q_old_pt,
+            transcript_old: Value::known(transcript_old),
+            depth_old: Value::known(Fq::from(depth_old as u64)),
+            txs: vec![tx],
+            q_new: q_new_pt,
+            transcript_new: Value::known(transcript_new_host),
+            depth_new: Value::known(Fq::from(depth_new_host as u64)),
+            generator: _gen_pt,
+            gen_offset: off_pt,
+        };
+        use halo2_proofs::dev::MockProver;
+        let instances_check = vec![vec![
+            *qn_coords.x(),
+            *qn_coords.y(),
+            transcript_new_host,
+            Fq::from(depth_new_host as u64),
+        ]];
+        let prover = MockProver::run(14, &circuit_check, instances_check).expect("mock prover");
+        let result = prover.verify();
+        println!("MockProver result: {:?}", result);
+        assert_eq!(result, Ok(()), "AccumulatorCircuit should be satisfied with correct instances");
+    }
+
+    #[test]
+    fn test_prove_and_verify_accumulate_empty() {
+        // 0-tx case: q_new == q_old, transcript_new == transcript_old, depth_new == depth_old
+        let q_old = EqAffine::generator();
+        let transcript_old = Fq::from(42);
+        let depth_old = 7;
+
+        let params = ParamsIPA::<EpAffine>::setup(14, &mut OsRng, "test_accumulate_empty");
+        let (vk, pk) = build_accumulate_keys(&params, 0).expect("keygen failed");
+
+        let (proof, q_new, transcript_new, depth_new) =
+            prove_block_recursive(&params, &pk, q_old, transcript_old, depth_old, vec![])
+                .expect("prove_block_recursive failed");
+        assert!(!proof.is_empty(), "proof must not be empty");
+        assert_eq!(q_old, q_new);
+        assert_eq!(transcript_old, transcript_new);
+        assert_eq!(depth_old, depth_new);
+
+        let coords = q_new.coordinates().unwrap();
+        let instances = vec![vec![
+            *coords.x(),
+            *coords.y(),
+            transcript_new,
+            Fq::from(depth_new as u64),
+        ]];
+        let valid = verify_accumulate_proof(&params, &vk, &proof, instances.clone());
+        assert!(valid, "verify_accumulate_proof must accept valid proof for 0 txs");
+
+        let mut corrupted = proof.clone();
+        corrupted[proof.len() / 2] ^= 0xff;
+        let rejected = verify_accumulate_proof(&params, &vk, &corrupted, instances);
         assert!(!rejected, "verify must reject corrupted proof");
     }
 }

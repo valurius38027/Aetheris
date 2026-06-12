@@ -40,7 +40,7 @@ pub const NUM_INSTANCES: usize = 4;
 pub const MAX_ITER: usize = 5;
 
 /// Domain separator for the accumulator transcript chain.
-const TRANSCRIPT_DOMAIN_FQ: Fq = Fq::from_raw([
+pub(crate) const TRANSCRIPT_DOMAIN_FQ: Fq = Fq::from_raw([
     0x0000000000000000,
     0x4000000000000000,
     0x0000000000000000,

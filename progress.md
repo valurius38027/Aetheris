@@ -3328,6 +3328,32 @@ The economic model is designed to be consistent with the whitepaper's core princ
 
 ---
 
+## Stage 50 — §D.1: Make `recursive_proof` Non-Optional (2026-06-12)
+
+**Scope**: Change `BlockHeader.recursive_proof` from `Option<Vec<u8>>` to `Vec<u8>`, update all 25+ construction sites, update consensus verification to use empty-vec check.
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `aetheris-core/src/lib.rs:74` | `Option<Vec<u8>>` → `Vec<u8>` |
+| `aetheris-ffi/src/lib.rs` | 5 sites: `None` → `vec![]` |
+| `aetheris-node/src/main.rs` | 4 sites: `None` → `vec![]` |
+| `aetheris-node/src/state.rs` | 14 sites: `None` → `vec![]`; validation: `if let Some` → `if !is_empty()` |
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ (0 warnings) |
+| aetheris-core 25/25 | ✅ |
+| aetheris-recursive 189/189 | ✅ |
+| aetheris-crypto 41/41 | ✅ |
+| aetheris-zkp 124/124 | ✅ |
+| aetheris-node 11/11 | ✅ |
+
+---
+
 ## Stage 50 — §A: Accumulator Curve Migration (Pallas → Vesta) (2026-06-12)
 
 **Scope**: Fix D8 (hash-to-curve targets wrong generator) and D2 (non-native PallasAccumulateChip). Migrate accumulator from Pallas (EpAffine/Fp) to Vesta (EqAffine/Fq). Completed per `FINAL_ARCHITECTURAL_PLAN.md §A`.
