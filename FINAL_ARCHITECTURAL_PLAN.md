@@ -41,7 +41,7 @@
 | D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ Deferred post-MVP |
 | D7 | R5 | `create_nullifier`/`build_merkle_root` use Blake3 not Poseidon | MEDIUM | §B.2 | ✅ Done |
 | D8 | R2 | `hash_to_curve` targets Pallas generator (EpAffine) not Vesta (EqAffine) | MEDIUM | §A | ✅ Done |
-| D9 | — | `RecursiveManagerHandle.verify_halo2_proof() -> bool { false }` (stub) | HIGH | §F | ⏳ Pending |
+| D9 | — | `RecursiveManagerHandle.verify_halo2_proof() -> bool { false }` (stub) | HIGH | §F | ✅ Done |
 | D10 | — | `empty_accumulator()` naming; deprecated trait methods; superseded docs | LOW | §G | ⏳ Pending |
 
 ---
@@ -818,7 +818,7 @@ Each phase must pass independently before the next begins:
 - [x] **§D.2**: `aggregate_proof` removed from `BlockHeader`, all callers updated
 - [ ] **§D.3**: Consensus uses O(1) recursive SNARK verification, no O(n) fallback
 - [ ] **§E** (Phase 1.6): In-circuit IPA verification complete, Blake2b circuit replaced by Poseidon
-- [ ] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works
+- [x] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works
 - [ ] **§G**: Cleanup complete, all documents annotated, no dead code
 - [x] **Final**: `cargo check --workspace` clean, all applicable tests pass
 

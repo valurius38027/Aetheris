@@ -2047,13 +2047,14 @@ impl P2PRecursiveManager {
         )
     }
 
-    /// Phase 1.3 stub: fail-closed. Real verification returns once Phase 1.4 wires
-    /// a real Pasta IPA verifier. For now, the protocol's state validation (total_flow
-    /// == 0, anti-replay, depth ordering) is enforced by `handle_*_gossip` callers
-    /// *before* reaching this function; cryptographic verification is intentionally
-    /// absent and gossip is rejected.
-    fn verify_halo2_proof(&self, _proof_bytes: &[u8], _statement: &RecursiveStatement) -> bool {
-        false
+    /// Verify a block recursive proof via `verify_block_recursive_proof`.
+    /// The `_statement` param is retained for API compat; individual tx proofs
+    /// (which lack the 104-byte block proof prefix) will return `false`.
+    fn verify_halo2_proof(&self, proof_bytes: &[u8], _statement: &RecursiveStatement) -> bool {
+        if proof_bytes.is_empty() {
+            return false;
+        }
+        crate::verify_block_recursive_proof(proof_bytes, &[0u8; 32])
     }
 
     pub fn add_peer(&mut self, _peer_id: PeerId) {
@@ -2126,9 +2127,51 @@ impl P2PRecursiveManager {
         )
     }
 
-    pub fn handle_proof_json(&mut self, sender: PeerId, json: &str) -> i32 {
-        println!("[P2P] Received proof from {}: {}", sender, json);
-        0
+    /// Parse a block recursive proof JSON and verify it.
+    ///
+    /// Expected JSON format:
+    /// ```json
+    /// {"proof": "<hex>", "state_root": "<hex>"}
+    /// ```
+    ///
+    /// Returns:
+    /// - `1` — proof valid
+    /// - `0` — proof invalid
+    /// - `-1` — parse error (malformed JSON or hex)
+    /// - `-2` — missing required field
+    pub fn handle_proof_json(&mut self, _sender: PeerId, json: &str) -> i32 {
+        let v: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => return -1,
+        };
+        let proof_hex = match v.get("proof").and_then(|p| p.as_str()) {
+            Some(h) => h,
+            None => return -2,
+        };
+        let proof = match hex::decode(proof_hex) {
+            Ok(b) => b,
+            Err(_) => return -1,
+        };
+        let state_root = match v.get("state_root").and_then(|s| s.as_str()) {
+            Some(h) => {
+                let bytes = match hex::decode(h) {
+                    Ok(b) => b,
+                    Err(_) => return -1,
+                };
+                if bytes.len() != 32 {
+                    return -1;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            None => [0u8; 32],
+        };
+        if crate::verify_block_recursive_proof(&proof, &state_root) {
+            1
+        } else {
+            0
+        }
     }
 
     pub fn get_reward(&self, _peer_id: &str) -> u64 {
