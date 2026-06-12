@@ -2,7 +2,7 @@ use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
-use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, signed_accumulate_proof, empty_accumulator};
+use aetheris_recursive::{AggregateProofGossip, verify_accumulator_chain, signed_accumulate_proof, genesis_recursive_state_bytes};
 use ed25519_dalek::SigningKey;
 use clap::Parser;
 use rand::{thread_rng, Rng, rngs::OsRng, RngCore};
@@ -93,7 +93,6 @@ mod tests {
                 timestamp: 0,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
                 height: 0,
                 difficulty: 10,
                 recursive_proof: vec![],
@@ -111,7 +110,7 @@ mod tests {
             db: db.clone(),
             height: 1,
             last_block_hash: [0u8; 32],
-            last_aggregate_proof: empty_accumulator(),
+            last_recursive_state: genesis_recursive_state_bytes(),
             current_difficulty: 10,
             timestamps: Vec::new(),
             aggregator_pk: None,
@@ -126,7 +125,6 @@ mod tests {
                 timestamp: 100,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 10,
                 recursive_proof: vec![],
@@ -147,7 +145,6 @@ mod tests {
             let (res, proof, _) = vdf.solve(&b.header.parent_hash);
             b.header.vdf_result = res;
             b.header.vdf_proof = proof;
-            b.header.aggregate_proof = state.last_aggregate_proof.clone();
             
             state.apply_block(b).unwrap();
         }
@@ -225,7 +222,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
-    let mut last_block_proof = empty_accumulator();
+    let mut last_block_proof = genesis_recursive_state_bytes();
     let mut seen_aggregates: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut per_peer_gossip_limits: HashMap<PeerId, (std::time::Instant, u32)> = HashMap::new();
     
@@ -244,9 +241,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // Recovery proof state
     if current_height > 0 {
-        if let Some(block) = ledger.lock().unwrap().get_block(current_height - 1) {
-            last_block_proof = block.header.aggregate_proof;
-        }
+        last_block_proof = ledger.lock().unwrap().last_recursive_state.clone();
     }
 
     println!("Aetheris Node Started. PeerId: {}", swarm.local_peer_id());
@@ -444,7 +439,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         timestamp: winner.timestamp,
                                         vdf_result: winner.vdf_result.clone(),
                                         vdf_proof: winner.vdf_proof.clone(),
-                                        aggregate_proof: winner.aggregate_proof.clone(),
                                         height: winner.height,
                                         difficulty: winner.difficulty,
                                         recursive_proof: vec![],
@@ -455,9 +449,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      if let Err(e) = ledger_lock.apply_block(block.clone()) {
                                          println!("❌ Failed to apply block #{}: {}", winner.height, e);
                                      } else {
-                                          println!("✅ Ledger updated to height {} via Mathematical Arbitration (Txs: {})", ledger_lock.height, block.transactions.len());
-                                          last_block_proof = block.header.aggregate_proof.clone();
-                                          parent_hash = ledger_lock.last_block_hash;
+                                           println!("✅ Ledger updated to height {} via Mathematical Arbitration (Txs: {})", ledger_lock.height, block.transactions.len());
+                                           parent_hash = ledger_lock.last_block_hash;
                                           arbitrator.set_prev_hash(parent_hash); // Update entropy for next round
                                          current_height = ledger_lock.height;
                                          
@@ -608,7 +601,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                       }
                                   }
                                   // Sync the local accumulator variable to avoid stale chaining
-                                  last_block_proof = ledger_lock.last_aggregate_proof.clone();
+                                   last_block_proof = ledger_lock.last_recursive_state.clone();
                               }
                               P2PMessage::Transaction(tx) => {
                                 println!("💸 Received Transaction from P2P network");
@@ -687,7 +680,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             timestamp,
                             vdf_result: vdf_result.clone(),
                             vdf_proof: vdf_proof.clone(),
-                            aggregate_proof: aggregate_proof.clone(),
                             height: current_height,
                             difficulty: current_difficulty,
                             recursive_proof: vec![],
@@ -702,7 +694,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         transactions: txs,
                         vdf_result,
                         vdf_proof,
-                        aggregate_proof,
                         sender: swarm.local_peer_id().to_string(),
                         difficulty: current_difficulty,
                         state_root,

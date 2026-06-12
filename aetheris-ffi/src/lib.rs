@@ -6,7 +6,7 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use aetheris_zkp::{ZKProofSystem, ZkProverSystem};
-use aetheris_recursive::{accumulate_proof, empty_accumulator};
+use aetheris_recursive::accumulate_proof;
 use bip39::{Mnemonic};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, AeadCore};
 use aes_gcm::aead::{Aead, OsRng};
@@ -186,7 +186,6 @@ fn create_genesis_block() -> aetheris_core::Block {
             timestamp: genesis_timestamp,
             vdf_result: vec![0u8; 32],
             vdf_proof: vec![0u8; 32],
-            aggregate_proof: empty_accumulator(),
             height: 0,
             difficulty: aetheris_core::VDF_DIFFICULTY,
             recursive_proof: vec![],
@@ -500,7 +499,6 @@ pub extern "C" fn aetheris_start_node(port: u16, db_path: *const c_char) -> i32 
                                                                     timestamp: chrono::Utc::now().timestamp() as u64,
                                                                     vdf_result: winner.vdf_result,
                                                                     vdf_proof: winner.vdf_proof,
-                                                                    aggregate_proof: winner.aggregate_proof,
                                                                     height: winner.height,
                                                                     difficulty: winner.difficulty,
                                                                     recursive_proof: vec![],
@@ -1592,8 +1590,6 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
     // Reward tx is a coinbase (public_amount > 0) and is NOT folded into
     // the IPA accumulator chain (consensus-validated). The new accumulator
     // state equals the parent's — identity fold over an empty set.
-    let aggregate_proof = ledger.last_aggregate_proof.clone();
-
     let block = aetheris_core::Block {
         header: aetheris_core::BlockHeader {
             parent_hash: ledger.last_block_hash,
@@ -1601,7 +1597,6 @@ pub extern "C" fn aetheris_submit_vdf_proof(result_hex: *const c_char, proof_hex
             timestamp: chrono::Utc::now().timestamp() as u64,
             vdf_result: result_bytes.clone(),
             vdf_proof: proof_bytes,
-            aggregate_proof,
             height: ledger.height,
             difficulty: current_difficulty,
             recursive_proof: vec![],
@@ -1669,7 +1664,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             // fix: read what we need under the lock, drop it, do all
             // computation off-lock, then re-acquire the lock to apply on
             // the canonical instance with a race-guard height re-check.
-            let (last_hash, current_height, current_difficulty, state_root, last_aggregate_proof) = {
+            let (last_hash, current_height, current_difficulty, state_root, last_recursive_state) = {
                 let state = STATE.lock().unwrap();
                 let ledger = state.ledger.as_ref().expect("LedgerState not initialized before mining");
                 (
@@ -1679,7 +1674,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                         .map(|d| String::from_utf8(d.to_vec()).unwrap().parse().unwrap_or(aetheris_core::VDF_DIFFICULTY))
                         .unwrap_or(aetheris_core::VDF_DIFFICULTY),
                     ledger.get_state_root(),
-                    ledger.last_aggregate_proof.clone(),
+                    ledger.last_recursive_state.clone(),
                 )
             };  // STATE lock released here — VDF / mempool drain / accumulator fold run off-lock
 
@@ -1702,7 +1697,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
 
             // 4. Build the IPA accumulator chain (off-lock; no state.ledger needed).
             //    Coinbase txs (public_amount > 0) are consensus-validated and NOT folded.
-            let mut acc = last_aggregate_proof;
+            let mut acc = last_recursive_state;
             let mut aggregation_failed = false;
             for tx in &core_txs {
                 if tx.is_coinbase() {
@@ -1727,7 +1722,7 @@ pub extern "C" fn aetheris_start_mining() -> bool {
             if aggregation_failed {
                 continue;
             }
-            let aggregate_proof = acc;
+            let _aggregate_proof = acc;
 
             // Compute block_hash from canonical block struct
             let temp_block = aetheris_core::Block {
@@ -1737,7 +1732,6 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     vdf_result: result.clone(),
                     vdf_proof: vdf_proof.clone(),
-                    aggregate_proof: aggregate_proof.clone(),
                     height: current_height,
                     difficulty: current_difficulty,
                     recursive_proof: vec![],
@@ -1752,7 +1746,6 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                 transactions: core_txs.clone(),
                 vdf_result: result.clone(),
                 vdf_proof: vdf_proof.clone(),
-                aggregate_proof: aggregate_proof.clone(),
                 sender: "LocalMiner".to_string(),
                 difficulty: current_difficulty,
                 state_root,
@@ -1790,7 +1783,6 @@ pub extern "C" fn aetheris_start_mining() -> bool {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     vdf_result: result,
                     vdf_proof,
-                    aggregate_proof,
                     height: current_height,
                     difficulty: current_difficulty,
                     recursive_proof: vec![],

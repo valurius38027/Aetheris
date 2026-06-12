@@ -9,7 +9,6 @@ pub struct BlockProposal {
     pub transactions: Vec<Transaction>,
     pub vdf_result: Vec<u8>,
     pub vdf_proof: Vec<u8>,
-    pub aggregate_proof: Vec<u8>,
     pub sender: String, // PeerId string
     pub difficulty: u64,
     pub state_root: Hash,

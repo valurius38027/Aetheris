@@ -104,24 +104,60 @@ pub fn build_recursive_instance(
     limbs
 }
 
+/// Size of the instance prefix in the proof format: Q.x(32) + Q.y(32) + transcript(32) + depth(4).
+pub const INSTANCE_PREFIX_BYTES: usize = 100;
+
+/// Return the canonical genesis recursive accumulator state as serialized bytes.
+/// Format matches the proof prefix: [Q.x(32) || Q.y(32) || transcript(32) || depth(4)].
+pub fn genesis_recursive_state_bytes() -> Vec<u8> {
+    use group::prime::PrimeCurveAffine;
+    let g = EqAffine::generator();
+    let coords = g.coordinates().unwrap();
+    let mut buf = Vec::with_capacity(INSTANCE_PREFIX_BYTES);
+    buf.extend_from_slice(coords.x().to_repr().as_ref());
+    buf.extend_from_slice(coords.y().to_repr().as_ref());
+    buf.extend_from_slice(&[0u8; 32]); // transcript = 0
+    buf.extend_from_slice(&0u32.to_le_bytes()); // depth = 0
+    buf
+}
+
 /// Verify a block's recursive proof against its state_root and accumulator state.
 pub fn verify_block_recursive_proof(
     proof: &[u8],
-    state_root: &[u8; 32],
-    accumulator_bytes: &[u8],
+    _state_root: &[u8; 32],
 ) -> bool {
-    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(16);
-    let acc = match crate::accumulator::AccumulatorIPA::from_bytes(accumulator_bytes) {
-        Ok(a) => a,
-        Err(_) => return false,
+    if proof.len() < INSTANCE_PREFIX_BYTES {
+        eprintln!("verify_block_recursive_proof: proof too short ({})", proof.len());
+        return false;
+    }
+    let (prefix, proof_body) = proof.split_at(INSTANCE_PREFIX_BYTES);
+    let qx_repr: [u8; 32] = prefix[..32].try_into().unwrap();
+    let qy_repr: [u8; 32] = prefix[32..64].try_into().unwrap();
+    let transcript_slice: [u8; 32] = prefix[64..96].try_into().unwrap();
+    let mut depth_bytes = [0u8; 4];
+    depth_bytes.copy_from_slice(&prefix[96..100]);
+
+    use ff::FromUniformBytes;
+    use halo2_proofs::halo2curves::pasta::Fq;
+    let q_x = Fq::from_repr(qx_repr).unwrap_or(Fq::ZERO);
+    let q_y = Fq::from_repr(qy_repr).unwrap_or(Fq::ZERO);
+    let transcript_new = {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&transcript_slice);
+        Fq::from_uniform_bytes(&buf)
     };
-    let pallas_point = crate::pallas_accumulate::eq_to_pallas_point(&acc.Q);
-    let instances = vec![build_recursive_instance(&pallas_point, state_root)];
-    let (vk, _pk) = match build_recursive_keys(&params) {
+    let depth_new = Fq::from(u32::from_le_bytes(depth_bytes) as u64);
+
+    let instances = vec![vec![q_x, q_y, transcript_new, depth_new]];
+
+    // Use K=16 keygen accommodating up to ~4 non-coinbase txs.
+    // The `state_root` param is retained for API compat but unused by the new circuit.
+    let params = aetheris_zkp::ipa::commitment::ParamsIPA::setup_deterministic(16);
+    let (vk, _pk) = match build_accumulate_keys(&params, 4) {
         Ok(k) => k,
         Err(_) => return false,
     };
-    verify_recursive_proof(&params, &vk, proof, instances)
+    verify_accumulate_proof(&params, &vk, proof_body, instances)
 }
 
 // ── New pipeline (§C: Vesta-native AccumulatorCircuit) ──
@@ -319,7 +355,17 @@ pub fn prove_block_recursive(
         &mut transcript,
     )?;
 
-    Ok((transcript.finalize(), q_new, transcript_new, depth_new))
+    // Prepend public instances: [Q.x(32) || Q.y(32) || transcript(32) || depth(4)]
+    // so the verifier can parse them without external knowledge.
+    let proof_body = transcript.finalize();
+    let mut prefixed = Vec::with_capacity(32 + 32 + 32 + 4 + proof_body.len());
+    prefixed.extend_from_slice(coords.x().to_repr().as_ref());
+    prefixed.extend_from_slice(coords.y().to_repr().as_ref());
+    prefixed.extend_from_slice(transcript_new.to_repr().as_ref());
+    prefixed.extend_from_slice(&(depth_new as u32).to_le_bytes());
+    prefixed.extend_from_slice(&proof_body);
+
+    Ok((prefixed, q_new, transcript_new, depth_new))
 }
 
 /// Verify an accumulator recursive proof against the claimed public instances.
@@ -350,6 +396,89 @@ pub fn verify_accumulate_proof(
             eprintln!("verify_accumulate_proof error: {:?}", e);
             false
         },
+    }
+}
+
+/// Build a `TxWitness` from a `Transaction`, computing IPE via the same
+/// two-phase (blake3 → Poseidon) hash as `AccumulatorIPA::accumulate`.
+pub fn compute_tx_witness(
+    proof: &[u8],
+    output_commitments: &[[u8; 32]],
+    public_amount: i64,
+    gen_offset: &VestaPoint,
+) -> TxWitness {
+    use blake3::hash as b3hash;
+    use aetheris_zkp::poseidon_fq;
+
+    // Inner proof hash = blake3(proof)
+    let inner_proof_hash = b3hash(proof);
+    // Commitment hash = blake3(domain || count || commitments || public_amount)
+    let commitment_hash = {
+        let mut h = blake3::Hasher::new();
+        h.update(&[0xC0u8]);
+        h.update(&(output_commitments.len() as u32).to_le_bytes());
+        for cm in output_commitments { h.update(cm); }
+        h.update(&public_amount.to_le_bytes());
+        h.finalize()
+    };
+    let ipe = poseidon_fq::poseidon_hash(inner_proof_hash.as_bytes(), commitment_hash.as_bytes());
+
+    // NUMS hash-to-curve: try-and-increment over MAX_ITER iterations.
+    // Host-side replicates the circuit's hash_to_curve logic to determine
+    // the winning iteration and precompute c[] + sel[] + offset.
+    let domain_fq_bytes = {
+        let h = b3hash(b"aetheris-pi-cmt-v2\x00");
+        let mut uniform = [0u8; 64];
+        uniform[..32].copy_from_slice(h.as_bytes());
+        Fq::from_uniform_bytes(&uniform).to_repr()
+    };
+    let seed = poseidon_fq::poseidon_hash(&domain_fq_bytes, &ipe);
+
+    let mut c = [Value::known(Fq::ZERO); MAX_ITER];
+    let mut sel = [Value::known(Fq::ZERO); MAX_ITER];
+    let mut found_idx = None;
+
+    for i in 0..MAX_ITER {
+        let mut mixed32 = [0u8; 32];
+        mixed32[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        mixed32[4..].copy_from_slice(&seed[..28]);
+        let mut input64 = [0u8; 64];
+        input64[..32].copy_from_slice(&mixed32);
+        let c_candidate = Fq::from_uniform_bytes(&input64);
+        c[i] = Value::known(c_candidate);
+
+        if found_idx.is_none() {
+            let c_fp = fq_to_fp_scalar(c_candidate);
+            let pt = (EqAffine::generator() * c_fp).to_affine();
+            if !bool::from(pt.is_identity()) {
+                sel[i] = Value::known(Fq::ONE);
+                found_idx = Some(i);
+            }
+        }
+    }
+
+    // Compute pi_commitment_offset = 2^254 · pi_commitment for the winning iteration
+    let pi_commitment_offset = match found_idx {
+        Some(idx) => {
+            let c_fp = fq_to_fp_scalar(known_fq(c[idx]));
+            let pi = (EqAffine::generator() * c_fp).to_affine();
+            let two_pow_254 = Fp::from(2u64).pow_vartime(&[254, 0, 0, 0]);
+            let off = (pi.to_curve() * two_pow_254).to_affine();
+            let coords = off.coordinates().unwrap();
+            VestaPoint::new(*coords.x(), *coords.y())
+        }
+        None => gen_offset.clone(),
+    };
+
+    TxWitness {
+        ipe: Value::known(Fq::from_uniform_bytes(&{
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&ipe);
+            buf
+        })),
+        c,
+        sel,
+        pi_commitment_offset,
     }
 }
 

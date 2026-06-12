@@ -1,18 +1,30 @@
 use aetheris_core::{Block, ShieldedOutput, DIFFICULTY_ADJUSTMENT_INTERVAL, VDF_DIFFICULTY, TARGET_BLOCK_TIME, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
 use aetheris_zkp::build_merkle_root;
-use aetheris_recursive::{empty_accumulator, verify_accumulator_chain, verify_block_recursive_proof};
+use aetheris_recursive::{verify_block_recursive_proof, genesis_recursive_state_bytes, INSTANCE_PREFIX_BYTES};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use sled::Db;
 use serde::{Serialize, Deserialize};
 
+/// Serialized recursive accumulator state (same as INSTANCE_PREFIX_BYTES).
+pub const RECURSIVE_STATE_BYTES: usize = INSTANCE_PREFIX_BYTES;
+
+/// Extract the recursive accumulator state from a proof that uses the
+/// instance-prefix format: [Q.x(32) || Q.y(32) || transcript(32) || depth(4) || halo2_proof].
+fn recursive_state_from_proof(proof: &[u8]) -> Option<Vec<u8>> {
+    if proof.len() < RECURSIVE_STATE_BYTES {
+        return None;
+    }
+    Some(proof[..RECURSIVE_STATE_BYTES].to_vec())
+}
+
 #[derive(Serialize, Deserialize)]
 struct StateSnapshot {
     height: u64,
     last_block_hash: [u8; 32],
-    last_aggregate_proof: Vec<u8>,
+    last_recursive_state: Vec<u8>,
     nullifiers: Vec<[u8; 32]>,
     commitments: Vec<[u8; 32]>,
     all_outputs: Vec<ShieldedOutput>,
@@ -20,7 +32,7 @@ struct StateSnapshot {
     timestamps: Vec<u64>,
 }
 
-const SNAPSHOT_KEY: &[u8] = b"state_snapshot_v1";
+const SNAPSHOT_KEY: &[u8] = b"state_snapshot_v2";
 
 pub struct LedgerState {
     pub nullifiers: HashSet<[u8; 32]>,
@@ -29,14 +41,12 @@ pub struct LedgerState {
     pub db: Db,
     pub height: u64,
     pub last_block_hash: [u8; 32],
-    pub last_aggregate_proof: Vec<u8>,
+    pub last_recursive_state: Vec<u8>,
     pub current_difficulty: u64,
     pub timestamps: Vec<u64>,
-    /// Aggregator's ed25519 verifying key for O(1) signed-accumulator checks.
-    /// `None` = fall back to O(n) proof replay.
+    /// Aggregator's ed25519 verifying key (SIP-1 signed accumulator fallback).
     pub aggregator_pk: Option<VerifyingKey>,
     /// Halo2 recursive proof verification key (serialized bytes).
-    /// `None` = fall back to accumulator chain replay.
     pub recursive_vk_bytes: Option<Vec<u8>>,
 }
 
@@ -54,7 +64,7 @@ impl LedgerState {
             db,
             height: 0,
             last_block_hash: [0u8; 32],
-            last_aggregate_proof: empty_accumulator(),
+            last_recursive_state: genesis_recursive_state_bytes(),
             current_difficulty: VDF_DIFFICULTY,
             timestamps: Vec::new(),
             aggregator_pk: None,
@@ -75,7 +85,7 @@ impl LedgerState {
             self.commitments.clear();
             self.all_outputs.clear();
             self.last_block_hash = [0u8; 32];
-            self.last_aggregate_proof = empty_accumulator();
+            self.last_recursive_state = genesis_recursive_state_bytes();
             self.current_difficulty = VDF_DIFFICULTY;
             self.timestamps.clear();
             self.height = 0;
@@ -107,7 +117,6 @@ impl LedgerState {
                         let mut hasher = blake3::Hasher::new();
                         hasher.update(&block_bytes);
                         self.last_block_hash = hasher.finalize().into();
-                        self.last_aggregate_proof = block.header.aggregate_proof.clone();
                         self.timestamps.push(block.header.timestamp);
 
                         // Recompute difficulty at each adjustment interval
@@ -167,20 +176,16 @@ impl LedgerState {
             self.height = target_height;
             self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
 
-            // Update last_block_hash and last_aggregate_proof from previous block
+            // Update last_block_hash from previous block
         if self.height > 0 {
                 let prev_height = self.height - 1;
                 if let Ok(Some(prev_block_bytes)) = self.db.get(format!("block_{}", prev_height).as_bytes()) {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update(&prev_block_bytes);
                     self.last_block_hash = hasher.finalize().into();
-                    if let Ok(prev_block) = bincode::deserialize::<Block>(&prev_block_bytes) {
-                        self.last_aggregate_proof = prev_block.header.aggregate_proof.clone();
-                    }
                 }
             } else {
                 self.last_block_hash = [0u8; 32];
-                self.last_aggregate_proof = empty_accumulator();
             }
 
             self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
@@ -197,7 +202,7 @@ impl LedgerState {
         let snapshot = StateSnapshot {
             height: self.height,
             last_block_hash: self.last_block_hash,
-            last_aggregate_proof: self.last_aggregate_proof.clone(),
+            last_recursive_state: self.last_recursive_state.clone(),
             nullifiers: self.nullifiers.iter().copied().collect(),
             commitments: self.commitments.iter().copied().collect(),
             all_outputs: self.all_outputs.clone(),
@@ -221,7 +226,7 @@ impl LedgerState {
         };
         self.height = snapshot.height;
         self.last_block_hash = snapshot.last_block_hash;
-        self.last_aggregate_proof = snapshot.last_aggregate_proof;
+        self.last_recursive_state = snapshot.last_recursive_state;
         self.nullifiers = snapshot.nullifiers.into_iter().collect();
         self.commitments = snapshot.commitments.into_iter().collect();
         self.all_outputs = snapshot.all_outputs;
@@ -352,52 +357,10 @@ impl LedgerState {
             }
         }
 
-        // Verify Aggregate ZK Proof (skip coinbase tx — validated by consensus, not ZK)
-        // Non-coinbase txs (those with `public_amount <= 0` in the consensus
-        // accounting layer) are folded into the IPA accumulator chain at the
-        // prover side (aetheris-ffi/src/lib.rs accumulate_proof loop). The
-        // accumulator is replayed from the parent's state and compared to the
-        // claimed state stored in the block header. Coinbase issuance is
-        // enforced separately by `validate_issuance_rules` below — it carries
-        // no ZK proof because it is consensus-minted.
-        //
-        // Note: `circuit_public_amount` returns the per-tx circuit public
-        // input (signed: positive for coinbase, negative/zero for shielded
-        // transfers). Coinbase txs (public_amount > 0) are filtered out of
-        // the accumulator chain here.
-        let tx_proofs: Vec<Vec<u8>> = block.transactions.iter()
-            .filter(|tx| tx.public_amount <= 0)
-            .map(|tx| tx.proof.clone())
-            .collect();
-        let tx_commitments: Vec<Vec<[u8; 32]>> = block.transactions.iter()
-            .filter(|tx| tx.public_amount <= 0)
-            .map(|tx| tx.outputs.iter().map(|o| o.commitment).collect())
-            .collect();
-        let public_amounts: Vec<i64> = block.transactions.iter()
-            .filter(|tx| tx.public_amount <= 0)
-            .map(|tx| tx.circuit_public_amount())
-            .collect();
-        if tx_proofs.is_empty() {
-            if block.header.aggregate_proof != self.last_aggregate_proof {
-                return Err(format!(
-                    "Empty-block accumulator mismatch at #{}: claimed != parent",
-                    block.header.height
-                ));
-            }
-        } else if !verify_accumulator_chain(
-            &block.header.aggregate_proof,
-            &self.last_aggregate_proof,
-            &tx_proofs,
-            &tx_commitments,
-            &public_amounts,
-            self.aggregator_pk.as_ref(),
-        ) {
-            return Err(format!("Aggregate ZK Proof verification failed for block #{}", block.header.height));
-        }
-
-        // S5-b: Verify recursive proof if present (empty = trusted fallback)
+        // §D.2+§D.3: O(1) recursive SNARK verification (replaces O(n) accumulator chain).
+        // Empty `recursive_proof` = trusted fallback (transitional: mining not yet wired).
         if !block.header.recursive_proof.is_empty() {
-            if !verify_block_recursive_proof(&block.header.recursive_proof, &block.header.state_root, &block.header.aggregate_proof) {
+            if !verify_block_recursive_proof(&block.header.recursive_proof, &block.header.state_root) {
                 return Err(format!("Recursive proof verification failed for block #{}", block.header.height));
             }
         }
@@ -443,8 +406,14 @@ impl LedgerState {
         // 5. Update Metadata & Difficulty Retargeting
         self.timestamps.push(block.header.timestamp);
         self.last_block_hash = blake3::hash(&data).into();
-        self.last_aggregate_proof = block.header.aggregate_proof.clone();
         self.height = block.header.height + 1;
+
+        // If block carries a recursive proof, extract the new state from it
+        if !block.header.recursive_proof.is_empty() {
+            if let Some(state_bytes) = recursive_state_from_proof(&block.header.recursive_proof) {
+                self.last_recursive_state = state_bytes;
+            }
+        }
 
         // V-1: Retarget difficulty every DIFFICULTY_ADJUSTMENT_INTERVAL blocks
         if self.height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && self.timestamps.len() >= 2 {
@@ -561,7 +530,6 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -574,7 +542,7 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof = empty_accumulator();
+        state.last_recursive_state = genesis_recursive_state_bytes();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         let vdf = aetheris_crypto::VDF::new(100);
@@ -601,7 +569,6 @@ mod tests {
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
-                aggregate_proof: empty_accumulator(),
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -628,7 +595,6 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -641,7 +607,7 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof = empty_accumulator();
+        state.last_recursive_state = genesis_recursive_state_bytes();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Pre-insert the spent nullifier
@@ -665,12 +631,6 @@ mod tests {
             proof,
         };
 
-        // Pre-compute the correct accumulator: empty parent + 1 proof
-        let commitments: Vec<[u8; 32]> = vec![];
-        let correct_acc = aetheris_recursive::AccumulatorIPA::new()
-            .accumulate(&tx.proof, &commitments, tx.circuit_public_amount())
-            .expect("accumulate must succeed");
-
         let state_root = state.get_state_root();
         let block = Block {
             header: BlockHeader {
@@ -679,7 +639,6 @@ mod tests {
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
-                aggregate_proof: correct_acc.to_bytes(),
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -726,7 +685,6 @@ mod tests {
                 timestamp: 999_999_999_999, // far future — passes monotonic check
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -734,7 +692,7 @@ mod tests {
             transactions: vec![tx],
         };
 
-        // We can't easily pass VDF/aggregate validation with dummy proofs,
+        // We can't easily pass VDF validation with dummy proofs,
         // but we CAN verify the nullifier check code path exists by testing
         // the insert logic in isolation:
         assert!(!state.nullifiers.insert(nf),
@@ -765,7 +723,6 @@ mod tests {
                 timestamp: prev_timestamp,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -783,7 +740,6 @@ mod tests {
                 timestamp: 1001, // Only 1s elapsed since block 0
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: vec![],
                 height: 1,
                 difficulty: 10_000_000, 
                 recursive_proof: vec![],
@@ -816,7 +772,7 @@ mod tests {
         println!("Created LedgerState with height: {}", state.height);
         assert_eq!(state.height, 0);
         assert_eq!(state.last_block_hash, [0u8; 32]);
-        assert_eq!(state.last_aggregate_proof, empty_accumulator());
+        assert_eq!(state.last_recursive_state, genesis_recursive_state_bytes());
         assert!(state.nullifiers.is_empty());
         assert!(state.commitments.is_empty());
         assert!(state.all_outputs.is_empty());
@@ -836,7 +792,6 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -850,15 +805,12 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof = empty_accumulator();
+        state.last_recursive_state = genesis_recursive_state_bytes();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
-        // Solve VDF and create aggregate proof for the new block
+        // Solve VDF for the new block
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
-        // No transactions in this test, so the new accumulator is just
-        // the parent's accumulator (identity fold over an empty set).
-        let agg_proof = state.last_aggregate_proof.clone();
 
         let state_root = state.get_state_root();
         let reward = calculate_block_reward_atoms(1);
@@ -879,7 +831,6 @@ mod tests {
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
-                aggregate_proof: agg_proof,
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -892,7 +843,7 @@ mod tests {
         assert!(result.is_ok(), "Block application failed: {:?}", result);
         assert_eq!(state.height, 2);
         assert_ne!(state.last_block_hash, [0u8; 32]);
-        assert!(state.last_aggregate_proof.starts_with(b"aetheris_accumulator_ipa_v2_"));
+        assert_eq!(state.last_recursive_state, genesis_recursive_state_bytes());
     }
 
     #[test]
@@ -909,7 +860,6 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -921,7 +871,7 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof = empty_accumulator();
+        state.last_recursive_state = genesis_recursive_state_bytes();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Apply a block to get to height 2
@@ -938,8 +888,6 @@ mod tests {
             public_amount: reward,
             proof: vec![],
         };
-        // No transactions, so the new accumulator is just the parent's.
-        let agg_proof = state.last_aggregate_proof.clone();
         let state_root = state.get_state_root();
         let block = Block {
             header: BlockHeader {
@@ -948,7 +896,6 @@ mod tests {
                 timestamp: 2000,
                 vdf_result,
                 vdf_proof,
-                aggregate_proof: agg_proof,
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -976,18 +923,15 @@ mod tests {
         let mut state = LedgerState::new_with_db(db.clone());
 
         // Manually set state fields (simulating applied state). Build a
-        // non-trivial 96-byte accumulator wire format (28B prefix + 32B
-        // identity Q + 32B transcript + 4B depth=7) that round-trips
-        // through `AccumulatorIPA::from_bytes`. We avoid folding an
-        // actual proof here because the snapshot test is about byte-level
+        // non-trivial 100-byte recursive state that round-trips through
+        // snapshot serialization. The snapshot test is about byte-level
         // persistence, not chain semantics.
-        let mut acc_bytes = empty_accumulator();
-        let len = acc_bytes.len();
-        // depth is the last 4 bytes of the 96-byte wire format
-        acc_bytes[len - 4..len].copy_from_slice(&7u32.to_le_bytes());
+        let mut state_bytes = genesis_recursive_state_bytes();
+        // Flip a byte to make it non-trivial for the round-trip test
+        state_bytes[0] ^= 0xFF;
         state.height = 5;
         state.last_block_hash = [0xAA; 32];
-        state.last_aggregate_proof = acc_bytes;
+        state.last_recursive_state = state_bytes;
         state.nullifiers.insert([1u8; 32]);
         state.commitments.insert([2u8; 32]);
         state.all_outputs.push(ShieldedOutput {
@@ -1008,7 +952,7 @@ mod tests {
         println!("Restored state height: {}", state2.height);
         assert_eq!(state2.height, 5);
         assert_eq!(state2.last_block_hash, [0xAA; 32]);
-        assert_eq!(state2.last_aggregate_proof, state.last_aggregate_proof);
+        assert_eq!(state2.last_recursive_state, state.last_recursive_state);
         assert!(state2.nullifiers.contains(&[1u8; 32]));
         assert!(state2.commitments.contains(&[2u8; 32]));
         assert_eq!(state2.all_outputs.len(), 1);
@@ -1029,7 +973,6 @@ mod tests {
                 timestamp: 1000,
                 vdf_result: vec![],
                 vdf_proof: vec![],
-                aggregate_proof: empty_accumulator(),
                 height: 0,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -1041,14 +984,12 @@ mod tests {
         state.height = 1;
         state.current_difficulty = 100;
         state.last_block_hash = [42u8; 32];
-        state.last_aggregate_proof = empty_accumulator();
+        state.last_recursive_state = genesis_recursive_state_bytes();
         db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
 
         // Apply block A (height 1) — canonical chain goes to height 2
         let vdf = aetheris_crypto::VDF::new(100);
         let (vdf_a, proof_a, _) = vdf.solve(&state.last_block_hash);
-        // No transactions, so the new accumulator is just the parent's.
-        let agg_a = state.last_aggregate_proof.clone();
         let reward = calculate_block_reward_atoms(1);
         let coinbase_tx = Transaction {
             inputs: vec![],
@@ -1068,7 +1009,6 @@ mod tests {
                 timestamp: 2000,
                 vdf_result: vdf_a,
                 vdf_proof: proof_a,
-                aggregate_proof: agg_a.clone(),
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],
@@ -1079,8 +1019,8 @@ mod tests {
         assert_eq!(state.height, 2);
 
         // Reorganize to a different block B at height 1 (different hash via different state_root)
-        // After rollback, last_block_hash will be hash of block_0, and last_aggregate_proof
-        // will be the value that was set when block A was applied (agg_a).
+        // After rollback, last_block_hash will be hash of block_0, and last_recursive_state
+        // will be the genesis value (since rollback_block does not modify it).
         let block_0_hash: [u8; 32] = {
             let data = bincode::serialize(&prev_block).unwrap();
             let mut hasher = blake3::Hasher::new();
@@ -1088,8 +1028,6 @@ mod tests {
             hasher.finalize().into()
         };
         let (vdf_b, proof_b, _) = vdf.solve(&block_0_hash);
-        // No transactions, so the new accumulator is just the parent's.
-        let agg_b = agg_a.clone();
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: block_0_hash,
@@ -1097,7 +1035,6 @@ mod tests {
                 timestamp: 3000,
                 vdf_result: vdf_b,
                 vdf_proof: proof_b,
-                aggregate_proof: agg_b,
                 height: 1,
                 difficulty: 100,
                 recursive_proof: vec![],

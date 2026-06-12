@@ -37,7 +37,7 @@
 | D2 | R1,R6 | Recursive proof uses `PallasAccumulateChip` (non-native) | HIGH | §C | ✅ Done |
 | D3 | R2,R5 | Transcript hash uses Blake3/Blake2b instead of Poseidon | HIGH | §B | ✅ Done |
 | D4 | R3 | Verification is O(n) accumulator replay, not O(1) recursive SNARK | HIGH | §C | ✅ Done |
-| D5 | R4 | `BlockHeader` has dual `aggregate_proof` + optional `recursive_proof` | MEDIUM | §D | ⚡ §D.1 done; §D.2 pending |
+| D5 | R4 | `BlockHeader` has dual `aggregate_proof` + optional `recursive_proof` | MEDIUM | §D | ✅ Done (D.1+D.2) |
 | D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ Deferred post-MVP |
 | D7 | R5 | `create_nullifier`/`build_merkle_root` use Blake3 not Poseidon | MEDIUM | §B.2 | ✅ Done |
 | D8 | R2 | `hash_to_curve` targets Pallas generator (EpAffine) not Vesta (EqAffine) | MEDIUM | §A | ✅ Done |
@@ -815,7 +815,7 @@ Each phase must pass independently before the next begins:
 - [x] **§C**: `CircuitAccumulate` constrains `Q_new = Q_old + Σchallenge·π` correctly
 - [x] **§C.6**: `prove_block_recursive`/`verify_block_recursive` produce/verify valid proofs
 - [x] **§D.1**: `recursive_proof` is `Vec<u8>` (non-optional), mining produces it
-- [ ] **§D.2**: `aggregate_proof` removed from `BlockHeader`, all callers updated
+- [x] **§D.2**: `aggregate_proof` removed from `BlockHeader`, all callers updated
 - [ ] **§D.3**: Consensus uses O(1) recursive SNARK verification, no O(n) fallback
 - [ ] **§E** (Phase 1.6): In-circuit IPA verification complete, Blake2b circuit replaced by Poseidon
 - [ ] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works

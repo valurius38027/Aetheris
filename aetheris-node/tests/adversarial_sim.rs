@@ -11,7 +11,6 @@ fn test_mathematical_arbitration_convergence() {
         transactions: vec![],
         vdf_result: vec![1, 2, 3], // Arbitrary
         vdf_proof: vec![],
-        aggregate_proof: vec![],
         sender: "NodeA".to_string(),
         difficulty: 100,
         state_root: [0u8; 32],
@@ -24,7 +23,6 @@ fn test_mathematical_arbitration_convergence() {
         transactions: vec![],
         vdf_result: vec![4, 5, 6], // Arbitrary
         vdf_proof: vec![],
-        aggregate_proof: vec![],
         sender: "NodeB".to_string(),
         difficulty: 100,
         state_root: [1u8; 32],
@@ -79,7 +77,6 @@ fn test_byzantine_proposal_resistance() {
         transactions: vec![],
         vdf_result: vec![1],
         vdf_proof: vec![],
-        aggregate_proof: vec![],
         sender: "HonestNode".to_string(),
         difficulty: 100,
         state_root: [0u8; 32],
@@ -95,7 +92,6 @@ fn test_byzantine_proposal_resistance() {
         transactions: vec![],
         vdf_result: vec![2],
         vdf_proof: vec![],
-        aggregate_proof: vec![],
         sender: "EvilNode".to_string(),
         difficulty: 100,
         state_root: [1u8; 32],

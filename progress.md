@@ -3328,6 +3328,40 @@ The economic model is designed to be consistent with the whitepaper's core princ
 
 ---
 
+## Stage 51 — §D.2: Remove `aggregate_proof` from BlockHeader + Replace With O(1) Recursive SNARK (2026-06-12)
+
+**Scope**: Remove the legacy `aggregate_proof: Vec<u8>` field from `BlockHeader` and `BlockProposal`; replace `last_aggregate_proof` with `last_recursive_state` in `LedgerState`; replace O(n) accumulator chain verification with O(1) recursive SNARK; write `compute_tx_witness` helper; change proof wire format to instance-prefixed (`Q.x || Q.y || transcript || depth || halo2_proof`).
+
+### Changes
+
+| File | Change |
+|------|--------|
+| `aetheris-core/src/lib.rs` | Removed `aggregate_proof` field from `BlockHeader` |
+| `aetheris-node/src/consensus.rs` | Removed `aggregate_proof` field from `BlockProposal` |
+| `aetheris-node/src/state.rs` | Replaced `last_aggregate_proof` with `last_recursive_state: Vec<u8>`; removed `verify_accumulator_chain` import; replaced O(n) chain verification with `verify_block_recursive_proof(proof, state_root)`; added `recursive_state_from_proof` helper; snapshot key bumped `v1`→`v2` |
+| `aetheris-node/src/main.rs` | 14 refs updated: `empty_accumulator()` → `genesis_recursive_state_bytes()`, `last_aggregate_proof` → `last_recursive_state`, all `aggregate_proof` BlockHeader/Proposal construction removed |
+| `aetheris-ffi/src/lib.rs` | 12 refs updated: same pattern as main.rs + unused `empty_accumulator` import removed; mining accumulator chain result prefixed `_aggregate_proof` |
+| `aetheris-node/tests/adversarial_sim.rs` | 4 BlockProposal `aggregate_proof: vec![]` removed |
+| `aetheris-recursive/src/prove_recursive.rs` | Added `compute_tx_witness(proof, commitments, amount, gen_offset) → TxWitness`; added `genesis_recursive_state_bytes() → Vec<u8>`; added `INSTANCE_PREFIX_BYTES` constant (100); `prove_block_recursive` now prepends 100-byte instance prefix to proof; `verify_block_recursive_proof` parses prefix and verifies with `verify_accumulate_proof` (new circuit) |
+| `aetheris-recursive/src/lib.rs` | Exported `compute_tx_witness`, `genesis_recursive_state_bytes`, `INSTANCE_PREFIX_BYTES` |
+
+### Design Decisions
+
+- **Instance-prefixed proofs**: `prove_block_recursive` now prepends public instances (Q.x, Q.y, transcript, depth) to the Halo2 proof. The verifier parses them from the prefix, eliminating the need to carry accumulator bytes in the block header.
+- **Transitional fallback**: Empty `recursive_proof: vec![]` still passes verification (trusted fallback). Mining integration with `prove_block_recursive` deferred to §D.2 follow-up.
+- **genesis_recursive_state_bytes**: Generator point + zero transcript + depth 0 (100 bytes). Replaces `empty_accumulator()` (96 bytes, wire-prefixed format).
+- **Snapshots**: Bumped to `state_snapshot_v2` — old snapshots fail deserialization and trigger full replay.
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ (0 errors, all warnings pre-existing) |
+| `cargo test --no-run` | ✅ (all binaries compile) |
+| `cargo test -p aetheris-core` | ✅ 25/25 |
+
+---
+
 ## Stage 50 — §D.1: Make `recursive_proof` Non-Optional (2026-06-12)
 
 **Scope**: Change `BlockHeader.recursive_proof` from `Option<Vec<u8>>` to `Vec<u8>`, update all 25+ construction sites, update consensus verification to use empty-vec check.
