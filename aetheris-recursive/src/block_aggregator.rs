@@ -169,9 +169,10 @@ pub fn verify_accumulator_chain(
 /// Convenience: return the canonical empty accumulator state bytes
 /// (genesis sentinel for the IPA accumulator chain).
 ///
+/// Returns the initial (genesis) IPA accumulator state.
 /// Equivalent to `AccumulatorIPA::new().to_bytes()` (96 bytes:
 /// 28B prefix + 32B identity Q + 32B genesis transcript + 4B depth=0).
-pub fn empty_accumulator() -> Vec<u8> {
+pub fn initial_accumulator() -> Vec<u8> {
     AccumulatorIPA::new().to_bytes()
 }
 
@@ -196,7 +197,7 @@ mod tests {
     /// set should return true (chain is identity, claimed == replayed).
     #[test]
     fn empty_chain_validates() {
-        let empty = empty_accumulator();
+        let empty = initial_accumulator();
         let ok = verify_accumulator_chain(&empty, &empty, &[], &[], &[], None);
         assert!(ok, "empty chain must self-validate");
     }
@@ -205,7 +206,7 @@ mod tests {
     /// false without panicking.
     #[test]
     fn mismatched_lengths_rejected() {
-        let empty = empty_accumulator();
+        let empty = initial_accumulator();
         let ok = verify_accumulator_chain(
             &empty,
             &empty,
@@ -221,7 +222,7 @@ mod tests {
     /// deserialize should return false.
     #[test]
     fn bad_wire_format_rejected() {
-        let empty = empty_accumulator();
+        let empty = initial_accumulator();
         let bad = b"not_an_accumulator_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let ok = verify_accumulator_chain(bad, &empty, &[], &[], &[], None);
         assert!(!ok);
@@ -231,7 +232,7 @@ mod tests {
     /// should return Err (not panic), even when called from FFI.
     #[test]
     fn accumulate_proof_bad_proof_returns_err() {
-        let empty = empty_accumulator();
+        let empty = initial_accumulator();
         let bad_proof = b"not_a_proof";
         let result = accumulate_proof(&empty, bad_proof, &[], 0);
         assert!(result.is_err());
@@ -266,7 +267,7 @@ mod tests {
     #[test]
     fn single_tx_chain_validates() {
         let (proof, commitments) = make_tx_proof(100, 1, 0);
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
 
         let claimed = accumulate_proof(&prev, &proof, &commitments, 0)
             .expect("single-tx accumulate must succeed");
@@ -283,7 +284,7 @@ mod tests {
         let (p2, c2) = make_tx_proof(75, 2, 0);
         let (p3, c3) = make_tx_proof(100, 3, 0);
 
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
         let acc1 = accumulate_proof(&prev, &p1, &c1, 0).expect("acc1");
         let acc2 = accumulate_proof(&acc1, &p2, &c2, 0).expect("acc2");
         let acc3 = accumulate_proof(&acc2, &p3, &c3, 0).expect("acc3");
@@ -300,7 +301,7 @@ mod tests {
     fn multi_block_chain_chains_across_blocks() {
         let (p1a, c1a) = make_tx_proof(40, 1, 0);
         let (p1b, c1b) = make_tx_proof(60, 2, 0);
-        let block1_prev = empty_accumulator();
+        let block1_prev = initial_accumulator();
         let block1_acc1 = accumulate_proof(&block1_prev, &p1a, &c1a, 0).expect("b1 acc1");
         let block1_claimed = accumulate_proof(&block1_acc1, &p1b, &c1b, 0).expect("b1 acc2");
 
@@ -349,7 +350,7 @@ mod tests {
     /// self-validate (no-op).
     #[test]
     fn empty_block_still_produces_valid_accumulator() {
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
         let ok = verify_accumulator_chain(&prev, &prev, &[], &[], &[], None);
         assert!(ok, "empty block must self-validate (no-op)");
     }
@@ -361,7 +362,7 @@ mod tests {
         let (mut proof, commitments) = make_tx_proof(100, 1, 0);
         let last = proof.len() - 1;
         proof[last] ^= 0xFF;
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
         let claimed_result = accumulate_proof(&prev, &proof, &commitments, 0);
         if let Ok(claimed) = claimed_result {
             let ok =
@@ -380,7 +381,7 @@ mod tests {
         let vk = sk.verifying_key();
 
         let (proof, commitments) = make_tx_proof(100, 1, 0);
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
 
         let claimed = signed_accumulate_proof(&prev, &proof, &commitments, 0, &sk)
             .expect("signed accumulate must succeed");
@@ -398,7 +399,7 @@ mod tests {
         let correct_vk = sk.verifying_key();
 
         let (proof, commitments) = make_tx_proof(100, 1, 0);
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
 
         let claimed = signed_accumulate_proof(&prev, &proof, &commitments, 0, &sk)
             .expect("signed accumulate");
@@ -436,7 +437,7 @@ mod tests {
         let vk = test_signing_key().verifying_key();
 
         let (proof, commitments) = make_tx_proof(100, 1, 0);
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
 
         let claimed =
             accumulate_proof(&prev, &proof, &commitments, 0).expect("unsigned accumulate");
@@ -455,7 +456,7 @@ mod tests {
         let vk = sk.verifying_key();
 
         let (proof, commitments) = make_tx_proof(100, 1, 0);
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
 
         let mut claimed = signed_accumulate_proof(&prev, &proof, &commitments, 0, &sk)
             .expect("signed accumulate");
@@ -503,7 +504,7 @@ mod tests {
         let (p2, c2) = make_tx_proof(75, 2, 0);
         let (p3, c3) = make_tx_proof(100, 3, 0);
 
-        let prev = empty_accumulator();
+        let prev = initial_accumulator();
         let acc1 = signed_accumulate_proof(&prev, &p1, &c1, 0, &sk).expect("acc1");
         let acc2 = signed_accumulate_proof(&acc1, &p2, &c2, 0, &sk).expect("acc2");
         let acc3 = signed_accumulate_proof(&acc2, &p3, &c3, 0, &sk).expect("acc3");

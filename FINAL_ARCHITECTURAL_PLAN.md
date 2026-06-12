@@ -42,7 +42,7 @@
 | D7 | R5 | `create_nullifier`/`build_merkle_root` use Blake3 not Poseidon | MEDIUM | §B.2 | ✅ Done |
 | D8 | R2 | `hash_to_curve` targets Pallas generator (EpAffine) not Vesta (EqAffine) | MEDIUM | §A | ✅ Done |
 | D9 | — | `RecursiveManagerHandle.verify_halo2_proof() -> bool { false }` (stub) | HIGH | §F | ✅ Done |
-| D10 | — | `empty_accumulator()` naming; deprecated trait methods; superseded docs | LOW | §G | ⏳ Pending |
+| D10 | — | `empty_accumulator()` naming; deprecated trait methods; superseded docs | LOW | §G | ✅ Done |
 
 ---
 
@@ -784,12 +784,12 @@ Update ~40 callers across:
 - `aetheris-node/src/main.rs` (line 228)
 - `aetheris-ffi/src/lib.rs` (line 9 import, line 189)
 
-### §G.2 — Remove Deprecated Trait Methods
+### §G.2 — Remove Deprecated Trait Methods ✅ Already Done
 
 File: `aetheris-zkp/src/trait_.rs`
 
-Remove `aggregate_proofs()` and `verify_aggregate()` from `ZkProverSystem` trait.
-No production callers remain (all use `AccumulatorStrategyIPA` or `verify_accumulator_chain`).
+`aggregate_proofs()` and `verify_aggregate()` were already removed from
+`ZkProverSystem`. No code or caller references remain. Verified via grep.
 
 ### §G.3 — Archive Superseded Documents
 
@@ -799,7 +799,7 @@ No production callers remain (all use `AccumulatorStrategyIPA` or `verify_accumu
 | `aetheris-recursive/phase_1_14_plan.md` | ✅ Already marked SUPERSEDED |
 | `mainnet_execution_plan.md §1.4` | ✅ Already marked SUPERSEDED |
 | `docs/in_circuit_ipa_verifier.md` | ✅ Already marked SUPERSEDED (since B-2) |
-| `ISSUE_IPA_PLONK_INTEGRATION.md` | Already marked outdated — add note: "Phase 1.11.5 fixed this" |
+| `ISSUE_IPA_PLONK_INTEGRATION.md` (root) | ✅ Annotated: "OUTDATED — Phase 1.11.5 resolved this" |
 | `PLAN_FIX_EXTENDED_DOMAIN.md` | Already marked OBSOLETE |
 
 ---
@@ -819,7 +819,7 @@ Each phase must pass independently before the next begins:
 - [ ] **§D.3**: Consensus uses O(1) recursive SNARK verification, no O(n) fallback
 - [ ] **§E** (Phase 1.6): In-circuit IPA verification complete, Blake2b circuit replaced by Poseidon
 - [x] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works
-- [ ] **§G**: Cleanup complete, all documents annotated, no dead code
+- [x] **§G**: Cleanup complete, all documents annotated, no dead code
 - [x] **Final**: `cargo check --workspace` clean, all applicable tests pass
 
 ---

@@ -78,7 +78,7 @@ pub mod block_aggregator;
 pub mod circuit_accumulate;
 pub use accumulator::INNER_PROOF_PREFIX;
 pub use block_aggregator::{
-    accumulate_proof, empty_accumulator, signed_accumulate_proof, verify_accumulator_chain,
+    accumulate_proof, initial_accumulator, signed_accumulate_proof, verify_accumulator_chain,
 };
 
 #[derive(Clone, Debug)]

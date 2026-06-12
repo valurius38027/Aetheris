@@ -1,5 +1,9 @@
 # Issue: IPA Commitment Scheme Fails in Plonk Multiopen Verification
 
+**⛔ OUTDATED — Phase 1.11.5 resolved this. The h_eval constraint at
+`vanishing/verifier.rs:142-144` is active and correct with `extended_k=13`.
+This document is retained for historical reference only.**
+
 **⚠️ CRITICAL: Phase 1.1.4 "transcript h_eval" fix MUST be removed — it is a
 soundness hole, not a fix. See below.**
 
