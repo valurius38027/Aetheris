@@ -73,6 +73,8 @@ pub mod accumulator;
 pub use accumulator::{AccumulatorError, AccumulatorIPA};
 
 pub mod block_aggregator;
+
+pub mod circuit_accumulate;
 pub use accumulator::INNER_PROOF_PREFIX;
 pub use block_aggregator::{
     accumulate_proof, empty_accumulator, signed_accumulate_proof, verify_accumulator_chain,
