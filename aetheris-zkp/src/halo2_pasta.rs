@@ -14,7 +14,7 @@ use halo2_proofs::{
         Blake2bWrite, Blake2bRead, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
     },
 };
-use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
+use halo2_proofs::halo2curves::pasta::{EpAffine, EqAffine, Fp, Fq};
 use std::sync::OnceLock;
 use std::fs;
 use rand::rngs::OsRng;
@@ -33,29 +33,37 @@ use crate::merkle_tree::IncrementalMerkleTree;
 
 const PROVING_K: u32 = 11;
 
-static CACHED_PARAMS: OnceLock<ParamsIPA<EpAffine>> = OnceLock::new();
+// ── Membership/legacy proof (Pallas IPA, EpAffine) ──
 pub(crate) type CachedKeyPair = (
     halo2_proofs::plonk::VerifyingKey<EpAffine>,
     halo2_proofs::plonk::ProvingKey<EpAffine>,
 );
-static KEY_CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), CachedKeyPair>>> =
-    OnceLock::new();
 
-pub(crate) fn ensure_params() -> &'static ParamsIPA<EpAffine> {
-    CACHED_PARAMS.get_or_init(|| {
+// ── Conservation proof (Vesta IPA, EqAffine) ──
+static CONSERVATION_PARAMS: OnceLock<ParamsIPA<EqAffine>> = OnceLock::new();
+type ConservationKeyPair = (
+    halo2_proofs::plonk::VerifyingKey<EqAffine>,
+    halo2_proofs::plonk::ProvingKey<EqAffine>,
+);
+static CONSERVATION_KEY_CACHE: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, usize), ConservationKeyPair>>,
+> = OnceLock::new();
+
+fn ensure_conservation_params() -> &'static ParamsIPA<EqAffine> {
+    CONSERVATION_PARAMS.get_or_init(|| {
         let crs_paths = ["aetheris-zkp/crs.bin", "crs.bin"];
         for path in &crs_paths {
             if let Ok(data) = fs::read(path) {
                 let mut cursor = std::io::Cursor::new(&data);
-                if let Ok(params) = ParamsIPA::<EpAffine>::read(&mut cursor) {
-                    eprintln!("[ZK] Loaded params from {} (k={})", path, params.k());
+                if let Ok(params) = ParamsIPA::<EqAffine>::read(&mut cursor) {
+                    eprintln!("[ZK] Loaded conservation params from {} (k={})", path, params.k());
                     return params;
                 }
             }
         }
         if cfg!(debug_assertions) {
             eprintln!("[ZK] WARNING: No params file found. Using deterministic IPA setup (DEV ONLY)");
-            return ParamsIPA::<EpAffine>::setup(
+            return ParamsIPA::<EqAffine>::setup(
                 PROVING_K,
                 &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"),
                 "value_conservation",
@@ -65,12 +73,13 @@ pub(crate) fn ensure_params() -> &'static ParamsIPA<EpAffine> {
     })
 }
 
-fn ensure_keys(
+fn ensure_conservation_keys(
     amounts_in_len: usize,
     amounts_out_len: usize,
-) -> (halo2_proofs::plonk::VerifyingKey<EpAffine>, halo2_proofs::plonk::ProvingKey<EpAffine>) {
-    let params = ensure_params();
-    let cache = KEY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+) -> ConservationKeyPair {
+    let params = ensure_conservation_params();
+    let cache = CONSERVATION_KEY_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (amounts_in_len, amounts_out_len);
     {
         let map = cache.lock().expect("key cache mutex poisoned");
@@ -78,14 +87,7 @@ fn ensure_keys(
             return (vk.clone(), pk.clone());
         }
     }
-    // Keygen circuit must satisfy net_value = total_in - total_out - public_amount = 0.
-    // We use amounts_in = [1; n_in] (sum = n_in). The amounts_out vector sums to n_in whenever
-    // n_out > 0; when n_out = 0, all input is "burned" into public_amount.
-    // The amount values don't affect the constraint (only their sums), so any distribution works
-    // as long as amounts_out sums to n_in. We fill at most n_in ones and pack the remainder
-    // into the last filled slot (or slot 0 if n_in == 0).
     let (amounts_out, public_amount): (Vec<u64>, i64) = if amounts_out_len == 0 {
-        // (n_in > 0, 0) case: burn all input as public_amount
         (vec![], amounts_in_len as i64)
     } else {
         let mut v = vec![0u64; amounts_out_len];
@@ -94,11 +96,8 @@ fn ensure_keys(
             v[i] = 1;
         }
         if amounts_in_len > fill {
-            // Pack remainder (n_in - fill) into the last filled slot.
-            // This is safe because fill >= 1 whenever amounts_in_len > fill > 0.
             v[fill - 1] += (amounts_in_len - fill) as u64;
         }
-        // Edge: n_in == 0 -> v stays all zeros, sum = 0 = n_in. ✓
         (v, 0)
     };
     let keygen_circuit = ValueConservationCircuit {
@@ -119,18 +118,38 @@ fn ensure_keys(
     result
 }
 
+// ── Membership params (EpAffine, Pallas IPA — separate cache) ──
+static MEMBERSHIP_PARAMS: OnceLock<ParamsIPA<EpAffine>> = OnceLock::new();
+
+/// Returns EpAffine (Pallas) params for membership/legacy circuits.
+/// Conservation proofs use `ensure_conservation_params()` (EqAffine).
+pub(crate) fn ensure_params() -> &'static ParamsIPA<EpAffine> {
+    ensure_membership_params()
+}
+
+fn ensure_membership_params() -> &'static ParamsIPA<EpAffine> {
+    MEMBERSHIP_PARAMS.get_or_init(|| {
+        if cfg!(debug_assertions) {
+            return ParamsIPA::<EpAffine>::setup(
+                PROVING_K,
+                &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"),
+                "membership",
+            );
+        }
+        panic!("[ZK] FATAL: No membership params. Run in debug mode for deterministic setup.");
+    })
+}
+
 #[cfg(test)]
 fn ensure_membership_keys(circuit: &MembershipCircuit) -> CachedKeyPair {
-    let params = ensure_params();
+    let params = ensure_membership_params();
     let vk = keygen_vk(params, circuit).expect("membership keygen_vk failed");
     let pk = keygen_pk(params, vk.clone(), circuit).expect("membership keygen_pk failed");
     (vk, pk)
 }
 
 fn ensure_membership_keys_for_depth(depth: usize) -> CachedKeyPair {
-    // After C-3 gate-based mux fix, VK is position_bits-independent.
-    // The dummy circuit (all-false bits) produces a VK valid for any position_bits.
-    let params = ensure_params();
+    let params = ensure_membership_params();
     let dummy = MembershipCircuit::dummy(depth);
     let vk = keygen_vk(params, &dummy).expect("membership keygen_vk failed");
     let pk = keygen_pk(params, vk.clone(), &dummy).expect("membership keygen_pk failed");
@@ -191,7 +210,7 @@ impl ValueConservationCircuit {
     }
 }
 
-impl Circuit<Fq> for ValueConservationCircuit {
+impl Circuit<Fp> for ValueConservationCircuit {
     type Config = ValueConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -199,7 +218,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
         Self::dummy()
     }
 
-    fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
+    fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
         let advice = [
             meta.advice_column(),
             meta.advice_column(),
@@ -221,13 +240,13 @@ impl Circuit<Fq> for ValueConservationCircuit {
             let z_prev = meta.query_advice(advice[0], Rotation(-1));
             let z_cur = meta.query_advice(advice[0], Rotation(0));
             let bit = meta.query_advice(advice[1], Rotation(0));
-            vec![s * (z_prev - Expression::Constant(Fq::from(2)) * z_cur - bit)]
+            vec![s * (z_prev - Expression::Constant(Fp::from(2)) * z_cur - bit)]
         });
 
         meta.create_gate("bit_constraint", |meta| {
             let s = meta.query_selector(s_running_sum);
             let b = meta.query_advice(advice[1], Rotation(0));
-            vec![s * b.clone() * (Expression::Constant(Fq::one()) - b)]
+            vec![s * b.clone() * (Expression::Constant(Fp::one()) - b)]
         });
 
         meta.create_gate("zero_check", |meta| {
@@ -254,7 +273,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
         }
     }
 
-    fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
+    fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fp>) -> Result<(), ErrorFront> {
         let all_amounts: Vec<u64> = self.amounts_in.iter()
             .chain(self.amounts_out.iter())
             .copied()
@@ -262,13 +281,13 @@ impl Circuit<Fq> for ValueConservationCircuit {
 
         layouter.assign_region(|| "value_conservation", |mut region| {
             let mut offset = 0;
-            let inv_2 = Fq::from(2).invert().unwrap();
+            let inv_2 = Fp::from(2).invert().unwrap();
 
             // ─── 64-bit range proof per amount ──────────────────────
             for &amount in &all_amounts {
-                let z_0 = Fq::from(amount);
+                let z_0 = Fp::from(amount);
                 region.assign_advice(|| "z_0", config.advice[0], offset, || Value::known(z_0))?;
-                region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fq::zero()))?;
+                region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fp::zero()))?;
 
                 let mut z_prev = z_0;
                 let mut remaining = amount;
@@ -277,11 +296,11 @@ impl Circuit<Fq> for ValueConservationCircuit {
                     config.s_running_sum.enable(&mut region, offset)?;
 
                     let bit_val = remaining & 1;
-                    let bit_fq = Fq::from(bit_val);
-                    let z_cur = (z_prev - bit_fq) * inv_2;
+                    let bit_fp = Fp::from(bit_val);
+                    let z_cur = (z_prev - bit_fp) * inv_2;
 
                     region.assign_advice(|| "z_cur", config.advice[0], offset, || Value::known(z_cur))?;
-                    region.assign_advice(|| "bit", config.advice[1], offset, || Value::known(bit_fq))?;
+                    region.assign_advice(|| "bit", config.advice[1], offset, || Value::known(bit_fp))?;
 
                     z_prev = z_cur;
                     remaining >>= 1;
@@ -290,7 +309,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
                 offset += 1;
                 config.s_zero_check.enable(&mut region, offset)?;
                 region.assign_advice(|| "z_64_zero", config.advice[0], offset, || Value::known(z_prev))?;
-                region.assign_advice(|| "zero", config.advice[2], offset, || Value::known(Fq::ZERO))?;
+                region.assign_advice(|| "zero", config.advice[2], offset, || Value::known(Fp::ZERO))?;
 
                 offset += 1; // gap / next z_0
             }
@@ -298,15 +317,15 @@ impl Circuit<Fq> for ValueConservationCircuit {
             // ─── Conservation running sum ───────────────────────────
             let n_in = self.amounts_in.len();
             offset += 1; // initial running_sum = 0 (no gate)
-            region.assign_advice(|| "run_sum_0", config.advice[2], offset, || Value::known(Fq::ZERO))?;
+            region.assign_advice(|| "run_sum_0", config.advice[2], offset, || Value::known(Fp::ZERO))?;
 
-            let mut running_sum = Fq::ZERO;
+            let mut running_sum = Fp::ZERO;
             for (i, &amount) in all_amounts.iter().enumerate() {
                 offset += 1;
-                let signed: Fq = if i < n_in {
-                    Fq::from(amount)
+                let signed: Fp = if i < n_in {
+                    Fp::from(amount)
                 } else {
-                    Fq::ZERO - Fq::from(amount)
+                    Fp::ZERO - Fp::from(amount)
                 };
                 running_sum = running_sum + signed;
                 region.assign_advice(|| "run_sum", config.advice[2], offset, || Value::known(running_sum))?;
@@ -321,7 +340,7 @@ impl Circuit<Fq> for ValueConservationCircuit {
             //   signed = 0 (at this row)
             // → public_amount = running_sum_last = sum_in - sum_out ✓
             offset += 1;
-            region.assign_advice(|| "zero_signed", config.advice[4], offset, || Value::known(Fq::ZERO))?;
+            region.assign_advice(|| "zero_signed", config.advice[4], offset, || Value::known(Fp::ZERO))?;
             region.assign_advice_from_instance(
                 || "pub_amt", config.instance, 0, config.advice[2], offset,
             )?;
@@ -356,19 +375,19 @@ pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 pub struct Halo2PastaBackend;
 
 impl ZkProverSystem for Halo2PastaBackend {
-    type Params = ParamsIPA<EpAffine>;
-    type ProvingKey = halo2_proofs::plonk::ProvingKey<EpAffine>;
-    type VerifyingKey = halo2_proofs::plonk::VerifyingKey<EpAffine>;
+    type Params = ParamsIPA<EqAffine>;
+    type ProvingKey = halo2_proofs::plonk::ProvingKey<EqAffine>;
+    type VerifyingKey = halo2_proofs::plonk::VerifyingKey<EqAffine>;
 
     fn ensure_params() -> &'static Self::Params {
-        ensure_params()
+        ensure_conservation_params()
     }
 
     fn ensure_keys(
         amounts_in_len: usize,
         amounts_out_len: usize,
     ) -> (Self::VerifyingKey, Self::ProvingKey) {
-        ensure_keys(amounts_in_len, amounts_out_len)
+        ensure_conservation_keys(amounts_in_len, amounts_out_len)
     }
 
     fn prove_conservation(
@@ -380,8 +399,8 @@ impl ZkProverSystem for Halo2PastaBackend {
         public_amount: i64,
     ) -> Vec<u8> {
         let (params, (_vk, pk)) = (
-            ensure_params(),
-            ensure_keys(amounts_in.len(), amounts_out.len()),
+            ensure_conservation_params(),
+            ensure_conservation_keys(amounts_in.len(), amounts_out.len()),
         );
 
         let padded_in_blindings: Vec<[u8; 32]> = if in_blindings.is_empty() {
@@ -409,25 +428,25 @@ impl ZkProverSystem for Halo2PastaBackend {
             public_amount,
         };
 
-        let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
-        let instance_fq = if public_amount >= 0 {
-            Fq::from(public_amount as u64)
+        let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
+        let instance_fp = if public_amount >= 0 {
+            Fp::from(public_amount as u64)
         } else {
-            Fq::ZERO - Fq::from(public_amount.unsigned_abs())
+            Fp::ZERO - Fp::from(public_amount.unsigned_abs())
         };
-        let mut instance_col = vec![instance_fq];
+        let mut instance_col = vec![instance_fp];
         for cm in output_commitments {
             instance_col.push(
-                Fq::from_repr(*cm).into_option()
-                    .expect("prove_conservation: invalid commitment bytes — must be canonical Fq repr")
+                Fp::from_repr(*cm).into_option()
+                    .expect("prove_conservation: invalid commitment bytes — must be canonical Fp repr")
             );
         }
         let instances = vec![instance_col];
-        create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
+        create_proof::<CommitmentSchemeIPA<EqAffine>, ProverIPA<'_, EqAffine>, _, _, _, _>(
             params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
         ).expect("prove_conservation failed");
         let proof = transcript.finalize();
-        let mut full = b"halo2_ipa_pasta_v1_".to_vec();
+        let mut full = b"halo2_ipa_vesta_v1_".to_vec();
         full.extend_from_slice(&(amounts_in.len() as u16).to_le_bytes());
         full.extend_from_slice(&(amounts_out.len() as u16).to_le_bytes());
         full.extend_from_slice(&proof);
@@ -439,7 +458,7 @@ impl ZkProverSystem for Halo2PastaBackend {
         output_commitments: &[[u8; 32]],
         public_amount: i64,
     ) -> bool {
-        const PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
+        const PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
         const PREFIX_LEN: usize = 19;
         const SHAPE_LEN: usize = 4;
         const MAX_PROOF_IOPS: usize = 30;
@@ -455,24 +474,24 @@ impl ZkProverSystem for Halo2PastaBackend {
         }
         let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
 
-        let (params, (vk, _)) = (ensure_params(), ensure_keys(in_len, out_len));
+        let (params, (vk, _)) = (ensure_conservation_params(), ensure_conservation_keys(in_len, out_len));
 
-        let instance_fq = if public_amount >= 0 {
-            Fq::from(public_amount as u64)
+        let instance_fp = if public_amount >= 0 {
+            Fp::from(public_amount as u64)
         } else {
-            Fq::ZERO - Fq::from(public_amount.unsigned_abs())
+            Fp::ZERO - Fp::from(public_amount.unsigned_abs())
         };
-        let mut instance_col = vec![instance_fq];
+        let mut instance_col = vec![instance_fp];
         for cm in output_commitments {
-            match Fq::from_repr(*cm).into_option() {
-                Some(fq) => instance_col.push(fq),
+            match Fp::from_repr(*cm).into_option() {
+                Some(fp) => instance_col.push(fp),
                 None => return false,
             }
         }
         let instances = vec![instance_col];
 
-        let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
-        match verify_proof_with_strategy::<CommitmentSchemeIPA<EpAffine>, _, Challenge255<EpAffine>, Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>, SingleStrategyIPA<'_, EpAffine>>(
+        let mut transcript = Blake2bRead::<_, EqAffine, Challenge255<_>>::init(inner_proof);
+        match verify_proof_with_strategy::<CommitmentSchemeIPA<EqAffine>, _, Challenge255<EqAffine>, Blake2bRead<&[u8], EqAffine, Challenge255<EqAffine>>, SingleStrategyIPA<'_, EqAffine>>(
             params, &vk, SingleStrategyIPA::new(params), &[instances], &mut transcript,
         ) {
             Ok(strategy) => strategy.finalize(),
@@ -574,8 +593,8 @@ impl Halo2PastaBackend {
         }
     }
 
-    pub fn setup_params() -> ParamsIPA<EpAffine> {
-        ParamsIPA::<EpAffine>::setup(
+    pub fn setup_params() -> ParamsIPA<EqAffine> {
+        ParamsIPA::<EqAffine>::setup(
             PROVING_K,
             &mut ChaCha20Rng::from_seed(*b"Aetheris IPA deterministic v0.00"),
             "value_conservation",
@@ -686,10 +705,10 @@ impl Halo2PastaBackend {
             return true;
         }
 
-        let params = ensure_params();
+        let params = ensure_conservation_params();
         let mut strategy = AccumulatorStrategyIPA::new(params);
 
-        const PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
+        const PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
         const PREFIX_LEN: usize = 19;
         const SHAPE_LEN: usize = 4;
         const MAX_PROOF_IOPS: usize = 30;
@@ -707,31 +726,31 @@ impl Halo2PastaBackend {
             }
             let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
 
-            let (vk, _) = ensure_keys(in_len, out_len);
+            let (vk, _) = ensure_conservation_keys(in_len, out_len);
 
             let public_amount = public_amounts[i];
             let output_commitments = outputs_list[i];
-            let instance_fq = if public_amount >= 0 {
-                Fq::from(public_amount as u64)
+            let instance_fp = if public_amount >= 0 {
+                Fp::from(public_amount as u64)
             } else {
-                Fq::ZERO - Fq::from(public_amount.unsigned_abs())
+                Fp::ZERO - Fp::from(public_amount.unsigned_abs())
             };
-            let mut instance_col = vec![instance_fq];
+            let mut instance_col = vec![instance_fp];
             for cm in output_commitments {
-                match Fq::from_repr(*cm).into_option() {
-                    Some(fq) => instance_col.push(fq),
+                match Fp::from_repr(*cm).into_option() {
+                    Some(fp) => instance_col.push(fp),
                     None => return false,
                 }
             }
             let instances = vec![instance_col];
 
-            let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
+            let mut transcript = Blake2bRead::<_, EqAffine, Challenge255<_>>::init(inner_proof);
             let result = verify_proof_with_strategy::<
-                CommitmentSchemeIPA<EpAffine>,
+                CommitmentSchemeIPA<EqAffine>,
                 _,
-                Challenge255<EpAffine>,
-                Blake2bRead<&[u8], EpAffine, Challenge255<EpAffine>>,
-                AccumulatorStrategyIPA<'_, EpAffine>,
+                Challenge255<EqAffine>,
+                Blake2bRead<&[u8], EqAffine, Challenge255<EqAffine>>,
+                AccumulatorStrategyIPA<'_, EqAffine>,
             >(
                 params, &vk, strategy, &[instances], &mut transcript,
             );
@@ -2043,20 +2062,20 @@ mod tests {
     #[test]
     fn test_keygen_unbalanced_2_0() {
         // (2 in, 0 out) shape: prove_conservation API requires at least 1 out,
-        // so this tests the keygen path directly via ensure_keys.
-        let (_vk, _pk) = ensure_keys(2, 0);
+        // so this tests the keygen path directly via ensure_conservation_keys.
+        let (_vk, _pk) = ensure_conservation_keys(2, 0);
     }
 
     /// Edge: n_in = 0, n_out = 1. amounts_out = [0] (degenerate 64-bit decomposes to zeros).
     #[test]
     fn test_keygen_unbalanced_0_1() {
-        let (_vk, _pk) = ensure_keys(0, 1);
+        let (_vk, _pk) = ensure_conservation_keys(0, 1);
     }
 
     /// Edge: n_in = 0, n_out = 0. Empty keygen, all-zero instance.
     #[test]
     fn test_keygen_unbalanced_0_0() {
-        let (_vk, _pk) = ensure_keys(0, 0);
+        let (_vk, _pk) = ensure_conservation_keys(0, 0);
     }
 
     #[test]
@@ -2151,25 +2170,25 @@ mod tests {
         use halo2_proofs::dev::MockProver;
 
         struct OverflowCircuit;
-        impl Circuit<Fq> for OverflowCircuit {
+        impl Circuit<Fp> for OverflowCircuit {
             type Config = ValueConfig;
             type FloorPlanner = SimpleFloorPlanner;
             fn without_witnesses(&self) -> Self { OverflowCircuit }
-            fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
-                <ValueConservationCircuit as Circuit<Fq>>::configure(meta)
+            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+                <ValueConservationCircuit as Circuit<Fp>>::configure(meta)
             }
-            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fq>) -> Result<(), ErrorFront> {
-                let large = Fq::from(u64::MAX) + Fq::one();
-                let inv_2 = Fq::from(2).invert().unwrap();
+            fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fp>) -> Result<(), ErrorFront> {
+                let large = Fp::from(u64::MAX) + Fp::one();
+                let inv_2 = Fp::from(2).invert().unwrap();
                 layouter.assign_region(|| "overflow_range", |mut region| {
                     let mut offset = 0;
                     region.assign_advice(|| "z_0_overflow", config.advice[0], offset, || Value::known(large))?;
-                    region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fq::zero()))?;
+                    region.assign_advice(|| "z_0_bit", config.advice[1], offset, || Value::known(Fp::zero()))?;
                     let mut z_prev = large;
                     for _ in 0..64 {
                         offset += 1;
                         config.s_running_sum.enable(&mut region, offset)?;
-                        let bit = Fq::zero();
+                        let bit = Fp::zero();
                         let z_cur = (z_prev - bit) * inv_2;
                         region.assign_advice(|| "z_cur", config.advice[0], offset, || Value::known(z_cur))?;
                         region.assign_advice(|| "bit", config.advice[1], offset, || Value::known(bit))?;
@@ -2178,7 +2197,7 @@ mod tests {
                     offset += 1;
                     config.s_zero_check.enable(&mut region, offset)?;
                     region.assign_advice(|| "z_64_overflow", config.advice[0], offset, || Value::known(z_prev))?;
-                    region.assign_advice(|| "zero_ref", config.advice[2], offset, || Value::known(Fq::ZERO))?;
+                    region.assign_advice(|| "zero_ref", config.advice[2], offset, || Value::known(Fp::ZERO))?;
                     Ok(())
                 })
             }

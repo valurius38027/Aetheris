@@ -38,7 +38,7 @@
 | D3 | R2,R5 | Transcript hash uses Blake3/Blake2b instead of Poseidon | HIGH | §B | ✅ Done |
 | D4 | R3 | Verification is O(n) accumulator replay, not O(1) recursive SNARK | HIGH | §C | ✅ Done |
 | D5 | R4 | `BlockHeader` has dual `aggregate_proof` + optional `recursive_proof` | MEDIUM | §D | ✅ Done (D.1+D.2) |
-| D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ Deferred post-MVP |
+| D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ In Progress |
 | D7 | R5 | `create_nullifier`/`build_merkle_root` use Blake3 not Poseidon | MEDIUM | §B.2 | ✅ Done |
 | D8 | R2 | `hash_to_curve` targets Pallas generator (EpAffine) not Vesta (EqAffine) | MEDIUM | §A | ✅ Done |
 | D9 | — | `RecursiveManagerHandle.verify_halo2_proof() -> bool { false }` (stub) | HIGH | §F | ✅ Done |
@@ -679,33 +679,48 @@ This requires `EqAffine::generator()` based Pedersen parameters, which don't exi
 
 ### §E.1 — Strategy: Option B (Vesta Inner Proofs)
 
-Change commitment curve from Pallas (`EpAffine`) to Vesta (`EqAffine`).
+Change the inner conservation proof's commitment scheme from Pallas (`EpAffine`) to Vesta (`EqAffine`).
+
+**Critical: Circuit field MUST change**. `CommitmentSchemeIPA<C>` has `type Scalar = C::ScalarExt`. For Vesta (`EqAffine`), `Scalar = Fp` (Vesta scalar = Pallas base). Halo2's `create_proof` requires `Circuit<Scheme::Scalar>`, so the conservation circuit must become `Circuit<Fp>`. This is a mechanical Fq→Fp substitution — the circuit only does 64-bit range checks and sum conservation, which works identically in any field > 2^64.
+
+The accumulator circuit stays `Circuit<Fq>` (outer proof remains Pallas IPA). The Pasta 2-cycle ensures:
+```
+Inner proof:  Circuit<Fp> + CommitmentSchemeIPA<EqAffine> → Vesta IPA proof
+               (Vesta points have Fq coords — native for in-circuit verifier)
+Outer proof:  Circuit<Fq> + CommitmentSchemeIPA<EpAffine> → Pallas IPA proof
+               (unchanged from current architecture)
+```
 
 **Scope**:
-1. `aetheris-zkp/src/halo2_pasta.rs`: All `EpAffine` → `EqAffine` type params
+1. `aetheris-zkp/src/halo2_pasta.rs`: All `EpAffine` → `EqAffine` type params; Fq → Fp in conservation circuit
 2. `aetheris-zkp/src/ipa/commitment.rs`: `CommitmentSchemeIPA<EpAffine>` → `<EqAffine>`
 3. `aetheris-zkp/src/ipa/strategy.rs`: Strategy type params
 4. `aetheris-zkp/src/combined_circuit.rs`: Type params
 5. CRS regeneration: `gen_crs.ps1` re-run for EqAffine params
 6. `INNER_PROOF_PREFIX`: `b"halo2_ipa_pasta_v1_"` → `b"halo2_ipa_vesta_v1_"`
 7. `aetheris-recursive/src/accumulator.rs`: Already done in §A
-8. `aetheris-recursive/src/prove_recursive.rs`: Type params
+8. `aetheris-recursive/src/prove_recursive.rs`: No change (outer proof stays Pallas IPA)
 9. All Pallas chip modules: Deprecated (Vesta chips replace them)
 10. `VestaAccumulateChip::verify_ipa_full`: Now usable directly for inner proof verification (native Vesta points)
 
-**Circuit field stays `Fq`** — the conservation circuit is `Circuit<Fq>` which is Vesta circuit field. Only the commitment curve changes.
-
-**Benefit**: `verify_ipa_full` in `VestaAccumulateChip` works on native Vesta points — no NonNativeChip needed anywhere.
+**Benefit**: `verify_ipa_full` in `VestaAccumulateChip` works on native Vesta points — no NonNativeChip needed anywhere. The Vesta IPA proof points have `(Fq, Fq)` coordinates = native `VestaPoint` in `Circuit<Fq>`. The Fp scalars are passed as witness bits → `VestaEccChip::scalar_mul` uses `Limb<Fq>` (double-and-add on bits, field-agnostic).
 
 ### §E.2 — Replace Blake2bCompressionCircuitChip with Poseidon (from §B.3)
 
 The `VestaAccumulateChip::squeeze_challenges` uses Blake2b (non-native Fq, ~60+ columns).
-Replace with Poseidon over Fq (~9 columns):
+After §E.1, the in-circuit verifier (inside `AccumulatorCircuit`, `Circuit<Fq>`) receives
+a Vesta IPA proof. The IPA transcript (challenge derivation) is processed by
+`PoseidonFqChip` — native over Fq, ~9 columns.
 
-1. Redesign IPA transcript to use Poseidon for challenge derivation
+Replace Blake2b with Poseidon over Fq:
+
+1. Redesign IPA transcript to use Poseidon for challenge derivation (host-side
+   `poseidon_fq` mirrors the circuit's `PoseidonFqChip`)
 2. Replace `Blake2bCompressionCircuitChip` in `VestaAccumulateConfig` with `PoseidonFqChip`
 3. Simplify config from ~60+ columns to ~9 columns
-4. Remove NonNativeFqChip dependency from `VestaAccumulateConfig`
+4. Remove `NonNativeFqChip` dependency from `VestaAccumulateConfig`
+5. No NonNativeChip needed anywhere: Vesta points are native Fq coords, Poseidon
+   transcript is native Fq hashing
 
 This eliminates the last NonNativeChip usage in the recursive crate (R6 requirement).
 
@@ -721,9 +736,26 @@ Files affected:
 
 **Net LoC reduction**: ~3000 lines removed, ~500 lines added (Poseidon transcript). This completes R6 (NonNativeChip elimination).
 
-### §E.4 — Deferred
+### §E.4 — Wire VestaAccumulateChip into AccumulatorCircuit
 
-Implemented after §C is verified in production. Minimum viable: inner proofs verified out-of-circuit (trusted aggregator, current model). Full trustlessness: Phase 1.6 / post-MVP.
+After §E.1 (Vesta inner proofs) and §E.2 (Poseidon transcript), VestaAccumulateChip
+verifies a Vesta IPA proof natively inside `Circuit<Fq>`:
+
+1. Parse Vesta IPA proof from bytes → `IpaProofWitness<EqAffine>` (points have Fq coords)
+2. `PoseidonFqChip` derives challenges (native Fq)
+3. `VestaIpaChip::fold_and_constrain` runs k-round folding (native VestaPoint ops)
+4. `VestaEccChip::scalar_mul` handles Fp scalars as bit-decomposed `Limb<Fq>` (field-agnostic)
+5. Constrain accumulator update: `Q_new = Q_old + Σ challenge_i · π_i`
+6. Update Poseidon transcript chain
+
+**Integration into `AccumulatorCircuit.synthesize`**: replace host-side `verify_conservation`
+call with in-circuit `VestaAccumulateChip::verify_ipa_full`. The inner proof bytes become
+private witness; the circuit constrains both the IPA relation AND the accumulator algebra
+in a single PLONK proof.
+
+**Net effect**: D6 fully resolved — no trusted aggregator needed. Verifier checks one
+Pallas IPA proof (outer) that encloses a Vesta IPA proof (inner) with full algebraic
+constraint.
 
 ---
 
@@ -817,7 +849,7 @@ Each phase must pass independently before the next begins:
 - [x] **§D.1**: `recursive_proof` is `Vec<u8>` (non-optional), mining produces it
 - [x] **§D.2**: `aggregate_proof` removed from `BlockHeader`, all callers updated
 - [ ] **§D.3**: Consensus uses O(1) recursive SNARK verification, no O(n) fallback
-- [ ] **§E** (Phase 1.6): In-circuit IPA verification complete, Blake2b circuit replaced by Poseidon
+- [ ] **§E**: In-circuit IPA verification complete (inner proofs on Vesta IPA, Poseidon transcript, VestaAccumulateChip wired into AccumulatorCircuit)
 - [x] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works
 - [x] **§G**: Cleanup complete, all documents annotated, no dead code
 - [x] **Final**: `cargo check --workspace` clean, all applicable tests pass

@@ -28,7 +28,7 @@ pub const PI_COMMITMENT_DOMAIN: &[u8] = b"aetheris-pi-cmt-v2\x00";
 /// Inner-proof wire-format prefix. The aggregator MUST reject proofs that
 /// do not start with this prefix (prevents accidental accumulation of
 /// non-Aetheris proofs).
-pub const INNER_PROOF_PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
+pub const INNER_PROOF_PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
 
 /// Wire format prefix for the serialized accumulator state.
 /// 28 bytes including the trailing separator.
@@ -564,7 +564,7 @@ mod tests {
         // `verify_conservation` returns false (the transcript is malformed),
         // so `accumulate()` returns `InnerProofInvalid` without panicking.
         let mut bad_proof = Vec::new();
-        bad_proof.extend_from_slice(b"halo2_ipa_pasta_v1_");
+        bad_proof.extend_from_slice(INNER_PROOF_PREFIX);
         bad_proof.extend_from_slice(&1u16.to_le_bytes());
         bad_proof.extend_from_slice(&0u16.to_le_bytes());
         bad_proof.extend_from_slice(&[0xFFu8; 32]);
