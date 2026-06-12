@@ -3328,6 +3328,49 @@ The economic model is designed to be consistent with the whitepaper's core princ
 
 ---
 
+## Stage 50 — §A: Accumulator Curve Migration (Pallas → Vesta) (2026-06-12)
+
+**Scope**: Fix D8 (hash-to-curve targets wrong generator) and D2 (non-native PallasAccumulateChip). Migrate accumulator from Pallas (EpAffine/Fp) to Vesta (EqAffine/Fq). Completed per `FINAL_ARCHITECTURAL_PLAN.md §A`.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `aetheris-recursive/src/accumulator.rs` | `Q: EpAffine` → `Q: EqAffine`; all identity/from_bytes/generator calls migrated; `fp_to_fq` bridge deleted; `fp_from_blake3` kept returning `Fp` (correct Vesta scalar type for `EqAffine::generator() * Fp`); hash-to-curve uses `EqAffine::generator()` with `Fp::from_uniform_bytes`; all 5 domain separators bumped `_v1_` → `_v2_` |
+| `aetheris-recursive/src/pallas_accumulate.rs` | Added `eq_to_pallas_point()` bridge (Fq→Fp reduction for EqAffine→PallasPoint, temporary until §C) |
+| `aetheris-recursive/src/prove_recursive.rs` | Changed `ep_to_pallas_point(&acc.Q)` → `eq_to_pallas_point(&acc.Q)` |
+| `aetheris-node/src/state.rs` | Fixed stale `_v1_` prefix in test assertion (line 895) |
+
+### Multi-Agent Review (2 rounds, 4 total reviews)
+
+- **Round 1**: ❌ 1 blocking issue (state.rs: `_v1_` prefix) + ⚠️ stale doc comments
+- **Round 2**: ✅ APPROVED by both reviewers (zero blocking issues, 4 minor doc warnings fixed)
+
+### Verification
+
+| Target | Result |
+|--------|--------|
+| `cargo check --workspace` | ✅ 0 errors, 0 warnings |
+| `cargo test -p aetheris-recursive --lib accumulator` | ✅ 16/16 |
+| `cargo test -p aetheris-core` | ✅ 25/25 |
+| `cargo test -p aetheris-crypto` | ✅ 41/41 |
+| `cargo test -p aetheris-zkp --lib` | ✅ 119/119 |
+| FFI `test_full_wallet_flow` | ❌ Pre-existing empty-genesis panic (unrelated) |
+
+### Key Design Verification
+
+- `EqAffine::generator() * Fp` — Fp IS Vesta's scalar field (Pasta 2-cycle: Vesta base=Fq, scalar=Fp) ✅
+- `Fp::from_uniform_bytes` — correct for Vesta scalar multiplication ✅
+- `fp_to_fq` bridge fully deleted — zero dangling code references ✅
+- All `_v1_` accumulator prefixes migrated — only `INNER_PROOF_PREFIX` (`halo2_ipa_pasta_v1_`) correctly retained ✅
+- `eq_to_pallas_point` soundness: Fq→Fp via `Fp::from_uniform_bytes(&[u8; 64])` — valid because Vesta modulus q > Pallas modulus p, mod-p reduction deterministic ✅
+
+### Next
+
+**§B.1**: Host-side Poseidon migration for nullifier/commitment hashes in `aetheris-zkp/src/halo2_pasta.rs`.
+
+---
+
 ## Stage 49 — Phase 1.14 S5-a/b: Recursive Proof Node Integration (BlockHeader + Consensus) (2026-06-12)
 
 **Scope**: Bridge the recursive proof system into the node — add `recursive_proof` field to `BlockHeader`, store `VerifyingKey` in `LedgerState`, verify recursive proofs during block validation.

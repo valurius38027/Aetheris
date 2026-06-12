@@ -321,6 +321,10 @@ Phase 4  生产就绪    ─→  文档/清理
 - **当前 diff**: -802 net LoC in `aetheris-recursive/src/lib.rs` (2380→1578), +152 new `grain.rs`, +90 new test function. 范围 bounded 到 `aetheris-recursive/` only.
 
 ### ⏳ 1.4 B-3: aggregate_proofs IPA 化（P1，P0 后执行）
+> **⚠️ SUPERSEDED** — This section is superseded by
+> [`FINAL_ARCHITECTURAL_PLAN.md`](FINAL_ARCHITECTURAL_PLAN.md) (§C–§D).
+> The plan below is outdated; refer to the final plan for the correct implementation.
+
 - **来源**: B-3，终裁 §4 P1
 - **当前**: `halo2_pasta.rs:460-495` 仍用 Merkle 哈希 + O(n) 逐 proof replay
 - **前置**: P0 全部完成

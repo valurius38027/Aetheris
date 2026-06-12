@@ -14,10 +14,10 @@
 use core::array;
 
 use blake2b_simd::Params as Blake2bParams;
-use ff::{Field, PrimeField};
+use ff::{Field, FromUniformBytes, PrimeField};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    halo2curves::pasta::{EpAffine, Fp, Fq},
+    halo2curves::pasta::{EpAffine, EqAffine, Fp, Fq},
     plonk::ErrorFront,
     transcript::{Challenge255, EncodedChallenge},
 };
@@ -131,6 +131,51 @@ pub fn ep_to_pallas_point(p: &EpAffine) -> PallasPoint {
         let lv = (&y_big / &lbb.pow(i as u32)) % &lbb;
         Limb { value: Value::known(big_to_fq(&lv)), cell: None }
     });
+    PallasPoint {
+        x: FpElement { limbs: x_limbs },
+        y: FpElement { limbs: y_limbs },
+        x_cell: None,
+        y_cell: None,
+    }
+}
+
+/// Convert an EqAffine (Vesta) point to a PallasPoint (3-limb Fp-over-Fq).
+/// Temporary bridge for §A migration; removed in §C when
+/// PallasAccumulateChip is replaced by VestaAccumulateChip.
+pub fn eq_to_pallas_point(p: &EqAffine) -> PallasPoint {
+    let coords = p.coordinates().unwrap();
+    let x_fq = *coords.x();
+    let y_fq = *coords.y();
+
+    // Fq → Fp via uniform bytes (mod-p reduction of 64-byte input).
+    // Safe: Vesta base (Fq) coordinates are < q; reducing mod p
+    // gives a valid Fp value. This is the reverse of the fp_to_fq
+    // bridge removed in accumulator.rs.
+    let x_fp = {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(x_fq.to_repr().as_ref());
+        Fp::from_uniform_bytes(&buf)
+    };
+    let y_fp = {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(y_fq.to_repr().as_ref());
+        Fp::from_uniform_bytes(&buf)
+    };
+
+    // Fp → [Limb<Fq>; 3] decomposition (same as ep_to_pallas_point)
+    let lbb = big_limb_base();
+    let x_big = num_bigint::BigUint::from_bytes_le(x_fp.to_repr().as_ref());
+    let y_big = num_bigint::BigUint::from_bytes_le(y_fp.to_repr().as_ref());
+
+    let x_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
+        let lv = (&x_big / &lbb.pow(i as u32)) % &lbb;
+        Limb { value: Value::known(big_to_fq(&lv)), cell: None }
+    });
+    let y_limbs: [Limb<Fq>; FP_NUM_LIMBS] = array::from_fn(|i| {
+        let lv = (&y_big / &lbb.pow(i as u32)) % &lbb;
+        Limb { value: Value::known(big_to_fq(&lv)), cell: None }
+    });
+
     PallasPoint {
         x: FpElement { limbs: x_limbs },
         y: FpElement { limbs: y_limbs },

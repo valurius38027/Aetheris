@@ -1,3 +1,7 @@
+> **⚠️ SUPERSEDED** — This document's implementation targets are superseded by
+> [`FINAL_ARCHITECTURAL_PLAN.md`](../FINAL_ARCHITECTURAL_PLAN.md) (§C–§D).
+> Do not implement from this document without cross-referencing the final plan.
+
 # Phase 1.14 — Recursive Proof Production & State Root Binding
 
 > **Status**: S1-S4 ✅ completed (Stage 47); S5 in progress.

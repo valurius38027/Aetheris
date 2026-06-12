@@ -101,7 +101,7 @@ pub fn verify_block_recursive_proof(
         Ok(a) => a,
         Err(_) => return false,
     };
-    let pallas_point = crate::pallas_accumulate::ep_to_pallas_point(&acc.Q);
+    let pallas_point = crate::pallas_accumulate::eq_to_pallas_point(&acc.Q);
     let instances = vec![build_recursive_instance(&pallas_point, state_root)];
     let (vk, _pk) = match build_recursive_keys(&params) {
         Ok(k) => k,

@@ -7,30 +7,23 @@
 //! verifies the algebraic update relation; a future Phase (1.6, see
 //! ISSUE-1.4.A) will add in-circuit IPA verification for trustless recursion.
 //!
-//! Curve placement: the inner proof's IPA commitment curve is Pallas
-//! (`EpAffine`, base `Fp`, scalar `Fq`). The accumulator's `Q` and
-//! `pi_commitment` are Pallas points. Pallas *coordinate* arithmetic
-//! (point add, point doubling) lives in `Fp` and is therefore *native*
-//! in this crate's Vesta-scalar (`Fp`-scalar) circuit — the Pasta 2-cycle
-//! property collapses Pallas.base = Vesta.scalar = `Fp`. Pallas *scalar*
-//! multiplication, however, uses an `Fq` scalar (= Vesta.base), which
-//! is the NON-native field of this `Fp`-scalar circuit; the
-//! out-of-circuit arithmetic here is sound, but a future in-circuit
-//! `CircuitAccumulate` (Phase 1.4 step 3, see mainnet_execution_plan.md)
-//! will need to range-check the `Fq` scalar via NonNativeChip.
+//! Curve placement: the accumulator's `Q` and `pi_commitment` are Vesta
+//! points (`EqAffine`, base `Fq`, scalar `Fp`). All arithmetic is native
+//! Fq (`FINAL_ARCHITECTURAL_PLAN.md §A`). The inner proof's IPA commitment
+//! curve remains Pallas.
 
 use aetheris_zkp::{halo2_pasta::Halo2PastaBackend, trait_::TxCommitments, ZkProverSystem};
 use ff::{Field, FromUniformBytes, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve, GroupEncoding};
-use halo2_proofs::halo2curves::pasta::{EpAffine, Fp, Fq};
+use halo2_proofs::halo2curves::pasta::{EqAffine, Fp};
 use subtle::CtOption;
 
 /// Domain separator for the accumulator's transcript state.
 /// Concatenated as a length-tag to prevent cross-protocol blake3 collisions.
-pub const ACCUMULATOR_TRANSCRIPT_DOMAIN: &[u8] = b"aetheris-ipa-accumulator-v1\x00";
+pub const ACCUMULATOR_TRANSCRIPT_DOMAIN: &[u8] = b"aetheris-ipa-accumulator-v2\x00";
 
 /// Domain separator for the per-proof `pi_commitment` derivation.
-pub const PI_COMMITMENT_DOMAIN: &[u8] = b"aetheris-pi-cmt-v1\x00";
+pub const PI_COMMITMENT_DOMAIN: &[u8] = b"aetheris-pi-cmt-v2\x00";
 
 /// Inner-proof wire-format prefix. The aggregator MUST reject proofs that
 /// do not start with this prefix (prevents accidental accumulation of
@@ -39,15 +32,15 @@ pub const INNER_PROOF_PREFIX: &[u8] = b"halo2_ipa_pasta_v1_";
 
 /// Wire format prefix for the serialized accumulator state.
 /// 28 bytes including the trailing separator.
-pub const ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_accumulator_ipa_v1_";
+pub const ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_accumulator_ipa_v2_";
 
 /// Wire format prefix for the signed accumulator state.
 /// 28 bytes including the trailing separator.
 /// Total: 28 + 32 + 32 + 64 + 4 = 160 bytes.
-pub const SIGNED_ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_signed_accumulator_v1_";
+pub const SIGNED_ACCUMULATOR_WIRE_PREFIX: &[u8] = b"aetheris_signed_accumulator_v2_";
 
 /// Domain separator for the ed25519 signature on accumulator claims.
-pub const ACCUMULATOR_SIGNATURE_DOMAIN: &[u8] = b"aetheris-accumulator-sig-v1\x00";
+pub const ACCUMULATOR_SIGNATURE_DOMAIN: &[u8] = b"aetheris-accumulator-sig-v2\x00";
 
 /// Maximum chain depth (anti-DoS bound). 1M accumulated proofs is well
 /// beyond any realistic block chain (at 1k txs/block, 1000 blocks of
@@ -88,17 +81,17 @@ impl std::error::Error for AccumulatorError {}
 /// Accumulator state: the cryptographic anchor that binds the chain of
 /// accumulated inner proofs.
 ///
-/// `Q` is a Pallas group element (the "rolling IPA commitment"). `transcript`
+/// `Q` is a Vesta group element (the "rolling IPA commitment"). `transcript`
 /// is a 32-byte blake3 hash that absorbs the proof hash and the previous
 /// accumulator state. `depth` is the number of accumulated proofs.
 ///
 /// Serialization: use `to_bytes()` / `from_bytes()` (custom wire format with
 /// the `ACCUMULATOR_WIRE_PREFIX`). The struct does not derive
-/// `Serialize`/`Deserialize` because `EpAffine` does not implement them.
+/// `Serialize`/`Deserialize` because `EqAffine` does not implement them.
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
 pub struct AccumulatorIPA {
-    pub Q: EpAffine,
+    pub Q: EqAffine,
     pub transcript: [u8; 32],
     pub depth: u32,
     /// ed25519 signature on the signed claim (empty if unsigned).
@@ -121,7 +114,7 @@ impl AccumulatorIPA {
         hasher.update(b"genesis");
         let transcript = hasher.finalize().into();
         Self {
-            Q: EpAffine::identity(),
+            Q: EqAffine::identity(),
             transcript,
             depth: 0,
             signature: None,
@@ -134,11 +127,15 @@ impl AccumulatorIPA {
     ///   1. Verify prefix on the proof bytes.
     ///   2. Call `verify_conservation` to ensure the proof is well-formed.
     ///   3. Compute `inner_proof_hash = blake3(proof)`.
-    ///   4. Compute `pi_commitment = hash_to_curve(pi_commitment_domain, inner_proof_hash)`.
-    ///   5. Compute `challenge = blake3(transcript || inner_proof_hash)`, reduced to `Fp`.
-    ///   6. `Q_new = Q + challenge * pi_commitment` (Pallas scalar mul + add, native `Fp`).
-    ///   7. `transcript_new = blake3(transcript || challenge_repr || Q_new_compressed)`.
-    ///   8. `depth += 1`.
+    ///   4. XOR-mix `inner_proof_hash` with commitment hash + `public_amount` to form
+    ///      `inner_proof_hash_eff` (commitment binding, Phase 1.5).
+    ///   5. Compute `pi_commitment = hash_to_curve(PI_COMMITMENT_DOMAIN, inner_proof_hash_eff)`.
+    ///   6. Compute `challenge = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
+    ///      || inner_proof_hash_eff)`, reduced to `Fp` (Vesta scalar).
+    ///   7. `Q_new = Q + challenge * pi_commitment` (Vesta scalar mul + add).
+    ///   8. `transcript_new = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
+    ///      || challenge_repr || Q_new_compressed || inner_proof_hash_eff)`.
+    ///   9. `depth += 1`.
     ///
     /// Returns the new accumulator state; `self` is consumed (struct is `Copy`-able by value).
     pub fn accumulate(
@@ -227,10 +224,10 @@ impl AccumulatorIPA {
         //    Phase 1.4: NUMS-style try-and-increment hash-to-curve.
         //    - Take blake3(PI_COMMITMENT_DOMAIN || inner_proof_hash_eff) -> 32 bytes
         //    - Mix in a 32-bit counter (length-tag to prevent ambiguity)
-        //    - Reduce mod Fp (Pallas base, native arithmetic field of this circuit)
+        //    - Reduce mod Fp (Vesta scalar field, native for EqAffine scalar mul)
         //      via `from_uniform_bytes` (NOT `from_repr`, which is canonical-only
         //      and would reject ~75% of inputs)
-        //    - Multiply by the Pallas generator to get a Pallas point
+        //    - Multiply by the Vesta generator to get a Vesta point
         //    - Increment counter and re-derive if the resulting point is the
         //      identity (2^-254 chance; theoretically possible, practically never)
         //    Phase 1.5: also includes output_commitments binding via
@@ -239,7 +236,7 @@ impl AccumulatorIPA {
         let pi_commitment = hash_to_curve_nums_eff(&inner_proof_hash, &inner_proof_hash_eff);
 
         // 7. challenge = blake3(ACCUMULATOR_TRANSCRIPT_DOMAIN || transcript
-        //    || inner_proof_hash_eff), reduced to Fp via `from_uniform_bytes`.
+        //    || inner_proof_hash_eff), reduced to Fp (Vesta scalar) via `from_uniform_bytes`.
         let mut hasher = blake3::Hasher::new();
         hasher.update(ACCUMULATOR_TRANSCRIPT_DOMAIN);
         hasher.update(&self.transcript);
@@ -248,18 +245,11 @@ impl AccumulatorIPA {
         let challenge = fp_from_blake3(challenge_hash.as_bytes());
 
         // 8. Q_new = Q + challenge * pi_commitment.
-        //    - `pi_commitment * challenge` is Pallas scalar mul (the scalar is
-        //      an Fq, see `fp_to_fq`); Pallas coordinates live in Fp, so the
-        //      point arithmetic is native in this Vesta-scalar circuit.
-        //    - `self.Q + t_aff` is Pallas affine add; same Fp-native.
-        //    - Pallas *scalar* multiplication, however, uses an Fq scalar,
-        //      which is the NON-native field of this Fp-scalar circuit.
-        //      The out-of-circuit arithmetic here is sound; a future
-        //      in-circuit `CircuitAccumulate` (Phase 1.4 step 3, see
-        //      mainnet_execution_plan.md) will need to range-check the
-        //      Fq scalar via NonNativeChip.
-        let challenge_q = fp_to_fq(&challenge);
-        let t_proj = pi_commitment * challenge_q;
+        //    Both Q and pi_commitment are Vesta points (EqAffine). Scalar
+        //    multiplication uses an Fp scalar (Vesta's scalar field). This
+        //    is the correctness fix from Pallas→Vesta migration
+        //    (FINAL_ARCHITECTURAL_PLAN.md §A).
+        let t_proj = pi_commitment * challenge;
         let t_aff = t_proj.to_affine();
         let q_new_proj = self.Q + t_aff;
         let q_new = q_new_proj.to_affine();
@@ -334,7 +324,7 @@ impl AccumulatorIPA {
     ///   || `transcript` (32 bytes)
     ///   || `depth` (4 bytes, little-endian)
     ///
-    /// Note: the identity point's `EpAffine::to_bytes()` encoding is
+    /// Note: the identity point's `EqAffine::to_bytes()` encoding is
     /// `[0u8; 32]` per the pasta_curves library (verified at
     /// `pasta_curves-0.5.1/src/curves.rs:693-704`), and `from_bytes` on
     /// the same all-zeros input returns `Some(identity)`. The explicit
@@ -410,11 +400,11 @@ impl AccumulatorIPA {
         q_bytes.copy_from_slice(&bytes[q_start..q_start + 32]);
 
         let Q = if q_bytes == [0u8; 32] {
-            EpAffine::identity()
+            EqAffine::identity()
         } else {
             ct_option_to_err(
-                EpAffine::from_bytes(&q_bytes),
-                "Q is not a valid Pallas point",
+                EqAffine::from_bytes(&q_bytes),
+                "Q is not a valid Vesta point",
             )?
         };
 
@@ -461,8 +451,8 @@ impl AccumulatorIPA {
 ///
 /// We hash it with the domain separator to get a 32-byte seed, mix in a
 /// 32-bit counter (length-tag to prevent ambiguity), and reduce mod Fp
-/// to get a uniform-random Pallas base field element. Multiply by the
-/// Pallas generator to get a Pallas point. If the result is the
+/// (Vesta scalar field) via `from_uniform_bytes`. Multiply by the
+/// Vesta generator to get a Vesta point. If the result is the
 /// identity (statistically negligible — 2^-254 for a non-zero scalar),
 /// we increment and retry.
 ///
@@ -477,16 +467,16 @@ impl AccumulatorIPA {
 fn hash_to_curve_nums_eff(
     _inner_proof_hash: &blake3::Hash,
     inner_proof_hash_eff: &[u8; 32],
-) -> EpAffine {
+) -> EqAffine {
     hash_to_curve_nums_bytes(inner_proof_hash_eff)
 }
 
 #[cfg(test)]
-fn hash_to_curve_nums(proof_hash: &blake3::Hash) -> EpAffine {
+fn hash_to_curve_nums(proof_hash: &blake3::Hash) -> EqAffine {
     hash_to_curve_nums_bytes(proof_hash.as_bytes())
 }
 
-fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
+fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EqAffine {
     let mut hasher = blake3::Hasher::new();
     hasher.update(PI_COMMITMENT_DOMAIN);
     hasher.update(seed_in);
@@ -505,9 +495,7 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
             !bool::from(c.is_zero()),
             "uniform sample is zero (impossible)"
         );
-        let c_q = fp_to_fq(&c);
-        debug_assert!(!bool::from(c_q.is_zero()), "Fq bridge produced zero");
-        let p_proj = EpAffine::generator() * c_q;
+        let p_proj = EqAffine::generator() * c;
         let p_aff = p_proj.to_affine();
         if !bool::from(p_aff.is_identity()) {
             return p_aff;
@@ -516,7 +504,7 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
     }
 }
 
-/// Reduce a 32-byte blake3 output to an `Fp` field element (Pallas base).
+/// Reduce a 32-byte blake3 output to an `Fp` field element (Vesta scalar).
 ///
 /// **CRITICAL:** we use `Fp::from_uniform_bytes(&[u8; 64])` (mod-p
 /// reduction of a 512-bit value) rather than `Fp::from_repr` (which
@@ -524,9 +512,9 @@ fn hash_to_curve_nums_bytes(seed_in: &[u8; 32]) -> EpAffine {
 /// ~3/4 of uniformly-random 32-byte inputs as "non-canonical" (>= Pallas
 /// prime), and `unwrap_or(Fp::ZERO)` would silently substitute the
 /// additive identity. For the Fiat-Shamir challenge in `accumulate()`
-/// (used as a scalar), this would mean `Q_new = Q + 0·π = Q` in 3/4 of
-/// accumulations — the IPA chain's binding property would collapse, and
-/// a malicious aggregator could grind the proof's nonce to force the
+/// (used as a Vesta scalar), this would mean `Q_new = Q + 0·π = Q` in 3/4
+/// of accumulations — the IPA chain's binding property would collapse,
+/// and a malicious aggregator could grind the proof's nonce to force the
 /// trivial update. `from_uniform_bytes` is total (never returns zero
 /// for a non-zero 64-byte input) and gives a uniform Fp sample.
 fn fp_from_blake3(bytes: &[u8]) -> Fp {
@@ -534,24 +522,6 @@ fn fp_from_blake3(bytes: &[u8]) -> Fp {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(bytes);
     Fp::from_uniform_bytes(&buf)
-}
-
-/// Bridge `Fp` -> `Fq` via byte rewrap.
-///
-/// **Pasta 2-cycle math (precise):** Pallas and Vesta are 2-cycle curves,
-/// meaning Pallas.base = Vesta.scalar = `Fp` and Vesta.base = Pallas.scalar
-/// = `Fq` (as field *types*). The actual prime moduli are *different*
-/// (Vesta's prime is larger than Pallas's by `0x47aefc33bba0634 << 192`),
-/// so the byte rewrap is a no-op arithmetic only because every `v <
-/// p_Pallas` is also a canonical Fq repr (no modular reduction needed
-/// when going `Fp -> Fq`). Going the other way (`Fq -> Fp`) is NOT a
-/// no-op and would require explicit reduction.
-///
-/// The `unwrap_or(Fq::ZERO)` is defensive paranoia; in practice this
-/// always returns `Some` for any value that was a valid `Fp`.
-fn fp_to_fq(fp: &Fp) -> Fq {
-    let bytes = fp.to_repr();
-    Fq::from_repr(bytes).unwrap_or(Fq::ZERO)
 }
 
 #[allow(dead_code)]

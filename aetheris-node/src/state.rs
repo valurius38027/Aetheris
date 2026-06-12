@@ -892,7 +892,7 @@ mod tests {
         assert!(result.is_ok(), "Block application failed: {:?}", result);
         assert_eq!(state.height, 2);
         assert_ne!(state.last_block_hash, [0u8; 32]);
-        assert!(state.last_aggregate_proof.starts_with(b"aetheris_accumulator_ipa_v1_"));
+        assert!(state.last_aggregate_proof.starts_with(b"aetheris_accumulator_ipa_v2_"));
     }
 
     #[test]

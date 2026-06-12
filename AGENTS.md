@@ -54,7 +54,10 @@ The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[p
 
 ### Key Architecture References
 - `protocol_design_ruling.md` — final design decisions (Pasta curves, IPA accumulation, ZK abstraction)
-- `aetheris-recursive/B-2_plan.md` — active implementation plan for native IPA accumulation on Vesta
+- `aetheris-recursive/B-2_plan.md` — ✅ Completed implementation plan for native IPA accumulation on Vesta
+- `FINAL_ARCHITECTURAL_PLAN.md` — **Active master plan** for Phase 1.4 B-3 CircuitAccumulate, Poseidon migration, block cleanup, P2P layer, and all remaining architectural alignment.
+- `aetheris-recursive/B-3_plan.md` — ⚠️ SUPERSEDED by FINAL_ARCHITECTURAL_PLAN.md
+- `aetheris-recursive/phase_1_14_plan.md` — ⚠️ SUPERSEDED by FINAL_ARCHITECTURAL_PLAN.md §C–§D
 - `math_spec.md` — VDF, class group, record model math
 - `genesis.json` — genesis config (network, VDF difficulty)
 - `gen_crs.ps1` — CRS generation for Halo2 params
