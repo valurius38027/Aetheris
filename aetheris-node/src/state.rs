@@ -358,7 +358,8 @@ impl LedgerState {
         }
 
         // §D.2+§D.3: O(1) recursive SNARK verification (replaces O(n) accumulator chain).
-        // Empty `recursive_proof` = trusted fallback (transitional: mining not yet wired).
+        // Mining is wired (§D.2 complete): produced blocks carry non-empty proofs.
+        // Empty `recursive_proof` allowed for genesis block only (trusted fallback).
         if !block.header.recursive_proof.is_empty() {
             if !verify_block_recursive_proof(&block.header.recursive_proof, &block.header.state_root) {
                 return Err(format!("Recursive proof verification failed for block #{}", block.header.height));
