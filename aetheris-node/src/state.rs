@@ -111,6 +111,7 @@ impl LedgerState {
         let start = self.height;
         if db_height > start {
             println!("[STATE] Replaying blocks {}-{} from DB...", start, db_height - 1);
+            let mut actual_max = start;
             for i in start..db_height {
                 if let Ok(Some(block_bytes)) = self.db.get(format!("block_{}", i).as_bytes()) {
                     if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
@@ -135,10 +136,18 @@ impl LedgerState {
                                 self.all_outputs.push(out.clone());
                             }
                         }
+                        actual_max = i + 1;
                     }
                 }
             }
-            self.height = db_height;
+            // If some blocks were missing (crash between height write and block write),
+            // adjust db_height down so it matches actual persisted blocks.
+            let corrected = actual_max;
+            if corrected != db_height {
+                println!("[STATE] Corrected height from {} to {} (some blocks were incomplete)", db_height, corrected);
+                self.db.insert(b"height", &corrected.to_le_bytes()).ok();
+            }
+            self.height = corrected;
         }
 
         // 5. Load persisted difficulty (may be more recent than replay-derived)
@@ -369,10 +378,11 @@ impl LedgerState {
         // C-3: Validate issuance rules before any state mutation
         self.validate_issuance_rules(&block, block.header.height)?;
 
-        // C-5: Validate nullifiers BEFORE write-ahead (validate-ahead, not write-ahead)
+        // C-5: Validate nullifiers — intra-block double-spend detection too
+        let mut seen_in_block = std::collections::HashSet::new();
         for tx in &block.transactions {
             for nf in &tx.inputs {
-                if self.nullifiers.contains(nf) {
+                if self.nullifiers.contains(nf) || !seen_in_block.insert(*nf) {
                     return Err("double-spend: nullifier already spent".to_string());
                 }
             }
@@ -387,13 +397,10 @@ impl LedgerState {
             ));
         }
 
-        let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
-
-        // P-5: Persist block to disk BEFORE updating in-memory state (write-ahead)
-        self.db.insert(format!("block_{}", block.header.height).as_bytes(), data.as_slice()).map_err(|e| e.to_string())?;
-        self.db.flush().map_err(|e| e.to_string())?;
-
-        // 4. Update State (Nullifiers & Commitments) — now safe after persist
+        // C-5: Update in-memory state FIRST — nullifiers and commitments must be
+        // committed before the block hits disk. After a crash, on-disk blocks are
+        // replayed via restore_from_db, which re-inserts nullifiers from any block
+        // whose DB height is ≤ the persisted height.
         for tx in &block.transactions {
             for nf in &tx.inputs {
                 self.nullifiers.insert(*nf);
@@ -404,10 +411,19 @@ impl LedgerState {
             }
         }
 
-        // 5. Update Metadata & Difficulty Retargeting
+        let data = bincode::serialize(&block).map_err(|e| e.to_string())?;
+
+        // C-5: Write height BEFORE the block (crash-safe ordering). If crash happens
+        // between these two writes, restore_from_db handles the missing-block edge case.
+        let new_height = block.header.height + 1;
+        self.db.insert(b"height", &new_height.to_le_bytes()).map_err(|e| e.to_string())?;
+        self.db.insert(format!("block_{}", block.header.height).as_bytes(), data.as_slice()).map_err(|e| e.to_string())?;
+        self.db.flush().map_err(|e| e.to_string())?;
+
+        // Update Metadata & Difficulty Retargeting
         self.timestamps.push(block.header.timestamp);
         self.last_block_hash = blake3::hash(&data).into();
-        self.height = block.header.height + 1;
+        self.height = new_height;
 
         // If block carries a recursive proof, extract the new state from it
         if !block.header.recursive_proof.is_empty() {
@@ -433,13 +449,12 @@ impl LedgerState {
             self.timestamps.drain(0..trim_at);
         }
 
-        // 6. Persist Metadata
-        self.db.insert(b"height", &self.height.to_le_bytes()).map_err(|e| e.to_string())?;
+        // Persist remaining metadata (height is already written, skip duplicate)
         self.db.insert(b"last_block_hash", &self.last_block_hash).map_err(|e| e.to_string())?;
         self.db.insert(b"current_difficulty", self.current_difficulty.to_string().as_bytes()).map_err(|e| e.to_string())?;
         self.db.flush().map_err(|e| e.to_string())?;
 
-        // 7. Persist state snapshot for fast O(1) startup
+        // Persist state snapshot for fast O(1) startup
         self.save_snapshot();
 
         Ok(())
