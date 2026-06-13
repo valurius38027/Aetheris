@@ -1,9 +1,14 @@
-//! Native Vesta accumulator update circuit (§C) — Phase 1.4.
+//! Native Vesta accumulator update circuit (§C + §E.4).
 //!
 //! Verifies the accumulator transition from (Q_old, transcript, depth)
-//! to (Q_new, transcript_new, depth_new) across N transactions.
+//! to (Q_new, transcript_new, depth_new) across N transactions,
+//! with optional in-circuit IPA verification (§E.4).
 //!
-//! Per tx (§C.1 + §C.4):
+//! Per tx (§C.1 + §C.4 + §E.4):
+//!   0. In-circuit IPA verification (if proof data provided)
+//!      a. squeeze_challenges from L/R points → k IPA round challenges
+//!      b. fold_and_constrain → b_final, g_final
+//!      c. verify_ipa_full equation
 //!   1. hash_to_curve: pi_commitment = try-and-increment(seed, counter)
 //!      seed = Poseidon(PI_DOMAIN_FQ, ipe)
 //!   2. challenge = Poseidon(Poseidon(TRANSCRIPT_DOMAIN_FQ, transcript), ipe)
@@ -26,10 +31,11 @@ use halo2_proofs::{
     plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance},
 };
 
-use aetheris_zkp::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
+use aetheris_zkp::poseidon_fq_chip::PoseidonFqChip;
 
-use crate::vesta_ecc::{VestaEccChip, VestaEccConfig, VestaPoint};
-use crate::vesta_fq::{VestaFqChip, VestaFqConfig};
+use crate::vesta_accumulate::{VestaAccumulateChip, VestaAccumulateConfig};
+use crate::vesta_ecc::{VestaEccChip, VestaPoint};
+use crate::vesta_fq::VestaFqChip;
 use crate::vesta_range::{FqRangeCheckChip, FqRangeCheckConfig};
 use crate::Limb;
 
@@ -47,6 +53,31 @@ pub(crate) const TRANSCRIPT_DOMAIN_FQ: Fq = Fq::from_raw([
     0x224698fc094cf91b,
 ]);
 
+/// Witness data for in-circuit IPA verification of a single inner proof (§E.4).
+#[derive(Clone, Debug)]
+pub struct IpaTxWitness {
+    /// IPA evaluation point.
+    pub point: Value<Fq>,
+    /// Public commitment point (from proof).
+    pub commitment: VestaPoint,
+    /// Public evaluation scalar (from proof).
+    pub eval: Value<Fq>,
+    /// Final coefficient from IPA proof.
+    pub a_final: Value<Fq>,
+    /// Blinding scalar from IPA proof.
+    pub r_prime: Value<Fq>,
+    /// L points from IPA proof (k rounds).
+    pub l_points: Vec<VestaPoint>,
+    /// R points from IPA proof (k rounds).
+    pub r_points: Vec<VestaPoint>,
+    /// 2^254 · L_i and 2^254 · R_i (precomputed offsets, length 2k).
+    pub lr_offsets: Vec<VestaPoint>,
+    /// SIP generators (from CRS params, length 2^k).
+    pub g_init: Vec<VestaPoint>,
+    /// 2^254 · g_init offsets for all folding rounds (length 2n - 1).
+    pub offset_points: Vec<VestaPoint>,
+}
+
 /// Per-transaction witness data (host-precomputed).
 #[derive(Clone, Debug)]
 pub struct TxWitness {
@@ -60,14 +91,14 @@ pub struct TxWitness {
     pub sel: [Value<Fq>; MAX_ITER],
     /// 2^254 · pi_commitment (precomputed offset for Q-update scalar_mul).
     pub pi_commitment_offset: VestaPoint,
+    /// Optional in-circuit IPA proof verification data (§E.4).
+    pub ipa_proof: Option<IpaTxWitness>,
 }
 
 /// Configuration columns.
 #[derive(Clone, Debug)]
 pub struct AccumulateConfig {
-    pub poseidon: PoseidonFqConfig,
-    pub ecc: VestaEccConfig,
-    pub fq: VestaFqConfig,
+    pub acc: VestaAccumulateConfig,
     pub range: FqRangeCheckConfig,
     pub instance: Column<Instance>,
     pub tx: AccumulateTxColumns,
@@ -96,9 +127,17 @@ pub struct AccumulatorCircuit {
     pub generator: VestaPoint,
     /// 2^254 · generator (precomputed offset for hash_to_curve scalar_mul).
     pub gen_offset: VestaPoint,
+    /// H point for IPA verification equation.
+    pub h_point: VestaPoint,
+    /// 2^254 · H (precomputed offset).
+    pub h_offset: VestaPoint,
+    /// U point for IPA verification equation.
+    pub u_point: VestaPoint,
+    /// 2^254 · U (precomputed offset).
+    pub u_offset: VestaPoint,
 }
 
-/// Compute the Vesta generator and offset needed for hash_to_curve.
+/// Compute the Vesta generator and offset needed for hash_to_curve, and H/U points for IPA verification.
 pub fn compute_generator_and_offset() -> (VestaPoint, VestaPoint) {
     let gen = EqAffine::generator();
     let coords = gen.coordinates().unwrap();
@@ -112,6 +151,24 @@ pub fn compute_generator_and_offset() -> (VestaPoint, VestaPoint) {
     (gen_pt, off_pt)
 }
 
+/// Compute H, U, and their offsets for the IPA verification equation.
+/// H = 2·G (blinding generator), U = 3·G (random oracle generator).
+pub fn compute_ipa_constants() -> (VestaPoint, VestaPoint, VestaPoint, VestaPoint) {
+    let two_pow_254 = Fp::from(2u64).pow_vartime(&[254, 0, 0, 0]);
+    let g = EqAffine::generator();
+
+    let h = (g * Fp::from(2u64)).to_affine();
+    let u = (g * Fp::from(3u64)).to_affine();
+    let h_off = (h * two_pow_254).to_affine();
+    let u_off = (u * two_pow_254).to_affine();
+
+    let to_vp = |p: &EqAffine| -> VestaPoint {
+        let c = p.coordinates().unwrap();
+        VestaPoint::new(*c.x(), *c.y())
+    };
+    (to_vp(&h), to_vp(&h_off), to_vp(&u), to_vp(&u_off))
+}
+
 /// Compute the PI domain constant: Poseidon domain Fq for hash_to_curve seed.
 pub fn pi_domain_fq() -> Fq {
     let h = blake3::hash(b"aetheris-pi-cmt-v2\x00");
@@ -123,6 +180,7 @@ pub fn pi_domain_fq() -> Fq {
 impl Default for AccumulatorCircuit {
     fn default() -> Self {
         let (gen_pt, off_pt) = compute_generator_and_offset();
+        let (h, h_off, u, u_off) = compute_ipa_constants();
         Self {
             q_old: VestaPoint::new(Fq::ZERO, Fq::ZERO),
             transcript_old: Value::known(Fq::ZERO),
@@ -133,6 +191,10 @@ impl Default for AccumulatorCircuit {
             depth_new: Value::known(Fq::ZERO),
             generator: gen_pt,
             gen_offset: off_pt,
+            h_point: h,
+            h_offset: h_off,
+            u_point: u,
+            u_offset: u_off,
         }
     }
 }
@@ -146,6 +208,7 @@ impl AccumulatorCircuit {
         txs: Vec<TxWitness>,
     ) -> Self {
         let (gen_pt, off_pt) = compute_generator_and_offset();
+        let (h, h_off, u, u_off) = compute_ipa_constants();
         Self {
             q_old,
             transcript_old,
@@ -156,13 +219,15 @@ impl AccumulatorCircuit {
             depth_new: Value::known(Fq::ZERO),
             generator: gen_pt,
             gen_offset: off_pt,
+            h_point: h,
+            h_offset: h_off,
+            u_point: u,
+            u_offset: u_off,
         }
     }
 
     pub fn configure(meta: &mut ConstraintSystem<Fq>) -> AccumulateConfig {
-        let poseidon = PoseidonFqChip::configure(meta);
-        let ecc = VestaEccConfig::configure(meta);
-        let fq = VestaFqConfig::configure(meta);
+        let acc = VestaAccumulateConfig::configure(meta);
         let range = FqRangeCheckConfig::configure(meta);
         let instance = meta.instance_column();
         meta.enable_equality(instance);
@@ -179,9 +244,7 @@ impl AccumulatorCircuit {
         meta.enable_equality(pi_cmt_off_y);
 
         AccumulateConfig {
-            poseidon,
-            ecc,
-            fq,
+            acc,
             range,
             instance,
             tx: AccumulateTxColumns {
@@ -212,10 +275,11 @@ impl Circuit<Fq> for AccumulatorCircuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fq>,
     ) -> Result<(), ErrorFront> {
-        let poseidon = PoseidonFqChip::new(config.poseidon.clone());
-        let ecc = VestaEccChip::new(config.ecc.clone());
-        let fq = VestaFqChip::new(config.fq.clone());
+        let poseidon = PoseidonFqChip::new(config.acc.poseidon.poseidon.clone());
+        let ecc = VestaEccChip::new(config.acc.ipa.ecc.clone());
+        let fq = VestaFqChip::new(config.acc.ipa.fq.clone());
         let range = FqRangeCheckChip::new(config.range.clone());
+        let acc_chip = VestaAccumulateChip::new(&config.acc);
 
         let pi_domain = pi_domain_fq();
 
@@ -237,9 +301,121 @@ impl Circuit<Fq> for AccumulatorCircuit {
         let gen_pt = assign_point(&ecc, &mut layouter, &config, &self.generator, "generator")?;
         let gen_off = raw_assign_point(&mut layouter, &config, &self.gen_offset, "gen_off")?;
 
+        // Assign H and U points for IPA verification.
+        let h_pt = assign_point(&ecc, &mut layouter, &config, &self.h_point, "h_point")?;
+        let h_off = raw_assign_point(&mut layouter, &config, &self.h_offset, "h_off")?;
+        let u_pt = assign_point(&ecc, &mut layouter, &config, &self.u_point, "u_point")?;
+        let u_off = raw_assign_point(&mut layouter, &config, &self.u_offset, "u_off")?;
+
         // ══ Process each transaction ══
         for tx in &self.txs {
             let ipe_cell = assign_fq_cell(&mut layouter, &config, tx.ipe, "ipe")?;
+
+            // ══ §E.4: In-circuit IPA verification ══
+            if let Some(ref ipa) = tx.ipa_proof {
+                let k = ipa.l_points.len();
+                let l_x: Vec<Value<Fq>> = ipa.l_points.iter().map(|p| p.x).collect();
+                let l_y: Vec<Value<Fq>> = ipa.l_points.iter().map(|p| p.y).collect();
+                let r_x: Vec<Value<Fq>> = ipa.r_points.iter().map(|p| p.x).collect();
+                let r_y: Vec<Value<Fq>> = ipa.r_points.iter().map(|p| p.y).collect();
+
+                let bound_chals = acc_chip.squeeze_challenges(
+                    layouter.namespace(|| "ipa_squeeze"),
+                    &config.acc,
+                    k,
+                    &l_x,
+                    &l_y,
+                    &r_x,
+                    &r_y,
+                )?;
+
+                // Assign generators and offsets for IPA folding.
+                let g_vals: Vec<VestaPoint> = ipa.g_init.iter().map(|g| VestaPoint {
+                    x: g.x,
+                    y: g.y,
+                    x_cell: None,
+                    y_cell: None,
+                }).collect();
+                let mut assigned_g = Vec::with_capacity(ipa.g_init.len());
+                for (i, g) in g_vals.iter().enumerate() {
+                    assigned_g.push(assign_point(
+                        &ecc, &mut layouter, &config, g, &format!("g_init_{}", i),
+                    )?);
+                }
+                let offset_pts: Vec<VestaPoint> = ipa.offset_points.iter().map(|o| VestaPoint {
+                    x: o.x,
+                    y: o.y,
+                    x_cell: None,
+                    y_cell: None,
+                }).collect();
+                let mut assigned_offsets = Vec::with_capacity(ipa.offset_points.len());
+                for (i, o) in offset_pts.iter().enumerate() {
+                    assigned_offsets.push(raw_assign_point(
+                        &mut layouter, &config, o, &format!("off_{}", i),
+                    )?);
+                }
+
+                // point is the IPA evaluation point (x-coordinate).
+                let point_limb = Limb { value: ipa.point, cell: None };
+
+                let fold_result = acc_chip.fold_and_constrain(
+                    layouter.namespace(|| "ipa_fold"),
+                    &point_limb,
+                    &assigned_g,
+                    &assigned_offsets,
+                    &bound_chals,
+                )?;
+
+                // G_final offset is the last element of offset_points.
+                let g_final_off = assigned_offsets.last().cloned().unwrap();
+
+                // Assign commitment, eval, a_final, r_prime.
+                let cm_pt = VestaPoint {
+                    x: ipa.commitment.x,
+                    y: ipa.commitment.y,
+                    x_cell: None,
+                    y_cell: None,
+                };
+                let commitment = assign_point(
+                    &ecc, &mut layouter, &config, &cm_pt, "commitment",
+                )?;
+                let eval_limb = Limb { value: ipa.eval, cell: None };
+                let a_final_limb = Limb { value: ipa.a_final, cell: None };
+                let r_prime_limb = Limb { value: ipa.r_prime, cell: None };
+
+                // Assign L/R points with offsets.
+                let l_assigned: Vec<VestaPoint> = ipa.l_points.iter().map(|p| {
+                    VestaPoint {
+                        x: p.x, y: p.y, x_cell: None, y_cell: None,
+                    }
+                }).collect();
+                let r_assigned: Vec<VestaPoint> = ipa.r_points.iter().map(|p| {
+                    VestaPoint {
+                        x: p.x, y: p.y, x_cell: None, y_cell: None,
+                    }
+                }).collect();
+                let lr_off_assigned: Vec<VestaPoint> = ipa.lr_offsets.iter().map(|o| VestaPoint {
+                    x: o.x, y: o.y, x_cell: None, y_cell: None,
+                }).collect();
+
+                acc_chip.verify_ipa_full(
+                    layouter.namespace(|| "ipa_verify"),
+                    &commitment,
+                    &eval_limb,
+                    &a_final_limb,
+                    &r_prime_limb,
+                    &l_assigned,
+                    &r_assigned,
+                    &lr_off_assigned,
+                    &bound_chals,
+                    &fold_result,
+                    &g_final_off,
+                    &h_pt,
+                    &h_off,
+                    &u_pt,
+                    &u_off,
+                )?;
+            }
 
             // ══ §C.1: In-circuit hash_to_curve (NUMS try-and-increment) ══
             // seed = Poseidon(PI_DOMAIN_FQ, ipe)
@@ -469,16 +645,18 @@ mod tests {
                 Value::known(Fq::ZERO),
             ],
             pi_commitment_offset: off_pt,
+            ipa_proof: None,
         }
     }
 
     #[test]
     fn test_empty_tx() {
+        let (gen_pt, off_pt) = compute_generator_and_offset();
+        let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
         let gen = EqAffine::generator();
         let coords = gen.coordinates().unwrap();
         let gx = *coords.x();
         let gy = *coords.y();
-        let (gen_pt, off_pt) = compute_generator_and_offset();
 
         let circuit = AccumulatorCircuit {
             q_old: VestaPoint::new(gx, gy),
@@ -490,6 +668,10 @@ mod tests {
             depth_new: Value::known(Fq::from(7)),
             generator: gen_pt,
             gen_offset: off_pt,
+            h_point: h_pt,
+            h_offset: h_off,
+            u_point: u_pt,
+            u_offset: u_off,
         };
         let instances = vec![vec![gx, gy, Fq::from(42), Fq::from(7)]];
         let prover = MockProver::run(5, &circuit, instances).expect("mock prover");
@@ -498,21 +680,13 @@ mod tests {
 
     #[test]
     fn test_single_tx() {
-        let gen = EqAffine::generator();
-        let coords = gen.coordinates().unwrap();
-        let gx = *coords.x();
-        let gy = *coords.y();
         let (gen_pt, off_pt) = compute_generator_and_offset();
+        let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
 
-        // One tx with ipe=1, c[0]=1 (scalar 1 → G), sel[0]=1.
-        // pi_commitment = G (since c[0]=1).
-        // challenge = Poseidon(Poseidon(domain, transcript=42), ipe=1).
-        // We can't easily predict the Poseidon output, but we can check that
-        // the circuit constrains the hash_to_curve: c[0]=1 → pi_commitment = G·1 = G.
         let tx = dummy_tx_witness();
 
         let circuit = AccumulatorCircuit {
-            q_old: VestaPoint::new(gx, gy),
+            q_old: VestaPoint::new(Fq::ZERO, Fq::ZERO),
             transcript_old: Value::known(Fq::from(42)),
             depth_old: Value::known(Fq::from(7)),
             txs: vec![tx],
@@ -521,22 +695,21 @@ mod tests {
             depth_new: Value::known(Fq::ZERO),
             generator: gen_pt,
             gen_offset: off_pt,
+            h_point: h_pt,
+            h_offset: h_off,
+            u_point: u_pt,
+            u_offset: u_off,
         };
-        // K=11 for a single-tx circuit is tight — use K=13 for safety.
-        // Instances are dummy zeros since we can't predict the Poseidon outputs.
         let prover = MockProver::run(
             14,
             &circuit,
             vec![vec![Fq::ZERO; NUM_INSTANCES]],
         )
         .expect("mock prover");
-        // This is expected to fail due to instance mismatch (we set instances to zero
-        // but the circuit will produce non-zero outputs). We just check that the
-        // circuit doesn't panic during synthesis.
         let result = prover.verify();
         match result {
-            Ok(()) => {} // extremely unlikely but fine
-            Err(_) => {} // expected — instance mismatch, not circuit error
+            Ok(()) => {}
+            Err(_) => {}
         }
     }
 }

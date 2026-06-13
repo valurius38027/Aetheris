@@ -29,6 +29,7 @@ use aetheris_zkp::ipa::strategy::SingleStrategyIPA;
 use crate::circuit_accumulate::{
     AccumulatorCircuit, TxWitness, MAX_ITER,
     TRANSCRIPT_DOMAIN_FQ, compute_generator_and_offset,
+    compute_ipa_constants,
 };
 use crate::pallas_accumulate::commitment_limbs;
 use crate::recursive_proof::RecursiveProofCircuit;
@@ -267,6 +268,7 @@ pub fn build_accumulate_keys(
     let gen_coords = EqAffine::generator().coordinates().unwrap();
     let gx = *gen_coords.x();
     let gy = *gen_coords.y();
+    let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
     let dummy_tx = TxWitness {
         ipe: Value::known(Fq::ONE),
         c: [
@@ -284,6 +286,7 @@ pub fn build_accumulate_keys(
             Value::known(Fq::ZERO),
         ],
         pi_commitment_offset: off_pt.clone(),
+        ipa_proof: None,
     };
     let circuit = AccumulatorCircuit {
         q_old: VestaPoint::new(gx, gy),
@@ -295,6 +298,10 @@ pub fn build_accumulate_keys(
         depth_new: Value::known(Fq::ZERO),
         generator: gen_pt,
         gen_offset: off_pt,
+        h_point: h_pt,
+        h_offset: h_off,
+        u_point: u_pt,
+        u_offset: u_off,
     };
     let vk = keygen_vk(params, &circuit)?;
     let pk = keygen_pk(params, vk.clone(), &circuit)?;
@@ -330,6 +337,7 @@ pub fn prove_block_recursive(
     let q_old_pt = eq_to_vesta_point(&q_old);
     let q_new_pt = eq_to_vesta_point(&q_new);
 
+    let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
     let circuit = AccumulatorCircuit {
         q_old: q_old_pt,
         transcript_old: Value::known(transcript_old),
@@ -340,6 +348,10 @@ pub fn prove_block_recursive(
         depth_new: Value::known(Fq::from(depth_new as u64)),
         generator: gen_pt,
         gen_offset: off_pt,
+        h_point: h_pt,
+        h_offset: h_off,
+        u_point: u_pt,
+        u_offset: u_off,
     };
 
     let coords = q_new.coordinates().unwrap();
@@ -520,6 +532,7 @@ pub fn compute_tx_witness(
         c,
         sel,
         pi_commitment_offset,
+        ipa_proof: None,
     }
 }
 
@@ -640,6 +653,7 @@ mod tests {
                 Value::known(Fq::ZERO),
             ],
             pi_commitment_offset: off_pt,
+            ipa_proof: None,
         };
 
         // Use K=15 to ensure enough rows for 1 tx circuit (scalar_mul loops are large)
@@ -695,6 +709,7 @@ mod tests {
         // Debug: use compute_expected_accumulator_output to get the correct
         // expected instances, then verify the circuit matches.
         let (_gen_pt, off_pt) = compute_generator_and_offset();
+        let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
         let tx = TxWitness {
             ipe: Value::known(Fq::ONE),
             c: [
@@ -712,6 +727,7 @@ mod tests {
                 Value::known(Fq::ZERO),
             ],
             pi_commitment_offset: off_pt.clone(),
+            ipa_proof: None,
         };
 
         let q_old = EqAffine::generator();
@@ -738,6 +754,10 @@ mod tests {
             depth_new: Value::known(Fq::from(depth_new_host as u64)),
             generator: _gen_pt,
             gen_offset: off_pt,
+            h_point: h_pt,
+            h_offset: h_off,
+            u_point: u_pt,
+            u_offset: u_off,
         };
         use halo2_proofs::dev::MockProver;
         let instances_check = vec![vec![
