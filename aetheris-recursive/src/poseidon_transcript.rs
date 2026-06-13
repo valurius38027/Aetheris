@@ -51,10 +51,32 @@ impl PoseidonTranscriptChip {
         r_x: &[Fq],
         r_y: &[Fq],
     ) -> Vec<Fq> {
+        let (_theta, chals) = Self::host_derive_ipa_theta_and_challenges(k, l_x, l_y, r_x, r_y);
+        chals
+    }
+
+    /// Host-side Poseidon transcript replay for IPA: returns (theta, round_challenges).
+    ///
+    /// Protocol (matching `VestaAccumulateChip::squeeze_challenges`):
+    ///   state = Poseidon(TRANSCRIPT_DOMAIN, CAPACITY)
+    ///   absorb(k)
+    ///   theta = state[0]                      ← squeeze BEFORE first L/R
+    ///   for each round i:
+    ///       absorb(L_i.x, L_i.y, R_i.x, R_i.y)
+    ///       x_i = state[0]                    ← squeeze before advance
+    ///       state = Poseidon(state, CAPACITY)  ← advance permutation
+    pub fn host_derive_ipa_theta_and_challenges(
+        k: usize,
+        l_x: &[Fq],
+        l_y: &[Fq],
+        r_x: &[Fq],
+        r_y: &[Fq],
+    ) -> (Fq, Vec<Fq>) {
         let spec = ensure_poseidon_spec();
         let mut state = host_poseidon(transcript_domain(), capacity_fill(), spec);
 
         state = host_poseidon(state, Fq::from(k as u64), spec);
+        let theta = state;
         let mut chals = Vec::with_capacity(k);
         for i in 0..k {
             state = host_poseidon(state, l_x[i], spec);
@@ -64,7 +86,7 @@ impl PoseidonTranscriptChip {
             chals.push(state);
             state = host_poseidon(state, capacity_fill(), spec);
         }
-        chals
+        (theta, chals)
     }
 
     /// Circuit-side init: state = Poseidon(transcript_domain(), capacity_fill()).

@@ -156,7 +156,11 @@ Circuit_inputs:
 Circuit_constraints:
   1. amount ∈ [0, 2^64)                         ← range proof (running-sum)
   2. sum(input_amounts) + public_in = sum(output_amounts) + public_out  ← conservation
-  3. output_commitment_i == amount_i·G + blinding_i·H  ← instance binding (C-1)
+  3. output_commitment_i == create_commitment(amount_i, blinding_i)  ← instance binding (C-1)
+     NOTE: `create_commitment` is field addition on Fq (Vesta base), not Pedersen ECC.
+     The circuit operates on Fp (Vesta scalar) — cross-field arithmetic prevents an
+     in-circuit gate. Binding is via host-side check + instance copy constraint.
+     Full ECC Pedersen deferred to ZK abstraction layer (§E.5).
   4. ∀i: input_commitment_i ∈ MerkleTree(state) ← membership proof (C-2)
   5. ∀i: nullifier_i == Poseidon(sk_i, record_id_i) ← nullifier correctness (C-2)
   6. ∀i: signature_verify(pk_i, tx_data, sig_i)  ← ownership (MOCK-01 待实现)

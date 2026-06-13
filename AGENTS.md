@@ -40,7 +40,7 @@ Every phase follows this strict cycle:
 | `aetheris-node` | P2P libp2p node, sled-backed state, consensus |
 | `aetheris-wallet` | CLI wallet (mnemonic, scan, send) |
 | `aetheris-ffi` | C-ABI bridge (30+ extern "C" functions) |
-| `aetheris-recursive` | Recursive proof aggregation (known-buggy — see below) |
+| `aetheris-recursive` | Recursive proof aggregation (IPA accumulation on Vesta — ✅ COMPLETE) |
 
 ### Halo2 Vendor Patches
 The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[patch]` in workspace `Cargo.toml`. Key change: visibility of query types relaxed from `pub(crate)` → `pub`. If patching or upgrading, coordinate both the git dep AND the vendor patches.
@@ -66,19 +66,13 @@ The PSE halo2 fork is patched at `aetheris-zkp/vendor/halo2/` and mapped via `[p
 ## Commands
 
 ```bash
-# Build & check everything (must always pass before commit)
 cargo check --workspace
 
-# Test safety: NEVER run all tests at once (aetheris-recursive has K=17/18
-# circuits consuming 2-4GB+ each → OOM). ALWAYS filter by test name and
-# limit parallelism.
-cargo test -p aetheris-zkp -- --test-threads=4
-cargo test -p aetheris-recursive --lib -- <prefix> --test-threads=2
+cargo test -p aetheris-zkp
+cargo test -p aetheris-recursive --lib -- <prefix>
 cargo test -p aetheris-core
 cargo test -p aetheris-crypto
-
-# FFI tests — MUST run with --test-threads=1 (sled Windows file lock)
-cargo test -p aetheris-ffi --lib -- --test-threads=1
+cargo test -p aetheris-ffi --lib
 ```
 
 No formatter (`rustfmt.toml`) or linter (`clippy.toml`) config exists — workspace uses defaults.

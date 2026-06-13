@@ -49,7 +49,7 @@ static CONSERVATION_KEY_CACHE: OnceLock<
     std::sync::Mutex<std::collections::HashMap<(usize, usize), ConservationKeyPair>>,
 > = OnceLock::new();
 
-fn ensure_conservation_params() -> &'static ParamsIPA<EqAffine> {
+pub fn ensure_conservation_params() -> &'static ParamsIPA<EqAffine> {
     CONSERVATION_PARAMS.get_or_init(|| {
         let crs_paths = ["aetheris-zkp/crs.bin", "crs.bin"];
         for path in &crs_paths {
@@ -346,7 +346,7 @@ impl Circuit<Fp> for ValueConservationCircuit {
             )?;
             config.s_conservation.enable(&mut region, offset)?;
 
-            // ─── Commitment bindings: instance[1+j] → advice[3] ────
+            // ─── Commitment copy: instance[1+j] → advice[3] ────
             for (j, cm_set) in self.output_commitments.iter().enumerate() {
                 let idx = n_in + j;
                 if idx < all_amounts.len() && !cm_set.is_empty() {
@@ -408,11 +408,22 @@ impl ZkProverSystem for Halo2PastaBackend {
         } else {
             in_blindings.to_vec()
         };
+        // Host-side check: output_commitments[j] must match create_commitment(amounts_out[j], out_blindings[j])
+        // This is a defense-in-depth check — the circuit enforces the copy constraint via instance→advice[3].
         let padded_out_blindings: Vec<[u8; 32]> = if out_blindings.is_empty() {
             vec![[0u8; 32]; amounts_out.len()]
         } else {
             out_blindings.to_vec()
         };
+        if !output_commitments.is_empty() {
+            for j in 0..amounts_out.len() {
+                let expected = create_commitment(amounts_out[j], &padded_out_blindings[j]);
+                if output_commitments[j] != expected {
+                    panic!("prove_conservation: output_commitments[{}] mismatch — expected {:02x?}, got {:02x?}",
+                        j, expected, output_commitments[j]);
+                }
+            }
+        }
         let padded_commitments: Vec<Vec<[u8; 32]>> = if output_commitments.is_empty() {
             amounts_out.iter().map(|_| vec![]).collect()
         } else {
@@ -774,8 +785,15 @@ mod tests {
         b
     }
 
-    fn make_proof(amounts_in: &[u64], amounts_out: &[u64], commitments: &[[u8; 32]], pub_amt: i64) -> Vec<u8> {
-        Halo2PastaBackend::prove_conservation(amounts_in, amounts_out, &[], &[], commitments, pub_amt)
+    fn make_proof(amounts_in: &[u64], amounts_out: &[u64], pub_amt: i64) -> (Vec<u8>, Vec<[u8; 32]>) {
+        let out_blindings: Vec<[u8; 32]> = vec![[0u8; 32]; amounts_out.len()];
+        let correct_cms: Vec<[u8; 32]> = amounts_out.iter()
+            .map(|&amt| create_commitment(amt, &[0u8; 32]))
+            .collect();
+        let proof = Halo2PastaBackend::prove_conservation(
+            amounts_in, amounts_out, &[], &out_blindings, &correct_cms, pub_amt,
+        );
+        (proof, correct_cms)
     }
 
     #[test]
@@ -1793,29 +1811,25 @@ mod tests {
 
     #[test]
     fn test_conservation_basic() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[100], &[100], &commitments, 0);
+        let (proof, commitments) = make_proof(&[100], &[100], 0);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, 0));
     }
 
     #[test]
     fn test_conservation_rejects_wrong_public_amount() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[100], &[100], &commitments, 0);
+        let (proof, commitments) = make_proof(&[100], &[100], 0);
         assert!(!Halo2PastaBackend::verify_conservation(&proof, &commitments, 1));
     }
 
     #[test]
     fn test_conservation_public_amount_net_zero() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[100], &[80], &commitments, 20);
+        let (proof, commitments) = make_proof(&[100], &[80], 20);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, 20));
     }
 
     #[test]
     fn test_conservation_negative_public_amount() {
-        let commitments = vec![[0u8; 32]; 2];
-        let proof = make_proof(&[50], &[70], &commitments, -20);
+        let (proof, commitments) = make_proof(&[50], &[70], -20);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -20));
     }
 
@@ -1823,16 +1837,14 @@ mod tests {
     /// Before sign fix, this shape panic'd at synthesis (net_value = -2*X != 0).
     #[test]
     fn test_mint_shape_proof_verifies() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[], &[1000], &commitments, -1000);
+        let (proof, commitments) = make_proof(&[], &[1000], -1000);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -1000));
     }
 
     /// Multi-output mint: 2 outs, sum equals -public_amount.
     #[test]
     fn test_mint_shape_multi_out_proof_verifies() {
-        let commitments = vec![[0u8; 32]; 2];
-        let proof = make_proof(&[], &[500, 500], &commitments, -1000);
+        let (proof, commitments) = make_proof(&[], &[500, 500], -1000);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, -1000));
     }
 
@@ -1840,8 +1852,7 @@ mod tests {
     /// (running_sum = -1000, instance[0] = 1000, so 1000 - (-1000) ≠ 0).
     #[test]
     fn test_mint_shape_wrong_sign_rejected_by_verifier() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[], &[1000], &commitments, 1000);
+        let (proof, commitments) = make_proof(&[], &[1000], 1000);
         assert!(!Halo2PastaBackend::verify_conservation(&proof, &commitments, 1000));
     }
 
@@ -1885,8 +1896,7 @@ mod tests {
     #[test]
     fn test_large_value_roundtrip() {
         let amount = u64::MAX;
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[amount], &[amount], &commitments, 0);
+        let (proof, commitments) = make_proof(&[amount], &[amount], 0);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, 0));
     }
 
@@ -1944,10 +1954,8 @@ mod tests {
 
     #[test]
     fn test_batch_verify_two_proofs() {
-        let commitments1 = vec![[0u8; 32]; 1];
-        let p1 = make_proof(&[10], &[10], &commitments1, 0);
-        let commitments2 = vec![[0u8; 32]; 1];
-        let p2 = make_proof(&[20], &[20], &commitments2, 0);
+        let (p1, commitments1) = make_proof(&[10], &[10], 0);
+        let (p2, commitments2) = make_proof(&[20], &[20], 0);
 
         assert!(Halo2PastaBackend::batch_verify_conservation(
             &[p1, p2],
@@ -1958,10 +1966,8 @@ mod tests {
 
     #[test]
     fn test_batch_verify_rejects_tampered_amount() {
-        let commitments1 = vec![[0u8; 32]; 1];
-        let p1 = make_proof(&[10], &[10], &commitments1, 0);
-        let commitments2 = vec![[0u8; 32]; 1];
-        let p2 = make_proof(&[20], &[20], &commitments2, 0);
+        let (p1, commitments1) = make_proof(&[10], &[10], 0);
+        let (p2, commitments2) = make_proof(&[20], &[20], 0);
 
         assert!(!Halo2PastaBackend::batch_verify_conservation(
             &[p1, p2],
@@ -1977,8 +1983,7 @@ mod tests {
 
     #[test]
     fn test_batch_verify_mismatched_lengths() {
-        let commitments1 = vec![[0u8; 32]; 1];
-        let p1 = make_proof(&[10], &[10], &commitments1, 0).to_vec();
+        let (p1, commitments1) = make_proof(&[10], &[10], 0);
         assert!(!Halo2PastaBackend::batch_verify_conservation(
             &[p1],
             &[&commitments1],
@@ -1988,8 +1993,8 @@ mod tests {
 
     #[test]
     fn test_batch_verify_rejects_tampered_proof() {
-        let commitments1 = vec![[0u8; 32]; 1];
-        let mut p1 = make_proof(&[10], &[10], &commitments1, 0);
+        let mut p1 = make_proof(&[10], &[10], 0).0;
+        let commitments1 = vec![create_commitment(10, &[0u8; 32])];
         if let Some(last) = p1.last_mut() {
             *last ^= 0xFF;
         }
@@ -2117,9 +2122,8 @@ mod tests {
 
     #[test]
     fn test_commitment_binding_rejects_tampered() {
-        let out_cms = vec![[0x11u8; 32], [0x22u8; 32]];
         let wrong_cms = vec![[0x01u8; 32], [0x02u8; 32]];
-        let proof = make_proof(&[100, 50], &[80, 70], &out_cms, 0);
+        let (proof, _) = make_proof(&[100, 50], &[80, 70], 0);
         assert!(!Halo2PastaBackend::verify_conservation(&proof, &wrong_cms, 0));
     }
 
@@ -2209,8 +2213,7 @@ mod tests {
 
     #[test]
     fn test_value_conservation_proof_verifies() {
-        let commitments = vec![[0u8; 32]; 1];
-        let proof = make_proof(&[42], &[42], &commitments, 0);
+        let (proof, commitments) = make_proof(&[42], &[42], 0);
         assert!(Halo2PastaBackend::verify_conservation(&proof, &commitments, 0));
     }
 

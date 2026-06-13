@@ -299,6 +299,7 @@ impl Circuit<Fq> for AccumulatorCircuit {
             value: self.depth_old,
             cell: Some(depth_cell.cell()),
         };
+        let depth_old_saved = depth_cur.clone();
 
         // Assign generator and offset for hash_to_curve scalar_mul.
         let gen_pt = assign_point(&ecc, &mut layouter, &config, &self.generator, "generator")?;
@@ -537,6 +538,32 @@ impl Circuit<Fq> for AccumulatorCircuit {
             depth_cur = depth_new;
         }
 
+        // ══ Depth safety (§C.7): range check + count binding ══
+        // 1. Range check: depth must fit in 32 bits (u32)
+        range.range_check(
+            layouter.namespace(|| "depth_range"),
+            &depth_cur,
+            32,
+        )?;
+        // 2. Count binding: depth_new == depth_old + num_txs
+        let num_txs_fq = fq.assign_constant(
+            layouter.namespace(|| "num_txs"),
+            Fq::from(self.txs.len() as u64),
+            "num_txs",
+        )?;
+        let expected_depth = fq.add(
+            layouter.namespace(|| "expected_depth"),
+            &depth_old_saved,
+            &num_txs_fq,
+            "expected_depth",
+        )?;
+        layouter.assign_region(|| "depth_eq", |mut region| {
+            if let (Some(cell_da), Some(cell_db)) = (depth_cur.cell, expected_depth.cell) {
+                region.constrain_equal(cell_da, cell_db)?;
+            }
+            Ok(())
+        })?;
+
         // ══ Constrain public instances ══
         if let Some(cell) = q_cur.x_cell {
             layouter.constrain_instance(cell, config.instance, 0)?;
@@ -672,7 +699,7 @@ mod tests {
             u_offset: u_off,
         };
         let instances = vec![vec![gx, gy, Fq::from(42), Fq::from(7)]];
-        let prover = MockProver::run(5, &circuit, instances).expect("mock prover");
+        let prover = MockProver::run(8, &circuit, instances).expect("mock prover");
         assert_eq!(prover.verify(), Ok(()));
     }
 

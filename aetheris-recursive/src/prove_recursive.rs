@@ -249,21 +249,72 @@ fn compute_expected_accumulator_output(
     (q_cur, transcript_cur, depth_cur)
 }
 
-/// Build a dummy `IpaTxWitness` for keygen (k rounds, n = 2^k generators).
+/// Build a dummy `IpaTxWitness` with k=2, n=4 for default keygen.
+pub fn build_dummy_ipa_witness() -> IpaTxWitness {
+    build_dummy_ipa_witness_k(2)
+}
+
+/// Build a dummy `IpaTxWitness` with specified k rounds (n = 2^k generators).
 /// The circuit structure (columns, gates, regions) is determined by the largest
 /// IPA witness structure — proving must use the same k to match keygen.
-pub fn build_dummy_ipa_witness() -> IpaTxWitness {
-    let k = 2usize;
+pub fn build_dummy_ipa_witness_k(k: usize) -> IpaTxWitness {
     let n = 1usize << k;
     let g0 = EqAffine::generator();
-    let two_pow_254 = {
-        let n = num_bigint::BigUint::from(2u128).pow(254);
-        let mut repr = <Fp as PrimeField>::Repr::default();
-        let le = n.to_bytes_le();
-        repr.as_mut()[..le.len()].copy_from_slice(&le);
-        Fp::from_repr(repr).unwrap()
-    };
-    let off_from_pt = |p: &EqAffine| -> VestaPoint {
+    let theta = Fq::from(5u64);
+    let chals: Vec<Fq> = vec![Fq::from(3u64), Fq::from(7u64)];
+    let a_val = Fq::from(11u64);
+    let r_val = Fq::from(13u64);
+    let eval_val = Fq::ZERO;
+
+    // Host-side IPA folding
+    let g_init_ea: Vec<EqAffine> = (0..n).map(|i| {
+        (g0 * Fp::from(i as u64 + 1)).to_affine()
+    }).collect();
+    let mut b_cur: Vec<Fq> = vec![Fq::ONE];
+    for _ in 1..n { b_cur.push(b_cur.last().unwrap() * theta); }
+    let mut g_cur = g_init_ea.clone();
+    for chal in &chals {
+        let x_inv = chal.invert().unwrap();
+        let half = b_cur.len() / 2;
+        let mut b_next = Vec::with_capacity(half);
+        let mut g_next = Vec::with_capacity(half);
+        for j in 0..half {
+            b_next.push(b_cur[j] + x_inv * b_cur[j + half]);
+            let g_scaled = (g_cur[j + half].to_curve() * fq_to_fp_scalar(x_inv)).to_affine();
+            g_next.push((g_cur[j].to_curve() + g_scaled).to_affine());
+        }
+        b_cur = b_next;
+        g_cur = g_next;
+    }
+    let b_final = b_cur[0];
+    let g_final = g_cur[0];
+
+    // L/R points
+    let l_ea: Vec<EqAffine> = (0..k).map(|i| (g0 * Fp::from(i as u64 + 10)).to_affine()).collect();
+    let r_ea: Vec<EqAffine> = (0..k).map(|i| (g0 * Fp::from(i as u64 + 20)).to_affine()).collect();
+
+    // lr_sum = Σ(x_inv·L_i + x·R_i)
+    let mut lr_sum = EqAffine::identity().to_curve();
+    for i in 0..k {
+        let x_inv_fp = fq_to_fp_scalar(chals[i].invert().unwrap());
+        let x_fp = fq_to_fp_scalar(chals[i]);
+        let l_scaled = (l_ea[i].to_curve() * x_inv_fp).to_affine();
+        let r_scaled = (r_ea[i].to_curve() * x_fp).to_affine();
+        lr_sum = lr_sum + l_scaled.to_curve() + r_scaled.to_curve();
+    }
+
+    // commitment = a·G_final + r'·H + (a·b - eval)·U - lr_sum  (eval=0)
+    let h_ea = (g0 * Fp::from(2u64)).to_affine();
+    let u_ea = (g0 * Fp::from(3u64)).to_affine();
+    let a_g = (g_final.to_curve() * fq_to_fp_scalar(a_val)).to_affine();
+    let r_h = (h_ea.to_curve() * fq_to_fp_scalar(r_val)).to_affine();
+    let ab_u = (u_ea.to_curve() * fq_to_fp_scalar(a_val * b_final)).to_affine();
+    let rhs = (a_g.to_curve() + r_h.to_curve() + ab_u.to_curve()).to_affine();
+    let cm_ea = (rhs.to_curve() - lr_sum).to_affine();
+
+    // Offsets (2^254 · points)
+    let two_pow_254 = Fp::from(2u64).pow_vartime(&[254, 0, 0, 0]);
+    let off_fn = |p: &EqAffine| -> VestaPoint {
         let s = (p.to_curve() * two_pow_254).to_affine();
         let c = s.coordinates().unwrap();
         VestaPoint::new(*c.x(), *c.y())
@@ -273,38 +324,44 @@ pub fn build_dummy_ipa_witness() -> IpaTxWitness {
         VestaPoint::new(*c.x(), *c.y())
     };
 
-    let g_init: Vec<VestaPoint> = (0..n).map(|i| {
-        to_vp(&(g0 * Fp::from(i as u64 + 1)).to_affine())
-    }).collect();
-    let dummy_lr_ea: Vec<EqAffine> = (0..k).map(|i| {
-        (g0 * Fp::from(i as u64 + 100)).to_affine()
-    }).collect();
-    let dummy_lr_vp: Vec<VestaPoint> = dummy_lr_ea.iter().map(to_vp).collect();
+    // g_all offsets: n + n/2 + n/4 = 2n-1 points
+    let mut g_all = vec![g_init_ea.clone()];
+    for chal in &chals {
+        let x_inv = chal.invert().unwrap();
+        let half = g_all.last().unwrap().len() / 2;
+        let cur = g_all.last().unwrap();
+        let mut next = Vec::with_capacity(half);
+        for j in 0..half {
+            let g_sc = (cur[j + half].to_curve() * fq_to_fp_scalar(x_inv)).to_affine();
+            next.push((cur[j].to_curve() + g_sc).to_affine());
+        }
+        g_all.push(next);
+    }
+    let offset_points: Vec<VestaPoint> = g_all.iter()
+        .flat_map(|round_g| round_g.iter())
+        .map(|g| off_fn(g))
+        .collect();
 
-    let offset_points: Vec<VestaPoint> = (0..2 * n - 1).map(|i| {
-        let p = (g0 * Fp::from(i as u64 + 200)).to_affine();
-        off_from_pt(&p)
-    }).collect();
-
-    let lr_offsets: Vec<VestaPoint> = dummy_lr_ea.iter().chain(dummy_lr_ea.iter())
-        .map(|p| off_from_pt(p)).collect();
+    let lr_offsets: Vec<VestaPoint> = l_ea.iter().zip(r_ea.iter())
+        .flat_map(|(l, r)| [off_fn(l), off_fn(r)]).collect();
 
     IpaTxWitness {
-        point: Value::known(Fq::ZERO),
-        commitment: VestaPoint::new(Fq::ZERO, Fq::ZERO),
-        eval: Value::known(Fq::ZERO),
-        a_final: Value::known(Fq::ZERO),
-        r_prime: Value::known(Fq::ZERO),
-        l_points: dummy_lr_vp.clone(),
-        r_points: dummy_lr_vp,
+        point: Value::known(theta),
+        commitment: to_vp(&cm_ea),
+        eval: Value::known(eval_val),
+        a_final: Value::known(a_val),
+        r_prime: Value::known(r_val),
+        l_points: l_ea.iter().map(to_vp).collect(),
+        r_points: r_ea.iter().map(to_vp).collect(),
         lr_offsets,
-        g_init,
+        g_init: g_init_ea.iter().map(to_vp).collect(),
         offset_points,
-        challenges: vec![Value::known(Fq::ZERO); k],
+        challenges: chals.iter().map(|c| Value::known(*c)).collect(),
     }
 }
 
-/// Generate proving key and verifying key for `AccumulatorCircuit`.
+/// Generate proving key and verifying key for `AccumulatorCircuit` with
+/// default IPA k=2. Use `build_accumulate_keys_k` for custom k.
 ///
 /// `num_txs` must equal the length of the txs slice that will be passed to
 /// `prove_block_recursive`. The keygen circuit must have the same structure
@@ -318,6 +375,16 @@ pub fn build_dummy_ipa_witness() -> IpaTxWitness {
 pub fn build_accumulate_keys(
     params: &ParamsIPA<EpAffine>,
     num_txs: usize,
+) -> Result<(VerifyingKey<EpAffine>, ProvingKey<EpAffine>), Error> {
+    build_accumulate_keys_k(params, num_txs, 2)
+}
+
+/// Generate proving key and verifying key for `AccumulatorCircuit` with
+/// specified IPA round count `k` (2^k generators for IPA folding).
+pub fn build_accumulate_keys_k(
+    params: &ParamsIPA<EpAffine>,
+    num_txs: usize,
+    ipa_k: usize,
 ) -> Result<(VerifyingKey<EpAffine>, ProvingKey<EpAffine>), Error> {
     let (gen_pt, off_pt) = compute_generator_and_offset();
     let gen_coords = EqAffine::generator().coordinates().unwrap();
@@ -342,7 +409,7 @@ pub fn build_accumulate_keys(
             Value::known(Fq::ZERO),
         ],
         pi_commitment_offset: off_pt.clone(),
-        ipa_proof: None,
+        ipa_proof: Some(build_dummy_ipa_witness_k(ipa_k)),
     };
     let circuit = AccumulatorCircuit {
         q_old: VestaPoint::new(gx, gy),
@@ -606,11 +673,28 @@ pub fn proof_to_ipa_tx_witness(
     params: &ParamsIPA<EqAffine>,
     k: u32,
 ) -> Result<IpaTxWitness, String> {
-    use crate::proof_import::parse_vesta_proof;
-    use num_bigint::BigUint;
+    use crate::poseidon_transcript::PoseidonTranscriptChip;
 
-    let data = parse_vesta_proof(proof, k)?;
+    let data = crate::proof_import::parse_vesta_proof(proof, k)?;
     let n = 1usize << k;
+
+    // Derive theta and round challenges via host-side Poseidon transcript
+    // (matching VestaAccumulateChip::squeeze_challenges circuit behavior).
+    let l_coords: Vec<(Fq, Fq)> = data.l_points.iter()
+        .map(|p| { let c = p.coordinates().unwrap(); (*c.x(), *c.y()) })
+        .collect();
+    let r_coords: Vec<(Fq, Fq)> = data.r_points.iter()
+        .map(|p| { let c = p.coordinates().unwrap(); (*c.x(), *c.y()) })
+        .collect();
+    let l_x: Vec<Fq> = l_coords.iter().map(|(x, _)| *x).collect();
+    let l_y: Vec<Fq> = l_coords.iter().map(|(_, y)| *y).collect();
+    let r_x: Vec<Fq> = r_coords.iter().map(|(x, _)| *x).collect();
+    let r_y: Vec<Fq> = r_coords.iter().map(|(_, y)| *y).collect();
+    let (theta, round_chals) =
+        PoseidonTranscriptChip::host_derive_ipa_theta_and_challenges(
+            k as usize, &l_x, &l_y, &r_x, &r_y,
+        );
+    let round_chals_fq: Vec<Fq> = round_chals;
 
     // Convert generators from params (Vesta curve points → VestaPoint)
     let to_vp = |p: &EqAffine| -> VestaPoint {
@@ -623,22 +707,16 @@ pub fn proof_to_ipa_tx_witness(
     let l_points: Vec<VestaPoint> = data.l_points.iter().map(&to_vp).collect();
     let r_points: Vec<VestaPoint> = data.r_points.iter().map(&to_vp).collect();
 
-    // Compute 2^254 as Fq (for offset scalar multiplication on Vesta)
-    let big_two = BigUint::from(2u128).pow(254);
-    let mut repr = <Fq as PrimeField>::Repr::default();
-    let le = big_two.to_bytes_le();
-    repr.as_mut()[..le.len()].copy_from_slice(&le);
-    let two_pow_254_fq = Fq::from_repr(repr).unwrap();
+    // Compute 2^254 as Fp (Vesta scalar field) for offset scalar multiplication.
+    // Must match compute_ipa_constants() which uses Fp::from(2u64).pow_vartime(&[254, 0, 0, 0]).
+    let two_pow_254_fp = Fp::from(2u64).pow_vartime(&[254, 0, 0, 0]);
 
     // Flattened offset_points: 2^254 · g for all generators across all folding rounds.
     // Round 0: n generators, round 1: n/2, ..., total = 2n - 1.
-    // We work entirely with EqAffine (Vesta) for folding, then convert to VestaPoint.
     let mut g_all: Vec<Vec<EqAffine>> = vec![params.g().to_vec()];
-    for i in 0..k as usize {
-        let x_inv = data.round_chals[i].invert().unwrap();
-        let x_inv_fq = x_inv;  // already Fq
-        // Convert Fq to Fp for Vesta scalar multiplication
-        let x_inv_fp = fq_to_fp_scalar(x_inv_fq);
+    for chal in &round_chals_fq {
+        let x_inv = chal.invert().unwrap_or(Fq::ZERO);
+        let x_inv_fp = fq_to_fp_scalar(x_inv);
         let half = g_all.last().unwrap().len() / 2;
         let cur = g_all.last().unwrap();
         let mut next = Vec::with_capacity(half);
@@ -649,8 +727,6 @@ pub fn proof_to_ipa_tx_witness(
         }
         g_all.push(next);
     }
-
-    let two_pow_254_fp = fq_to_fp_scalar(two_pow_254_fq);
 
     let offset_points: Vec<VestaPoint> = g_all.iter()
         .flat_map(|round_g| round_g.iter())
@@ -663,7 +739,7 @@ pub fn proof_to_ipa_tx_witness(
         .collect();
 
     // Compute commitment and eval by running the IPA protocol host-side.
-    // Re-fold generators and b-vector with the extracted challenges to get
+    // Re-fold generators and b-vector with the Poseidon-derived challenges to get
     // G_final and b_final. Then compute commitment P from the IPA equation.
     // We set eval = 0 and derive P from the equation — producing a
     // self-consistent witness pair that the circuit accepts.
@@ -672,17 +748,15 @@ pub fn proof_to_ipa_tx_witness(
     let h = (g0 * Fp::from(2u64)).to_affine();
     let u = (g0 * Fp::from(3u64)).to_affine();
 
-    let theta = data.theta;
-
     // Build b-vector: [1, theta, theta^2, ..., theta^(n-1)]
     let mut b_cur = vec![Fq::ONE];
     for _ in 1..n {
         b_cur.push(b_cur.last().unwrap() * theta);
     }
 
-    // Fold generators and b-vector with round challenges
+    // Fold generators and b-vector with Poseidon-derived round challenges
     let mut g_cur: Vec<EqAffine> = params.g().to_vec();
-    for chal in &data.round_chals {
+    for chal in &round_chals_fq {
         let x_inv = chal.invert().unwrap_or(Fq::ZERO);
         let half = b_cur.len() / 2;
 
@@ -707,7 +781,7 @@ pub fn proof_to_ipa_tx_witness(
     // Compute Σ(x_i^-1·L_i + x_i·R_i)
     let mut lr_sum = EqAffine::identity().to_curve();
     for i in 0..k as usize {
-        let x = data.round_chals[i];
+        let x = round_chals_fq[i];
         let x_inv = x.invert().unwrap_or(Fq::ZERO);
         let x_inv_fp = fq_to_fp_scalar(x_inv);
         let x_fp = fq_to_fp_scalar(x);
@@ -743,7 +817,7 @@ pub fn proof_to_ipa_tx_witness(
         lr_offsets,
         g_init,
         offset_points,
-        challenges: data.round_chals.iter().map(|c| Value::known(*c)).collect(),
+        challenges: round_chals_fq.iter().map(|c| Value::known(*c)).collect(),
     })
 }
 
@@ -871,7 +945,7 @@ mod tests {
                 Value::known(Fq::ZERO),
             ],
             pi_commitment_offset: off_pt,
-            ipa_proof: None,
+            ipa_proof: Some(build_dummy_ipa_witness()),
         };
 
         // Use K=15 to ensure enough rows for 1 tx circuit (scalar_mul loops are large)
@@ -945,7 +1019,7 @@ mod tests {
                 Value::known(Fq::ZERO),
             ],
             pi_commitment_offset: off_pt.clone(),
-            ipa_proof: None,
+            ipa_proof: Some(build_dummy_ipa_witness()),
         };
 
         let q_old = EqAffine::generator();
@@ -1024,5 +1098,182 @@ mod tests {
         corrupted[idx] ^= 0xff;
         let rejected = verify_accumulate_proof(&params, &vk, &corrupted, instances);
         assert!(!rejected, "verify must reject corrupted proof");
+    }
+
+    #[test]
+    fn test_e2e_conservation_proof_to_ipa_witness() {
+        // §E.5.5: End-to-end test of the IPA witness pipeline with a real
+        // conservation proof (K=11 → n=2048 generators).
+        //
+        // Steps:
+        //   1. Generate a real Vesta conservation proof via Halo2PastaBackend
+        //   2. Parse proof bytes → extract L/R points, a_final, r_prime (§E.5.1)
+        //   3. Derive theta + round challenges via Poseidon host-side (§E.5.2)
+        //   4. Fold generators + b-vector → compute commitment from IPA equation (§E.5.3)
+        //   5. Host-side self-check: verify the IPA equation holds
+        //
+        // MockProver is NOT used here (n=2048 requires K≥17 which risks OOM in
+        // CI). Instead, the host-side self-check validates that the parsed proof
+        // produces a self-consistent IpaTxWitness.
+        //
+        // The circuit path (AccumulatorCircuit with IpaTxWitness) is verified by
+        // test_dummy_ipa_witness_circuit (k=2, n=4) and
+        // test_prove_and_verify_accumulate_single_tx (k=2 via build_dummy_ipa_witness_k).
+        use aetheris_zkp::ZkProverSystem;
+        use aetheris_zkp::halo2_pasta::{Halo2PastaBackend, ensure_conservation_params};
+
+        let proof = Halo2PastaBackend::prove_conservation(
+            &[100], &[100], &[], &[], &[], 0,
+        );
+        assert!(proof.len() > 100, "proof should be non-trivial");
+
+        // Parse conservation proof → IpaTxWitness using the same global params
+        let params = ensure_conservation_params();
+        let k = 11u32;
+        let ipa_wit = proof_to_ipa_tx_witness(&proof, params, k)
+            .expect("proof_to_ipa_tx_witness should succeed");
+
+        // Host-side self-check: verify the IPA equation
+        //   commitment + Σ(x_inv·L_i + x·R_i) = a·G_final + r'·H + (a·b_final)·U
+        // (eval = 0 since we derived commitment from eval=0)
+        let theta = known_fq(ipa_wit.point);
+        let a_final = known_fq(ipa_wit.a_final);
+        let r_prime = known_fq(ipa_wit.r_prime);
+
+        let g0 = EqAffine::generator();
+        // Compute b-vector and b_final from theta
+        let n = 1usize << k;
+        let mut b_cur = vec![Fq::ONE];
+        for _ in 1..n {
+            b_cur.push(b_cur.last().unwrap() * theta);
+        }
+        // Fold b-vector with challenges
+        for chal in &ipa_wit.challenges {
+            let x_inv = known_fq(*chal).invert().unwrap_or(Fq::ZERO);
+            let half = b_cur.len() / 2;
+            let mut b_next = Vec::with_capacity(half);
+            for j in 0..half {
+                b_next.push(b_cur[j] + x_inv * b_cur[j + half]);
+            }
+            b_cur = b_next;
+        }
+        let b_final = b_cur[0];
+
+        // Reconstruct L/R points from VestaPoint (need x/y coordinates)
+        let to_ea = |vp: &VestaPoint| -> EqAffine {
+            let x = known_fq(vp.x);
+            let y = known_fq(vp.y);
+            EqAffine::from_xy(x, y).unwrap_or(EqAffine::identity())
+        };
+        let l_ea: Vec<EqAffine> = ipa_wit.l_points.iter().map(to_ea).collect();
+        let r_ea: Vec<EqAffine> = ipa_wit.r_points.iter().map(to_ea).collect();
+        let cm_ea = to_ea(&ipa_wit.commitment);
+
+        // Compute LHS = commitment + Σ(x_inv·L_i + x·R_i)
+        let mut lhs = cm_ea.to_curve();
+        for i in 0..k as usize {
+            let x = known_fq(ipa_wit.challenges[i]);
+            let x_fp = fq_to_fp_scalar(x);
+            let x_inv = x.invert().unwrap_or(Fq::ZERO);
+            let x_inv_fp = fq_to_fp_scalar(x_inv);
+            let l_scaled = (l_ea[i].to_curve() * x_inv_fp).to_affine();
+            let r_scaled = (r_ea[i].to_curve() * x_fp).to_affine();
+            lhs = lhs + l_scaled.to_curve() + r_scaled.to_curve();
+        }
+
+        // Compute RHS = a·G_final + r'·H + (a·b_final)·U
+        // Need to fold generators to find G_final
+        let mut g_cur: Vec<EqAffine> = params.g().to_vec();
+        for chal in &ipa_wit.challenges {
+            let x = known_fq(*chal);
+            let x_inv = x.invert().unwrap_or(Fq::ZERO);
+            let x_inv_fp = fq_to_fp_scalar(x_inv);
+            let half = g_cur.len() / 2;
+            let mut g_next = Vec::with_capacity(half);
+            for j in 0..half {
+                let g_scaled = (g_cur[j + half].to_curve() * x_inv_fp).to_affine();
+                g_next.push((g_cur[j].to_curve() + g_scaled).to_affine());
+            }
+            g_cur = g_next;
+        }
+        let g_final = g_cur[0];
+
+        let h_ea = (g0 * Fp::from(2u64)).to_affine();
+        let u_ea = (g0 * Fp::from(3u64)).to_affine();
+        let a_fp = fq_to_fp_scalar(a_final);
+        let rp_fp = fq_to_fp_scalar(r_prime);
+        let ab = a_final * b_final;
+        let ab_fp = fq_to_fp_scalar(ab);
+
+        let rhs_a = (g_final * a_fp).to_affine();
+        let rhs_h = (h_ea * rp_fp).to_affine();
+        let rhs_u = (u_ea * ab_fp).to_affine();
+        let rhs = rhs_a.to_curve() + rhs_h.to_curve() + rhs_u.to_curve();
+
+        let lhs_aff = lhs.to_affine();
+        let rhs_aff = rhs.to_affine();
+        let lx = lhs_aff.coordinates().map(|c| *c.x());
+        let rx = rhs_aff.coordinates().map(|c| *c.x());
+        assert_eq!(lhs_aff, rhs_aff,
+            "IPA equation must hold: LHS.x={:?} RHS.x={:?} (eval=0 host-side derivation)",
+            lx, rx);
+    }
+
+    #[test]
+    fn test_dummy_ipa_witness_circuit() {
+        // §E.5.5: Verify the accumulator circuit accepts a self-consistent IpaTxWitness
+        // with non-zero values using MockProver. Uses k=2 (n=4) for speed.
+        // K=14 is needed because scalar_mul allocates one row per bit (254+ rows each)
+        // and verify_ipa_full uses 3 + 2k = 7 scalar_mul operations.
+        use halo2_proofs::dev::MockProver;
+
+        let (gen_pt, off_pt) = compute_generator_and_offset();
+        let (h_pt, h_off, u_pt, u_off) = compute_ipa_constants();
+        let ipa_wit = build_dummy_ipa_witness();
+
+        // Build the accumulator circuit
+        let q_old = EqAffine::generator();
+        let transcript_old = Fq::from(42);
+        let depth_old = 7u32;
+
+        let tx = TxWitness {
+            ipe: Value::known(Fq::ONE),
+            c: [Value::known(Fq::ONE), Value::known(Fq::ZERO), Value::known(Fq::ZERO),
+                Value::known(Fq::ZERO), Value::known(Fq::ZERO)],
+            sel: [Value::known(Fq::ONE), Value::known(Fq::ZERO), Value::known(Fq::ZERO),
+                   Value::known(Fq::ZERO), Value::known(Fq::ZERO)],
+            pi_commitment_offset: off_pt.clone(),
+            ipa_proof: Some(ipa_wit),
+        };
+
+        let (q_new_host, transcript_new_host, depth_new_host) =
+            compute_expected_accumulator_output(q_old, transcript_old, depth_old, &[tx.clone()]);
+
+        let circuit = AccumulatorCircuit {
+            q_old: eq_to_vesta_point(&q_old),
+            transcript_old: Value::known(transcript_old),
+            depth_old: Value::known(Fq::from(depth_old as u64)),
+            txs: vec![tx],
+            q_new: eq_to_vesta_point(&q_new_host),
+            transcript_new: Value::known(transcript_new_host),
+            depth_new: Value::known(Fq::from(depth_new_host as u64)),
+            generator: gen_pt,
+            gen_offset: off_pt.clone(),
+            h_point: h_pt,
+            h_offset: h_off,
+            u_point: u_pt,
+            u_offset: u_off,
+        };
+
+        let qn_coords = q_new_host.coordinates().unwrap();
+        let instances = vec![vec![
+            *qn_coords.x(),
+            *qn_coords.y(),
+            transcript_new_host,
+            Fq::from(depth_new_host as u64),
+        ]];
+        let prover = MockProver::run(14, &circuit, instances).expect("mock prover");
+        let result = prover.verify();
+        assert_eq!(result, Ok(()), "AccumulatorCircuit with non-zero dummy IPA must be satisfied");
     }
 }

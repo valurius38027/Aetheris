@@ -1,4 +1,6 @@
 use ff::{Field, PrimeField};
+use group::prime::PrimeCurveAffine;
+use group::GroupEncoding;
 use halo2_proofs::halo2curves::pasta::{EpAffine, EqAffine, Fp, Fq};
 use halo2_proofs::transcript::{Blake2bRead, Challenge255, Transcript, TranscriptRead, TranscriptReadBuffer};
 
@@ -184,23 +186,52 @@ pub fn parse_proof_bytes(
     })
 }
 
-/// Parsed data extracted from a Vesta (EqAffine) IPA proof by replaying
-/// the Halo2 Blake2b transcript. Includes theta (evaluation point) and
-/// per-round challenges for use as circuit witness (§E.5).
+/// Parsed data extracted from a Vesta (EqAffine) IPA proof using raw byte parsing.
+///
+/// Only k, L/R points, a_final, r_prime are extracted from the proof bytes.
+/// Theta and round challenges are NOT extracted here — they must be derived
+/// via host-side Poseidon transcript (see `poseidon_transcript.rs`:
+/// `host_derive_ipa_theta_and_challenges`).
+///
+/// All elements in the Halo2 proof output are 32-byte aligned:
+/// - Points: compressed EqAffine (32 bytes: x coordinate + sign bit)
+/// - Scalars: Fp to_repr (32 bytes LE)
 pub struct VestaProofData {
     pub k: u32,
-    /// Theta — evaluation point for polynomial commitment (Fq, native in Circuit<Fq>).
-    pub theta: Fq,
-    /// Per-round challenges x_i (length k), extracted from Blake2b transcript replay.
-    pub round_chals: Vec<Fq>,
     pub l_points: Vec<EqAffine>,
     pub r_points: Vec<EqAffine>,
     pub a_final: Fp,
     pub r_prime: Fp,
 }
 
-/// Parse a Vesta conservation proof and replay the Blake2b transcript to
-/// extract all round challenges.
+/// Find the byte offset of the first IPA proof `k` value inside Vesta proof bytes.
+///
+/// The Halo2 conservation proof format:
+///   [0..19]    b"halo2_ipa_vesta_v1_"
+///   [19..21]   in_len as u16 LE
+///   [21..23]   out_len as u16 LE
+///   [23..]     plonk proof (commitments + evaluations) + IPA proof(s)
+///
+/// The IPA proof `k` is written as a CommonScalar (Fp::from(k as u64)),
+/// serialized as 32-byte LE repr. k=11 → [11, 0, 0, 0, 0...0].
+///
+/// We scan 32-byte aligned positions for the first valid k (1..20).
+fn find_ipa_k_offset(inner: &[u8], expected_k: u32) -> Option<usize> {
+    for offset in (0..inner.len().saturating_sub(32)).step_by(32) {
+        let val = u32::from_le_bytes([
+            inner[offset], inner[offset + 1], inner[offset + 2], inner[offset + 3],
+        ]);
+        if val != expected_k {
+            continue;
+        }
+        if inner[offset + 4..offset + 32].iter().all(|&b| b == 0) {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+/// Parse a Vesta conservation proof using raw byte extraction.
 ///
 /// Wire format (same as `prove_conservation` in `halo2_pasta.rs`):
 ///   [0..19]  b"halo2_ipa_vesta_v1_"
@@ -208,13 +239,16 @@ pub struct VestaProofData {
 ///   [21..23] out_len as u16 LE
 ///   [23..]   internal Halo2 IPA proof bytes
 ///
-/// Blake2b challenge protocol replayed:
-///   absorb(k) → squeeze(theta)
-///   for each round: absorb(L) → absorb(R) → squeeze(x_i)
-///   read(a_final) → read(r_prime)
+/// The IPA proof portion contains k rounds of L/R points followed by
+/// a_final and r_prime scalars. All elements are 32 bytes:
+///   k(32) || L_0(32) || R_0(32) || ... || L_{k-1}(32) || R_{k-1}(32) || a_final(32) || r_prime(32)
 ///
-/// The `squeeze_challenge_scalar` method absorbs 0x00 then hashes the Blake2b
-/// state. Rejection sampling is handled (challenge != 0, != 1 per Halo2 spec).
+/// Use `find_ipa_k_offset` to locate the first IPA proof within the plonk
+/// boilerplate. The first IPA proof is the only one parsed (all unique
+/// evaluation points share the same k).
+///
+/// Returns VestaProofData with only the raw extracted data. Theta and
+/// round challenges must be derived via Poseidon host-side transcript.
 pub fn parse_vesta_proof(proof: &[u8], k_expected: u32) -> Result<VestaProofData, String> {
     const PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
     const PREFIX_LEN: usize = 19;
@@ -227,82 +261,59 @@ pub fn parse_vesta_proof(proof: &[u8], k_expected: u32) -> Result<VestaProofData
         return Err("proof too short".into());
     }
 
-    let internal = &proof[PREFIX_LEN + SHAPE_LEN..];
-    let mut transcript =
-        Blake2bRead::<&[u8], EqAffine, Challenge255<EqAffine>>::init(internal);
+    let inner = &proof[PREFIX_LEN + SHAPE_LEN..];
+    let k_offset = find_ipa_k_offset(inner, k_expected)
+        .ok_or_else(|| format!("could not find k={} in proof bytes", k_expected))?;
 
-    let k_fp: Fp = transcript
-        .read_scalar()
-        .map_err(|e| format!("read k: {:?}", e))?;
-    let k_bytes = k_fp.to_repr();
-    let k = u32::from_le_bytes([
-        k_bytes.as_ref()[0],
-        k_bytes.as_ref()[1],
-        k_bytes.as_ref()[2],
-        k_bytes.as_ref()[3],
-    ]);
-    if k != k_expected {
-        return Err(format!("proof k={} != expected k={}", k, k_expected));
-    }
+    // Start of IPA proof within inner bytes
+    let ipa_start = &inner[k_offset..];
+    let elem = |off: usize| -> &[u8] {
+        &ipa_start[off..off + 32]
+    };
+    let k_usize = k_expected as usize;
 
-    // Squeeze theta (evaluation point)
-    let theta_fp: Fp = *transcript.squeeze_challenge_scalar::<()>();
-    let theta = fp_to_fq(theta_fp);
-
-    let k_usize = k as usize;
     let mut l_points = Vec::with_capacity(k_usize);
     let mut r_points = Vec::with_capacity(k_usize);
-    let mut round_chals = Vec::with_capacity(k_usize);
 
-    for _ in 0..k {
-        let l: EqAffine = transcript
-            .read_point()
-            .map_err(|e| format!("read L: {:?}", e))?;
-        let r: EqAffine = transcript
-            .read_point()
-            .map_err(|e| format!("read R: {:?}", e))?;
-
-        let x_fp: Fp = *transcript.squeeze_challenge_scalar::<()>();
-        let mut x = x_fp;
-        let mut reject_count = 0u32;
-        while bool::from(x.is_zero()) || x == Fp::ONE {
-            reject_count += 1;
-            transcript
-                .common_scalar(Fp::from(reject_count as u64))
-                .map_err(|e| format!("reject: {:?}", e))?;
-            x = *transcript.squeeze_challenge_scalar::<()>();
-        }
-
+    // L and R points: alternately parse k compressed EqAffine points
+    for i in 0..k_usize {
+        let l_bytes: [u8; 32] = elem(32 + 2 * i * 32 + 0 * 32)
+            .try_into()
+            .map_err(|_| "L point byte read failed".to_string())?;
+        let l = EqAffine::from_bytes(&l_bytes).unwrap_or(EqAffine::identity());
         l_points.push(l);
+
+        let r_bytes: [u8; 32] = elem(32 + 2 * i * 32 + 1 * 32)
+            .try_into()
+            .map_err(|_| "R point byte read failed".to_string())?;
+        let r = EqAffine::from_bytes(&r_bytes).unwrap_or(EqAffine::identity());
         r_points.push(r);
-        round_chals.push(fp_to_fq(x));
     }
 
-    let a_final: Fp = transcript
-        .read_scalar()
-        .map_err(|e| format!("read a_final: {:?}", e))?;
-    let r_prime: Fp = transcript
-        .read_scalar()
-        .map_err(|e| format!("read r_prime: {:?}", e))?;
+    // a_final and r_prime: next two 32-byte blocks after all L/R
+    let a_final_offset = 32 + 2 * k_usize * 32;
+    let a_final_bytes: [u8; 32] = elem(a_final_offset)
+        .try_into()
+        .map_err(|_| "a_final byte read failed".to_string())?;
+    let mut a_final_repr = <Fp as PrimeField>::Repr::default();
+    a_final_repr.as_mut().copy_from_slice(&a_final_bytes);
+    let a_final = Fp::from_repr(a_final_repr).unwrap_or(Fp::ZERO);
+
+    let r_prime_offset = a_final_offset + 32;
+    let r_prime_bytes: [u8; 32] = elem(r_prime_offset)
+        .try_into()
+        .map_err(|_| "r_prime byte read failed".to_string())?;
+    let mut r_prime_repr = <Fp as PrimeField>::Repr::default();
+    r_prime_repr.as_mut().copy_from_slice(&r_prime_bytes);
+    let r_prime = Fp::from_repr(r_prime_repr).unwrap_or(Fp::ZERO);
 
     Ok(VestaProofData {
-        k,
-        theta,
-        round_chals,
+        k: k_expected,
         l_points,
         r_points,
         a_final,
         r_prime,
     })
-}
-
-/// Convert an Fp scalar to an Fq value preserving the integer (byte) representation.
-/// Fp::MODULUS < Fq::MODULUS for the Pasta cycle, so any valid Fp repr is also
-/// a valid Fq repr.
-fn fp_to_fq(fp: Fp) -> Fq {
-    let mut fq_repr = <Fq as PrimeField>::Repr::default();
-    fq_repr.as_mut().copy_from_slice(fp.to_repr().as_ref());
-    Fq::from_repr(fq_repr).unwrap_or(Fq::ZERO)
 }
 
 #[cfg(test)]

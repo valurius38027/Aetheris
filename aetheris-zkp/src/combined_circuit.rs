@@ -280,6 +280,11 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             .map(|s| Fq::from_repr(*s).expect("sibling is canonical Fq"))
             .collect();
 
+        // Host-side check in prove_combined_tx verifies commitment binding.
+        // Circuit constraint for Fq-based Pedersen commitment is deferred
+        // (requires ECC gates). The copy constraint instance→advice[3] ensures
+        // the commitment value is a public input.
+
         // ── Witness region (bits, sk, index) ──
         let sk_cell: Cell;
         let index_cell: Cell;
@@ -437,7 +442,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                 )?;
                 config.s_conservation.enable(&mut region, offset)?;
 
-                // Commitment bindings: instance[3+j] → advice[3]
+                // Commitment copy: instance[3+j] → advice[3]
                 for (j, cm_set) in self.output_commitments.iter().enumerate() {
                     let idx = n_in + j;
                     if idx < all_amounts.len() && !cm_set.is_empty() {
@@ -777,6 +782,17 @@ pub fn prove_combined_tx(
         output_commitments.iter().map(|&cm| vec![cm]).collect()
     };
 
+    // Host-side check: output_commitments[j] must match create_commitment(amounts_out[j], out_blindings[j])
+    if !output_commitments.is_empty() {
+        for j in 0..amounts_out.len() {
+            let expected = crate::halo2_pasta::create_commitment(amounts_out[j], &padded_out_blindings[j]);
+            if output_commitments[j] != expected {
+                panic!("prove_combined_tx: output_commitments[{}] mismatch — expected {:02x?}, got {:02x?}",
+                    j, expected, output_commitments[j]);
+            }
+        }
+    }
+
     let circuit = CombinedConservationCircuit {
         amounts_in: amounts_in.to_vec(),
         amounts_out: amounts_out.to_vec(),
@@ -945,12 +961,15 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, leaf_index as u64);
 
+        // Compute correct commitment: create_commitment(amount, blinding)
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let circuit = CombinedConservationCircuit {
             amounts_in: vec![100, 200],
             amounts_out: vec![300],
             in_blindings: vec![[1u8; 32], [2u8; 32]],
             out_blindings: vec![[3u8; 32]],
-            output_commitments: vec![vec![[4u8; 32]]],
+            output_commitments: vec![vec![correct_cm]],
             public_amount: 0,
             leaf: leaves[leaf_index],
             path_siblings: path.siblings.clone(),
@@ -963,7 +982,8 @@ mod tests {
 
         let root_fq = Fq::from_repr(if expect_valid { root } else { make_leaf(0xFF) }).unwrap();
         let nf_fq = Fq::from_repr(nf).unwrap();
-        let instances = vec![vec![root_fq, nf_fq, Fq::ZERO, Fq::from(4)]];
+        let cm_fq = Fq::from_repr(correct_cm).unwrap();
+        let instances = vec![vec![root_fq, nf_fq, Fq::ZERO, cm_fq]];
         let prover = MockProver::run(MEMBERSHIP_K, &circuit, instances).unwrap();
         if expect_valid {
             assert_eq!(prover.verify(), Ok(()));
@@ -1011,12 +1031,14 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let circuit = CombinedConservationCircuit {
             amounts_in: vec![100, 200],
             amounts_out: vec![300],
             in_blindings: vec![[1u8; 32], [2u8; 32]],
             out_blindings: vec![[3u8; 32]],
-            output_commitments: vec![vec![[4u8; 32]]],
+            output_commitments: vec![vec![correct_cm]],
             public_amount: 0,
             leaf: leaves[2],
             path_siblings: path.siblings.clone(),
@@ -1026,12 +1048,13 @@ mod tests {
             merkle_root: root,
             nullifier: nf,
         };
-        // Wrong public_amount = 1 (should be 0)
+        // Wrong public_amount = 1 (should be 0), correct commitment
+        let cm_fq = Fq::from_repr(correct_cm).unwrap();
         let instances = vec![vec![
             Fq::from_repr(root).unwrap(),
             Fq::from_repr(nf).unwrap(),
             Fq::from(1u64),
-            Fq::from(4),
+            cm_fq,
         ]];
         let prover = MockProver::run(MEMBERSHIP_K, &circuit, instances).unwrap();
         assert!(prover.verify().is_err());
@@ -1056,12 +1079,14 @@ mod tests {
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
         let wrong_nf = poseidon_fq::poseidon_nullifier(&make_leaf(0xBEEF), 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let circuit = CombinedConservationCircuit {
             amounts_in: vec![100, 200],
             amounts_out: vec![300],
             in_blindings: vec![[1u8; 32], [2u8; 32]],
             out_blindings: vec![[3u8; 32]],
-            output_commitments: vec![vec![[4u8; 32]]],
+            output_commitments: vec![vec![correct_cm]],
             public_amount: 0,
             leaf: leaves[2],
             path_siblings: path.siblings.clone(),
@@ -1071,11 +1096,12 @@ mod tests {
             merkle_root: root,
             nullifier: nf,
         };
+        let cm_fq = Fq::from_repr(correct_cm).unwrap();
         let instances = vec![vec![
             Fq::from_repr(root).unwrap(),
             Fq::from_repr(wrong_nf).unwrap(),
             Fq::ZERO,
-            Fq::from(4),
+            cm_fq,
         ]];
         let prover = MockProver::run(MEMBERSHIP_K, &circuit, instances).unwrap();
         assert!(prover.verify().is_err());
@@ -1096,12 +1122,14 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let proof = prove_combined_tx(
             &[100, 200],
             &[300],
             &[[1u8; 32], [2u8; 32]],
             &[[3u8; 32]],
-            &[[4u8; 32]],
+            &[correct_cm],
             0,
             &leaves[2],
             &path.siblings,
@@ -1113,7 +1141,7 @@ mod tests {
         );
         eprintln!("combined IPA proof len={}", proof.len());
 
-        let valid = verify_combined_tx(&proof, &root, &nf, &[[4u8; 32]], 0);
+        let valid = verify_combined_tx(&proof, &root, &nf, &[correct_cm], 0);
         assert!(valid, "combined IPA roundtrip should verify");
     }
 
@@ -1131,12 +1159,14 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let proof = prove_combined_tx(
             &[100, 200],
             &[300],
             &[[1u8; 32], [2u8; 32]],
             &[[3u8; 32]],
-            &[[4u8; 32]],
+            &[correct_cm],
             0,
             &leaves[2],
             &path.siblings,
@@ -1148,7 +1178,7 @@ mod tests {
         );
 
         let wrong_root = make_leaf(0xFF);
-        let valid = verify_combined_tx(&proof, &wrong_root, &nf, &[[4u8; 32]], 0);
+        let valid = verify_combined_tx(&proof, &wrong_root, &nf, &[correct_cm], 0);
         assert!(!valid, "wrong root should be rejected");
     }
 
@@ -1207,12 +1237,14 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let proof = prove_combined_tx(
             &[100, 200],
             &[300],
             &[[1u8; 32], [2u8; 32]],
             &[[3u8; 32]],
-            &[[4u8; 32]],
+            &[correct_cm],
             0,
             &leaves[2],
             &path.siblings,
@@ -1224,7 +1256,7 @@ mod tests {
         );
 
         // Provide 2 commitments when proof expects 1
-        let valid = verify_combined_tx(&proof, &root, &nf, &[[4u8; 32], [5u8; 32]], 0);
+        let valid = verify_combined_tx(&proof, &root, &nf, &[correct_cm, make_leaf(5)], 0);
         assert!(!valid, "len mismatch should be rejected");
     }
 
@@ -1242,12 +1274,14 @@ mod tests {
         let sk = make_leaf(0xCAFE);
         let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
 
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
         let proof = prove_combined_tx(
             &[100, 200],
             &[300],
             &[[1u8; 32], [2u8; 32]],
             &[[3u8; 32]],
-            &[[4u8; 32]],
+            &[correct_cm],
             0,
             &leaves[2],
             &path.siblings,
@@ -1259,7 +1293,7 @@ mod tests {
         );
 
         // Swap root and nullifier in verification
-        let valid = verify_combined_tx(&proof, &nf, &root, &[[4u8; 32]], 0);
+        let valid = verify_combined_tx(&proof, &nf, &root, &[correct_cm], 0);
         assert!(!valid, "swapped root/nf should be rejected");
     }
 }
