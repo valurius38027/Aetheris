@@ -1,8 +1,4 @@
-use crate::non_native_fq::NonNativeFqConfig;
-use crate::transcript_blake2b_circuit::{
-    Blake2bCompressionCircuitChip, Blake2bCompressionCircuitConfig,
-};
-use crate::transcript_words::TranscriptWordConfig;
+use crate::poseidon_transcript::{PoseidonTranscriptChip, PoseidonTranscriptConfig};
 use crate::vesta_ecc::{VestaEccConfig, VestaPoint};
 use crate::vesta_fq::VestaFqConfig;
 use crate::vesta_ipa::{VestaIpaChip, VestaIpaConfig, VestaIpaResult};
@@ -11,121 +7,99 @@ use ff::Field;
 use halo2_proofs::{
     circuit::{Layouter, Value},
     halo2curves::pasta::Fq,
-    plonk::{Advice, Column, ConstraintSystem, ErrorFront, Selector},
+    plonk::{ConstraintSystem, ErrorFront},
 };
 
 #[derive(Clone, Debug)]
 pub struct VestaAccumulateConfig {
-    pub compression: Blake2bCompressionCircuitConfig,
-    pub word_config: TranscriptWordConfig,
-    pub fq_dummy: NonNativeFqConfig,
-    pub challenge_col: Column<Advice>,
-    pub s_witness: Selector,
+    pub poseidon: PoseidonTranscriptConfig,
     pub ipa: VestaIpaConfig,
 }
 
 impl VestaAccumulateConfig {
     pub fn configure(meta: &mut ConstraintSystem<Fq>) -> Self {
-        let compression = Blake2bCompressionCircuitChip::configure(meta);
-        let word_config = crate::transcript_words::TranscriptWordChip::configure(meta);
-        let fq_dummy = NonNativeFqConfig::configure_no_gates(meta);
-        let challenge_col = meta.advice_column();
-        meta.enable_equality(challenge_col);
-        let s_witness = meta.complex_selector();
+        let poseidon = PoseidonTranscriptConfig::configure(meta);
         let ipa = VestaIpaConfig {
             fq: VestaFqConfig::configure(meta),
             ecc: VestaEccConfig::configure(meta),
         };
-        Self {
-            compression,
-            word_config,
-            fq_dummy,
-            challenge_col,
-            s_witness,
-            ipa,
-        }
+        Self { poseidon, ipa }
     }
 }
 
 pub struct VestaAccumulateChip {
-    blake2b: Blake2bCompressionCircuitChip,
+    poseidon: PoseidonTranscriptChip,
     pub ipa: VestaIpaChip,
 }
 
 impl VestaAccumulateChip {
     pub fn new(config: &VestaAccumulateConfig) -> Self {
-        let blake2b = Blake2bCompressionCircuitChip::new(
-            config.compression.clone(),
-            config.word_config.clone(),
-            config.fq_dummy.clone(),
-        );
+        let poseidon = PoseidonTranscriptChip::new(&config.poseidon);
         let fq = crate::vesta_fq::VestaFqChip::new(config.ipa.fq.clone());
         let ecc = crate::vesta_ecc::VestaEccChip::new(config.ipa.ecc.clone());
         let ipa = VestaIpaChip::new(fq, ecc);
-        Self { blake2b, ipa }
+        Self { poseidon, ipa }
     }
 
     pub fn squeeze_challenges(
         &self,
         mut layouter: impl Layouter<Fq>,
-        config: &VestaAccumulateConfig,
-        prefixes: &[Vec<u8>],
-        chal_witness: &[Limb<Fq>],
+        _config: &VestaAccumulateConfig,
+        k: usize,
+        l_x: &[Value<Fq>],
+        l_y: &[Value<Fq>],
+        r_x: &[Value<Fq>],
+        r_y: &[Value<Fq>],
     ) -> Result<Vec<Limb<Fq>>, ErrorFront> {
-        use crate::transcript_blake2b::BLAKE2B_STATE_WORDS;
-        use crate::transcript_blake2b_circuit::{AssignedBlake2bStateRow};
-        use crate::transcript_blake2b_compression::{
-            blake2b_compression_trace_skeleton, halo2_blake2b_transcript_initial_state,
-        };
-        use crate::transcript_bytes::TranscriptByteStream;
-        use crate::vesta_transcript::constrain_challenge_scalar_native;
+        // Init: state = Poseidon(TRANSCRIPT_DOMAIN, CAPACITY_FILL)
+        let mut state = self.poseidon.assign_init(
+            layouter.namespace(|| "transcript_init"),
+        )?;
 
-        let mut out = Vec::with_capacity(prefixes.len());
+        // Absorb k
+        state = self.poseidon.assign_absorb_scalar(
+            layouter.namespace(|| "absorb_k"),
+            &state,
+            Value::known(Fq::from(k as u64)),
+        )?;
 
-        for (i, prefix) in prefixes.iter().enumerate() {
-            let mut stream = TranscriptByteStream::new();
-            stream.extend_bytes(prefix);
-            let ref_trace = blake2b_compression_trace_skeleton(&stream);
-            let iv = halo2_blake2b_transcript_initial_state();
+        let mut out = Vec::with_capacity(k);
 
-            let mut prev_cells: [Limb<Fq>; BLAKE2B_STATE_WORDS] = std::array::from_fn(|_| Limb {
-                value: Value::known(Fq::ZERO),
-                cell: None,
-            });
-            let mut last_assigned: Option<AssignedBlake2bStateRow<Fq>> = None;
-
-            for (bi, row) in ref_trace.rows.iter().enumerate() {
-                let state_in = if bi == 0 {
-                    iv
-                } else {
-                    ref_trace.rows[bi - 1].state_out
-                };
-                let this_row = self.blake2b.assign_and_constrain_squeeze_block(
-                    layouter.namespace(|| format!("squeeze_{}_{}", i, bi)),
-                    &state_in,
-                    &row.block,
-                    &prev_cells,
-                    &format!("squeeze_{}_{}", i, bi),
-                )?;
-                prev_cells = std::array::from_fn(|j| this_row.state_out[j].clone());
-                last_assigned = Some(this_row);
-            }
-
-            let last_row = last_assigned.expect("trace must have rows");
-            let digest = ref_trace.rows.last().expect("trace must have rows").state_out;
-            let digest_limbs: [Limb<Fq>; BLAKE2B_STATE_WORDS] =
-                std::array::from_fn(|j| last_row.state_out[j].clone());
-
-            let _bound = constrain_challenge_scalar_native(
-                &config.compression,
-                layouter.namespace(|| format!("bind_{}", i)),
-                &digest_limbs,
-                &digest,
-                &chal_witness[i],
+        for i in 0..k {
+            // Absorb L_i (x, y) and R_i (x, y)
+            state = self.poseidon.assign_absorb_coord(
+                layouter.namespace(|| format!("absorb_lx_{}", i)),
+                &state,
+                l_x[i],
+            )?;
+            state = self.poseidon.assign_absorb_coord(
+                layouter.namespace(|| format!("absorb_ly_{}", i)),
+                &state,
+                l_y[i],
+            )?;
+            state = self.poseidon.assign_absorb_coord(
+                layouter.namespace(|| format!("absorb_rx_{}", i)),
+                &state,
+                r_x[i],
+            )?;
+            state = self.poseidon.assign_absorb_coord(
+                layouter.namespace(|| format!("absorb_ry_{}", i)),
+                &state,
+                r_y[i],
             )?;
 
-            out.push(chal_witness[i].clone());
+            // Squeeze: challenge = state[0] before advance permutation
+            let (challenge, new_state) = self.poseidon.assign_squeeze(
+                layouter.namespace(|| format!("squeeze_{}", i)),
+                &state,
+            )?;
+            out.push(Limb {
+                value: challenge.value().map(|&v| v),
+                cell: Some(challenge.cell()),
+            });
+            state = new_state;
         }
+
         Ok(out)
     }
 
@@ -288,55 +262,14 @@ impl VestaAccumulateChip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipa_transcript::{challenge_prefix_bytes, point_transcript_bytes, scalar_transcript_bytes};
-    use ff::{Field, FromUniformBytes, PrimeField};
+    use crate::poseidon_transcript::HostTranscript;
+    use ff::{Field, PrimeField};
     use halo2_proofs::halo2curves::pasta::EqAffine;
     use halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit};
     use halo2curves::group::prime::PrimeCurveAffine;
     use halo2curves::group::{Curve, Group};
     use halo2curves::CurveAffine;
     use num_bigint::BigUint;
-
-    const SCALAR_ENCODED_SIZE: usize = 33;
-    const POINT_ENCODED_SIZE: usize = 65;
-    const CHALLENGE_PREFIX_SIZE: usize = 1;
-
-    /// Compute the byte-stream position of the i-th squeeze marker (0 = theta).
-    fn squeeze_position(idx: usize) -> usize {
-        if idx == 0 {
-            SCALAR_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE - 1
-        } else {
-            squeeze_position(idx - 1) + 1 + POINT_ENCODED_SIZE + POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE - 1
-        }
-    }
-
-    /// Extract challenge prefixes from an IPA-trace byte stream by known positions.
-    fn extract_ipa_prefixes(stream: &[u8]) -> Vec<Vec<u8>> {
-        // stream has k+1 squeezes: theta + k round challenges.
-        // Total squeezes = (stream.len() - SCALAR_ENCODED_SIZE) / (2 * POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE)
-        let num_squeezes = 1 + (stream.len() - SCALAR_ENCODED_SIZE - CHALLENGE_PREFIX_SIZE)
-            / (2 * POINT_ENCODED_SIZE + CHALLENGE_PREFIX_SIZE);
-        (0..num_squeezes)
-            .map(|i| {
-                let pos = squeeze_position(i);
-                stream[..=pos].to_vec()
-            })
-            .collect()
-    }
-
-    /// Hash a byte prefix through Blake2b and produce an Fq challenge.
-    fn blake2b_prefix_challenge(prefix: &[u8]) -> Fq {
-        let mut stream = crate::transcript_bytes::TranscriptByteStream::new();
-        stream.extend_bytes(prefix);
-        let trace =
-            crate::transcript_blake2b_compression::blake2b_compression_trace_skeleton(&stream);
-        let digest = trace.rows.last().expect("trace must have rows").state_out;
-        let mut bytes = [0u8; 64];
-        for (i, w) in digest.iter().enumerate() {
-            bytes[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
-        }
-        Fq::from_uniform_bytes(&bytes)
-    }
 
     fn to_vesta_point(p: &EqAffine) -> VestaPoint {
         let coords = p.coordinates().unwrap();
@@ -463,6 +396,8 @@ mod tests {
         let mut r_points = Vec::new();
         let mut challenges = Vec::new();
         let mut len = n;
+        let mut transcript = HostTranscript::new();
+        transcript.absorb_scalar(Fq::from(k as u64));
 
         while len > 1 {
             let half = len / 2;
@@ -478,22 +413,9 @@ mod tests {
             let l_aff = l.to_affine();
             let r_aff = r.to_affine();
 
-            let mut byte_stream = Vec::new();
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k as u64)));
-            byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            for idx in 0..l_points.len() {
-                byte_stream.extend_from_slice(&point_transcript_bytes(l_points[idx]).unwrap());
-                byte_stream.extend_from_slice(&point_transcript_bytes(r_points[idx]).unwrap());
-                byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            }
-            byte_stream.extend_from_slice(&point_transcript_bytes(l_aff).unwrap());
-            byte_stream.extend_from_slice(&point_transcript_bytes(r_aff).unwrap());
-            byte_stream.extend_from_slice(&challenge_prefix_bytes());
-
-            let prefixes = extract_ipa_prefixes(&byte_stream);
-            // prefixes[0] = theta, prefixes[1..] = round challenges
-            let round_idx = l_points.len();  // 0-indexed round number
-            let x = blake2b_prefix_challenge(&prefixes[round_idx + 1]);  // +1 to skip theta
+            transcript.absorb_point(&l_aff);
+            transcript.absorb_point(&r_aff);
+            let x = transcript.squeeze();
             let x_inv = x.invert().unwrap();
 
             let mut a_new = Vec::with_capacity(half);
@@ -586,48 +508,51 @@ mod tests {
             let chip = VestaAccumulateChip::new(&config.acc);
 
             let k = self.witness.challenges.len();
+            let l_x: Vec<Value<Fq>> = self.witness.l_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.x())
+            }).collect();
+            let l_y: Vec<Value<Fq>> = self.witness.l_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.y())
+            }).collect();
+            let r_x: Vec<Value<Fq>> = self.witness.r_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.x())
+            }).collect();
+            let r_y: Vec<Value<Fq>> = self.witness.r_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.y())
+            }).collect();
 
-            let mut byte_stream = Vec::new();
-            let k_u64 = k as u64;
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k_u64)));
-            byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            for i in 0..k {
-                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.l_points[i]).unwrap());
-                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.r_points[i]).unwrap());
-                byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            }
-
-            let all_prefixes = extract_ipa_prefixes(&byte_stream);
-            let prefixes: Vec<Vec<u8>> = all_prefixes[1..].to_vec();  // skip theta
-
-            let chal_limbs: Vec<Limb<Fq>> = self
-                .witness
-                .challenges
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let val = if self.corrupt_challenge {
-                        *c + Fq::from(i as u64 + 1)
-                    } else {
-                        *c
-                    };
-                    chip.ipa
-                        .fq
-                        .assign_constant(
-                            layouter.namespace(|| format!("chal_{}", i)),
-                            val,
-                            &format!("chal_{}", i),
-                        )
-                        .unwrap()
-                })
-                .collect();
-
-            let bound_chals = chip.squeeze_challenges(
-                layouter.namespace(|| "squeeze"),
-                &config.acc,
-                &prefixes,
-                &chal_limbs,
-            )?;
+            let bound_chals = if self.corrupt_challenge {
+                // Introduce a challenge mismatch by generating wrong L/R data.
+                // Flip the first byte of the first L point's x coordinate.
+                let mut wrong_l_x = l_x.clone();
+                if let Some(val) = wrong_l_x.first_mut() {
+                    let corrupt = val.map(|v| v + Fq::ONE);
+                    *val = corrupt;
+                }
+                chip.squeeze_challenges(
+                    layouter.namespace(|| "squeeze"),
+                    &config.acc,
+                    k,
+                    &wrong_l_x,
+                    &l_y,
+                    &r_x,
+                    &r_y,
+                )?
+            } else {
+                chip.squeeze_challenges(
+                    layouter.namespace(|| "squeeze"),
+                    &config.acc,
+                    k,
+                    &l_x,
+                    &l_y,
+                    &r_x,
+                    &r_y,
+                )?
+            };
 
             let point_limb = chip.ipa.fq.assign_constant(
                 layouter.namespace(|| "point"),
@@ -778,41 +703,31 @@ mod tests {
             let chip = VestaAccumulateChip::new(&config.acc);
             let k = self.witness.challenges.len();
 
-            // Build byte stream for challenge derivation (IPA-only trace matching PallasIpaProofTrace)
-            let mut byte_stream = Vec::new();
-            let k_u64 = k as u64;
-            byte_stream.extend_from_slice(&scalar_transcript_bytes(Fq::from(k_u64)));
-            byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            for i in 0..k {
-                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.l_points[i]).unwrap());
-                byte_stream.extend_from_slice(&point_transcript_bytes(self.witness.r_points[i]).unwrap());
-                byte_stream.extend_from_slice(&challenge_prefix_bytes());
-            }
-            let all_prefixes = extract_ipa_prefixes(&byte_stream);
-            let prefixes: Vec<Vec<u8>> = all_prefixes[1..].to_vec();  // skip theta
-
-            let chal_limbs: Vec<Limb<Fq>> = self
-                .witness
-                .challenges
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    chip.ipa
-                        .fq
-                        .assign_constant(
-                            layouter.namespace(|| format!("chal_{}", i)),
-                            *c,
-                            &format!("chal_{}", i),
-                        )
-                        .unwrap()
-                })
-                .collect();
+            let l_x: Vec<Value<Fq>> = self.witness.l_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.x())
+            }).collect();
+            let l_y: Vec<Value<Fq>> = self.witness.l_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.y())
+            }).collect();
+            let r_x: Vec<Value<Fq>> = self.witness.r_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.x())
+            }).collect();
+            let r_y: Vec<Value<Fq>> = self.witness.r_points.iter().map(|p| {
+                let coords = p.coordinates().unwrap();
+                Value::known(*coords.y())
+            }).collect();
 
             let bound_chals = chip.squeeze_challenges(
                 layouter.namespace(|| "squeeze"),
                 &config.acc,
-                &prefixes,
-                &chal_limbs,
+                k,
+                &l_x,
+                &l_y,
+                &r_x,
+                &r_y,
             )?;
 
             let point_limb = chip.ipa.fq.assign_constant(

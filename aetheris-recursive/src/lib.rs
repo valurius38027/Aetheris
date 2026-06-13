@@ -1832,6 +1832,7 @@ pub mod vesta_ecc;
 pub mod vesta_fq;
 pub mod vesta_ipa;
 pub mod vesta_accumulate;
+pub mod poseidon_transcript;
 
 pub mod vesta_range;
 
