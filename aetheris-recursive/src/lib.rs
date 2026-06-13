@@ -7,11 +7,9 @@
 //! architecture entirely. See `B-2_plan.md` for the implementation roadmap.
 //!
 //! The old `ipa_fold.rs`, `non_native_mul.rs`, `ipa_verifier_circuit.rs` have been
-//! deleted in B-2 S11. `non_native_fq.rs` is retained for the transcript gadget
-//! (to be replaced in Phase 6).
-//!
-//! The Blake2b transcript gadget (§1.12d1-d4) is preserved and will be
-//! field-parameterized (Phase 1 of B-2) for reuse in `Circuit<Fq>`.
+//! deleted in B-2 S11. The Blake2b transcript gadget (§1.12d1-d4) and the
+//! `non_native_fq.rs` intermediary have been removed in §E.3 — Poseidon transcript
+//! (native Fq) replaces all Blake2b/NonNativeFq in the Vesta circuit.
 
 use halo2_proofs::{
     circuit::{Cell, Layouter, Value},
@@ -1822,12 +1820,6 @@ impl EccChip {
 pub mod diagnostics;
 pub mod ipa_transcript;
 pub mod proof_import;
-pub mod non_native_fq;
-pub mod transcript_blake2b;
-pub mod transcript_blake2b_circuit;
-pub mod transcript_blake2b_compression;
-pub mod transcript_bytes;
-pub mod transcript_words;
 pub mod vesta_ecc;
 pub mod vesta_fq;
 pub mod vesta_ipa;
@@ -1835,8 +1827,6 @@ pub mod vesta_accumulate;
 pub mod poseidon_transcript;
 
 pub mod vesta_range;
-
-pub mod vesta_transcript;
 
 pub mod non_native_fp;
 pub mod pallas_ecc;

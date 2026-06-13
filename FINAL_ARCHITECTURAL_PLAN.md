@@ -38,7 +38,7 @@
 | D3 | R2,R5 | Transcript hash uses Blake3/Blake2b instead of Poseidon | HIGH | §B | ✅ Done |
 | D4 | R3 | Verification is O(n) accumulator replay, not O(1) recursive SNARK | HIGH | §C | ✅ Done |
 | D5 | R4 | `BlockHeader` has dual `aggregate_proof` + optional `recursive_proof` | MEDIUM | §D | ✅ Done (D.1+D.2) |
-| D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ In Progress |
+| D6 | R2(①) | In-circuit IPA verification deferred (trusted-aggregator model) | MEDIUM | §E | ⏳ §E.1–§E.3 Done, §E.4 Pending |
 | D7 | R5 | `create_nullifier`/`build_merkle_root` use Blake3 not Poseidon | MEDIUM | §B.2 | ✅ Done |
 | D8 | R2 | `hash_to_curve` targets Pallas generator (EpAffine) not Vesta (EqAffine) | MEDIUM | §A | ✅ Done |
 | D9 | — | `RecursiveManagerHandle.verify_halo2_proof() -> bool { false }` (stub) | HIGH | §F | ✅ Done |
@@ -661,7 +661,7 @@ cargo test -p aetheris-node -- --test-threads=2
 
 **Fixes**: D6 (design doc step ①: Halo2-verify π in-circuit)
 **Prereqs**: §C (CircuitAccumulate), §B (Poseidon), B-2 (VestaAccumulateChip)
-**Effort**: ~500-800 lines | **Status**: Deferred post-MVP
+**Effort**: ~500-800 lines | **Status**: §E.1–§E.3 ✅ Done, §E.4 Pending
 
 ### §E.0 — Critical Finding: `create_commitment` is NOT a Pedersen Commitment
 
@@ -705,36 +705,38 @@ Outer proof:  Circuit<Fq> + CommitmentSchemeIPA<EpAffine> → Pallas IPA proof
 
 **Benefit**: `verify_ipa_full` in `VestaAccumulateChip` works on native Vesta points — no NonNativeChip needed anywhere. The Vesta IPA proof points have `(Fq, Fq)` coordinates = native `VestaPoint` in `Circuit<Fq>`. The Fp scalars are passed as witness bits → `VestaEccChip::scalar_mul` uses `Limb<Fq>` (double-and-add on bits, field-agnostic).
 
-### §E.2 — Replace Blake2bCompressionCircuitChip with Poseidon (from §B.3)
+### §E.2 — Replace Blake2bCompressionCircuitChip with Poseidon (from §B.3) ✅ Done
 
-The `VestaAccumulateChip::squeeze_challenges` uses Blake2b (non-native Fq, ~60+ columns).
-After §E.1, the in-circuit verifier (inside `AccumulatorCircuit`, `Circuit<Fq>`) receives
-a Vesta IPA proof. The IPA transcript (challenge derivation) is processed by
-`PoseidonFqChip` — native over Fq, ~9 columns.
+`VestaAccumulateChip::squeeze_challenges` now uses `PoseidonTranscriptChip` instead of Blake2b
+(native Fq, ~9 columns replacing ~60+). `vesta_accumulate.rs` config simplified to `{ poseidon, ipa }`.
 
-Replace Blake2b with Poseidon over Fq:
-
-1. Redesign IPA transcript to use Poseidon for challenge derivation (host-side
-   `poseidon_fq` mirrors the circuit's `PoseidonFqChip`)
-2. Replace `Blake2bCompressionCircuitChip` in `VestaAccumulateConfig` with `PoseidonFqChip`
-3. Simplify config from ~60+ columns to ~9 columns
-4. Remove `NonNativeFqChip` dependency from `VestaAccumulateConfig`
-5. No NonNativeChip needed anywhere: Vesta points are native Fq coords, Poseidon
-   transcript is native Fq hashing
+Changes:
+1. New `poseidon_transcript.rs`: `PoseidonTranscriptConfig/Chip` wrapping `PoseidonFqChip`,
+   `HostTranscript` for host-side challenge derivation (commit `a507110`)
+2. `VestaAccumulateConfig` stripped of `Blake2bCompressionCircuitConfig`, `TranscriptWordConfig`,
+   `NonNativeFqConfig`, `challenge_col`, `s_witness` — replaced by `PoseidonTranscriptConfig`
+3. `squeeze_challenges` takes `k, l_x, l_y, r_x, r_y: &[Value<Fq>]` instead of byte prefixes
+4. All 189 recursive crate tests pass
 
 This eliminates the last NonNativeChip usage in the recursive crate (R6 requirement).
 
-### §E.3 — Replacement Scope for Blake2bCompressionCircuitChip
+### §E.3 — Removal of Deprecated Blake2b Modules ✅ Done
 
-Files affected:
-- `aetheris-recursive/src/transcript_blake2b_circuit.rs` (~2537 lines) — **Deprecated**
-- `aetheris-recursive/src/transcript_blake2b.rs` (~158 lines) — **Deprecated**
-- `aetheris-recursive/src/transcript_blake2b_compression.rs` (~458 lines) — **Deprecated**
-- `aetheris-recursive/src/vesta_accumulate.rs` — Replace `squeeze_challenges` body
-- `aetheris-recursive/src/lib.rs` — Module declarations: remove `transcript_blake2b*`, add `poseidon_transcript`
-- `aetheris-recursive/src/non_native_fq.rs` — **Deprecated** (was needed for Blake2b's Fq-in-Fp encoding)
+All 7 dead modules removed from the recursive crate (vesta_transcript was the sole consumer,
+making the entire chain dead code):
 
-**Net LoC reduction**: ~3000 lines removed, ~500 lines added (Poseidon transcript). This completes R6 (NonNativeChip elimination).
+| Removed File | Lines | Reason |
+|-------------|-------|--------|
+| `transcript_blake2b_circuit.rs` | ~2537 | Used only by `vesta_transcript` |
+| `transcript_blake2b.rs` | ~158 | Dependency of above |
+| `transcript_blake2b_compression.rs` | ~458 | Dependency of above |
+| `transcript_bytes.rs` | ~150 | Dependency of above |
+| `transcript_words.rs` | ~150 | Dependency of above |
+| `non_native_fq.rs` | ~800 | Leaf dependency (Fq-in-Fp encoding) |
+| `vesta_transcript.rs` | ~829 | Zero consumers — root dead module |
+
+**Net**: ~5000 LoC removed. 109 tests pass (80 vesta_transcript/Blake2b tests removed with dead code).
+R6 (NonNativeChip elimination) fully complete.
 
 ### §E.4 — Wire VestaAccumulateChip into AccumulatorCircuit
 
