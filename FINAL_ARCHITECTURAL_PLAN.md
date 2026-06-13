@@ -661,7 +661,7 @@ cargo test -p aetheris-node -- --test-threads=2
 
 **Fixes**: D6 (design doc step ①: Halo2-verify π in-circuit)
 **Prereqs**: §C (CircuitAccumulate), §B (Poseidon), B-2 (VestaAccumulateChip)
-**Effort**: ~500-800 lines | **Status**: §E.1–§E.3 ✅ Done, §E.4 Pending
+**Effort**: ~800-1100 lines | **Status**: §E.1–§E.4 ✅ Done, §E.5 🚧 Blocking
 
 ### §E.0 — Critical Finding: `create_commitment` is NOT a Pedersen Commitment
 
@@ -759,6 +759,29 @@ in a single PLONK proof.
 Pallas IPA proof (outer) that encloses a Vesta IPA proof (inner) with full algebraic
 constraint.
 
+### §E.5 — End-to-End Protocol Closure (Blocking Items)
+
+Circuit constraints (`VestaAccumulateChip::verify_ipa_full`) work with synthetic test
+data. The glue code bridging real Conservation Circuit proofs into `AccumulatorCircuit`
+is missing. Protocol is **NOT** closed end-to-end until all items below are resolved.
+
+| # | Item | File(s) | Effort | Detail |
+|---|------|---------|--------|--------|
+| E.5.1 | Vesta IPA proof parser | `proof_import.rs` | ~80 lines | Adapt `parse_proof_bytes` (Pallas only, prefix `halo2_ipa_pasta_v1_`) for `EqAffine` (Vesta, prefix `halo2_ipa_vesta_v1_`). Extract L/R points, a_final, r_prime from Blake2b transcript. |
+| E.5.2 | Host-side Poseidon challenge derivation | `vesta_accumulate.rs` / `poseidon_transcript.rs` | ~40 lines | `host_derive_ipa_challenges` exists but must be called with L/R points to produce challenges matching the circuit's Poseidon transcript. Integrate into conversion pipeline. |
+| E.5.3 | `IpaTxWitness` builder from real proof | `prove_recursive.rs` | ~120 lines | New function: parse proof (E.5.1) → squeeze challenges (E.5.2) → extract `g_init` from `ParamsIPA<EqAffine>.g()` → build flattened `offset_points` (2^254·g per generator per round) → build `lr_offsets` (2^254·L_i, 2^254·R_i) → populate `IpaTxWitness`. Stop hardcoding `ipa_proof: None` in `compute_tx_witness`. |
+| E.5.4 | Keygen with IPA circuit structure | `prove_recursive.rs:263-301` | ~20 lines | `build_accumulate_keys` builds dummy tx with `ipa_proof: None` → keygen circuit lacks IPA advice columns/constraints. Must use `ipa_proof: Some(dummy_ipa)` so proving circuit structure matches. |
+| E.5.5 | End-to-end test | `prove_recursive.rs` (test) or `circuit_accumulate.rs` (test) | ~60 lines | Produce real proof via `prove_conservation` → convert to `TxWitness` with `IpaTxWitness` → run through `AccumulatorCircuit`/`MockProver` with correct instances → verify in-circuit IPA path is exercised. |
+| E.5.6 | Update CRS generation script | `gen_crs.ps1`, `gen_crs.rs` | ~30 lines | Currently generates KZG Bn256 params. Must add `ParamsIPA<EqAffine>` generation. Deterministic hash-to-curve fallback works for dev but production needs proper CRS. |
+
+**Total gap**: ~350 lines of new code + test.
+
+**Prerequisite knowledge**: 
+- IPA proof format: `Blake2bRead` transcript with tags `0x01` (point), `0x02` (scalar), `0x00` (challenge). Protocol: `CommonScalar(k) || SqueezeCh(theta) || (CommonPoint(L_i) || CommonPoint(R_i) || SqueezeCh(x_i))* || CommonScalar(a_final) || CommonScalar(r_prime)`.
+- Challenge mismatch: Halo2 IPA uses Blake2b Fiat-Shamir; circuit uses Poseidon. Raw proof bytes alone are insufficient — challenges must be re-derived via Poseidon on host side.
+- `offset_points` flattening: round 0 has n generators, round 1 has n/2, etc. Total length = n + n/2 + n/4 + ... = 2n-1. Required by `VestaIpaChip::fold_to_final`.
+- `lr_offsets`: 2^254 · L_i (first k) then 2^254 · R_i (next k), total 2k. Required by `VestaAccumulateChip::verify_ipa_full`.
+
 ---
 
 ## §F — P2P Recursive Manager
@@ -851,7 +874,7 @@ Each phase must pass independently before the next begins:
 - [x] **§D.1**: `recursive_proof` is `Vec<u8>` (non-optional), mining produces it
 - [x] **§D.2**: `aggregate_proof` removed from `BlockHeader`, all callers updated
 - [ ] **§D.3**: Consensus uses O(1) recursive SNARK verification, no O(n) fallback
-- [ ] **§E**: In-circuit IPA verification complete (inner proofs on Vesta IPA, Poseidon transcript, VestaAccumulateChip wired into AccumulatorCircuit)
+- [ ] **§E**: In-circuit IPA verification complete — circuit constraints work (mock tests pass), but §E.5 glue code (proof parser, challenge bridge, keygen fix, end-to-end test) is still missing
 - [x] **§F**: P2P `verify_halo2_proof` is real, gossip proof verification works
 - [x] **§G**: Cleanup complete, all documents annotated, no dead code
 - [x] **Final**: `cargo check --workspace` clean, all applicable tests pass
@@ -867,11 +890,16 @@ Each phase must pass independently before the next begins:
 | D3 | Blake3 for transcript | `accumulator.rs:243-248` | §B: PoseidonFqChip | HIGH |
 | D4 | O(n) replay | `block_aggregator.rs:94-170` | §C.6: O(1) verify | HIGH |
 | D5 | Dual aggregate+recursive | `aetheris-core/src/lib.rs:71,74` | §D: remove aggregate_proof, make recursive non-optional | MEDIUM |
-| D6 | No in-circuit IPA verify | — | §E: Phase 1.6 deferred | MEDIUM |
+| D6 | No in-circuit IPA verify | — | §E: §E.5 glue code missing (Vesta proof parser, Poseidon challenge bridge, keygen fix, E2E test) | MEDIUM |
 | D7 | Blake3 nullifier | `halo2_pasta.rs:149-153` | §B.1a: `poseidon_nullifier()` | MEDIUM |
 | D8 | hash_to_curve Pallas gen | `accumulator.rs:510` | §A: `EqAffine::generator()` | MEDIUM |
 | D9 | verify_halo2_proof stub | `lib.rs:2047-2049` | §F.1: real verification | HIGH |
 | D10 | Name/docs | multiple | §G: rename, remove dead trait methods | LOW |
+| D11 | No Vesta IPA proof → IpaTxWitness converter | `prove_recursive.rs` | §E.5.1–E.5.3: parser + challenge bridge + builder | HIGH — blocks E2E |
+| D12 | Keygen lacks IPA circuit structure | `prove_recursive.rs:263-301` | §E.5.4: use dummy IpaTxWitness in keygen | HIGH — structural mismatch |
+| D13 | No E2E test with real IPA data | test files | §E.5.5: end-to-end test | HIGH — untested path |
+| D14 | gen_crs.ps1 generates wrong params | `gen_crs.ps1`, `gen_crs.rs` | §E.5.6: add ParamsIPA generation | LOW — dev fallback exists |
+| D15 | compute_tx_witness hardcodes ipa_proof: None | `prove_recursive.rs:535` | §E.5.3: populate from real proof data | HIGH — proof data discarded |
 
 ## Appendix B: File Inventory
 
