@@ -1836,8 +1836,8 @@ pub mod recursive_proof;
 pub mod prove_recursive;
 pub use prove_recursive::{
     prove_block_recursive, verify_block_recursive_proof, verify_accumulate_proof,
-    build_accumulate_keys, genesis_recursive_state_bytes, INSTANCE_PREFIX_BYTES,
-    PROOF_PREFIX_BYTES, compute_tx_witness, parse_recursive_state,
+    build_accumulate_keys, build_dummy_ipa_witness, genesis_recursive_state_bytes,
+    INSTANCE_PREFIX_BYTES, PROOF_PREFIX_BYTES, compute_tx_witness, parse_recursive_state,
 };
 
 

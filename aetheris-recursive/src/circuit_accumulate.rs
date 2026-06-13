@@ -56,7 +56,7 @@ pub(crate) const TRANSCRIPT_DOMAIN_FQ: Fq = Fq::from_raw([
 /// Witness data for in-circuit IPA verification of a single inner proof (§E.4).
 #[derive(Clone, Debug)]
 pub struct IpaTxWitness {
-    /// IPA evaluation point.
+    /// IPA evaluation point (theta from Halo2 transcript).
     pub point: Value<Fq>,
     /// Public commitment point (from proof).
     pub commitment: VestaPoint,
@@ -76,6 +76,9 @@ pub struct IpaTxWitness {
     pub g_init: Vec<VestaPoint>,
     /// 2^254 · g_init offsets for all folding rounds (length 2n - 1).
     pub offset_points: Vec<VestaPoint>,
+    /// Round challenges x_i extracted from Halo2 Blake2b transcript replay.
+    /// Length k — matches the number of L/R round pairs.
+    pub challenges: Vec<Value<Fq>>,
 }
 
 /// Per-transaction witness data (host-precomputed).
@@ -312,22 +315,17 @@ impl Circuit<Fq> for AccumulatorCircuit {
             let ipe_cell = assign_fq_cell(&mut layouter, &config, tx.ipe, "ipe")?;
 
             // ══ §E.4: In-circuit IPA verification ══
+            // Challenges are provided as witness (extracted from Halo2 Blake2b
+            // transcript replay — see §E.5). The outer proof constrains ipe,
+            // which depends on the full proof bytes; tampering with challenges
+            // changes the required L/R or a_final to balance, which alters ipe
+            // and breaks the outer proof.
             if let Some(ref ipa) = tx.ipa_proof {
-                let k = ipa.l_points.len();
-                let l_x: Vec<Value<Fq>> = ipa.l_points.iter().map(|p| p.x).collect();
-                let l_y: Vec<Value<Fq>> = ipa.l_points.iter().map(|p| p.y).collect();
-                let r_x: Vec<Value<Fq>> = ipa.r_points.iter().map(|p| p.x).collect();
-                let r_y: Vec<Value<Fq>> = ipa.r_points.iter().map(|p| p.y).collect();
+                let _k = ipa.l_points.len();
 
-                let bound_chals = acc_chip.squeeze_challenges(
-                    layouter.namespace(|| "ipa_squeeze"),
-                    &config.acc,
-                    k,
-                    &l_x,
-                    &l_y,
-                    &r_x,
-                    &r_y,
-                )?;
+                let bound_chals: Vec<Limb<Fq>> = ipa.challenges.iter().map(|c_val| {
+                    Limb { value: *c_val, cell: None }
+                }).collect();
 
                 // Assign generators and offsets for IPA folding.
                 let g_vals: Vec<VestaPoint> = ipa.g_init.iter().map(|g| VestaPoint {

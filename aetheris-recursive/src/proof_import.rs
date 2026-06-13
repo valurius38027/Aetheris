@@ -1,5 +1,5 @@
 use ff::{Field, PrimeField};
-use halo2_proofs::halo2curves::pasta::{EpAffine, Fq};
+use halo2_proofs::halo2curves::pasta::{EpAffine, EqAffine, Fp, Fq};
 use halo2_proofs::transcript::{Blake2bRead, Challenge255, Transcript, TranscriptRead, TranscriptReadBuffer};
 
 /// Size of a scalar transcript encoding: 1 tag byte + 32 LE repr bytes.
@@ -182,6 +182,127 @@ pub fn parse_proof_bytes(
         r_prime,
         challenge_prefixes: round_prefixes,
     })
+}
+
+/// Parsed data extracted from a Vesta (EqAffine) IPA proof by replaying
+/// the Halo2 Blake2b transcript. Includes theta (evaluation point) and
+/// per-round challenges for use as circuit witness (§E.5).
+pub struct VestaProofData {
+    pub k: u32,
+    /// Theta — evaluation point for polynomial commitment (Fq, native in Circuit<Fq>).
+    pub theta: Fq,
+    /// Per-round challenges x_i (length k), extracted from Blake2b transcript replay.
+    pub round_chals: Vec<Fq>,
+    pub l_points: Vec<EqAffine>,
+    pub r_points: Vec<EqAffine>,
+    pub a_final: Fp,
+    pub r_prime: Fp,
+}
+
+/// Parse a Vesta conservation proof and replay the Blake2b transcript to
+/// extract all round challenges.
+///
+/// Wire format (same as `prove_conservation` in `halo2_pasta.rs`):
+///   [0..19]  b"halo2_ipa_vesta_v1_"
+///   [19..21] in_len as u16 LE
+///   [21..23] out_len as u16 LE
+///   [23..]   internal Halo2 IPA proof bytes
+///
+/// Blake2b challenge protocol replayed:
+///   absorb(k) → squeeze(theta)
+///   for each round: absorb(L) → absorb(R) → squeeze(x_i)
+///   read(a_final) → read(r_prime)
+///
+/// The `squeeze_challenge_scalar` method absorbs 0x00 then hashes the Blake2b
+/// state. Rejection sampling is handled (challenge != 0, != 1 per Halo2 spec).
+pub fn parse_vesta_proof(proof: &[u8], k_expected: u32) -> Result<VestaProofData, String> {
+    const PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
+    const PREFIX_LEN: usize = 19;
+    const SHAPE_LEN: usize = 4;
+
+    if !proof.starts_with(PREFIX) {
+        return Err("proof must start with halo2_ipa_vesta_v1_ prefix".into());
+    }
+    if proof.len() < PREFIX_LEN + SHAPE_LEN {
+        return Err("proof too short".into());
+    }
+
+    let internal = &proof[PREFIX_LEN + SHAPE_LEN..];
+    let mut transcript =
+        Blake2bRead::<&[u8], EqAffine, Challenge255<EqAffine>>::init(internal);
+
+    let k_fp: Fp = transcript
+        .read_scalar()
+        .map_err(|e| format!("read k: {:?}", e))?;
+    let k_bytes = k_fp.to_repr();
+    let k = u32::from_le_bytes([
+        k_bytes.as_ref()[0],
+        k_bytes.as_ref()[1],
+        k_bytes.as_ref()[2],
+        k_bytes.as_ref()[3],
+    ]);
+    if k != k_expected {
+        return Err(format!("proof k={} != expected k={}", k, k_expected));
+    }
+
+    // Squeeze theta (evaluation point)
+    let theta_fp: Fp = *transcript.squeeze_challenge_scalar::<()>();
+    let theta = fp_to_fq(theta_fp);
+
+    let k_usize = k as usize;
+    let mut l_points = Vec::with_capacity(k_usize);
+    let mut r_points = Vec::with_capacity(k_usize);
+    let mut round_chals = Vec::with_capacity(k_usize);
+
+    for _ in 0..k {
+        let l: EqAffine = transcript
+            .read_point()
+            .map_err(|e| format!("read L: {:?}", e))?;
+        let r: EqAffine = transcript
+            .read_point()
+            .map_err(|e| format!("read R: {:?}", e))?;
+
+        let x_fp: Fp = *transcript.squeeze_challenge_scalar::<()>();
+        let mut x = x_fp;
+        let mut reject_count = 0u32;
+        while bool::from(x.is_zero()) || x == Fp::ONE {
+            reject_count += 1;
+            transcript
+                .common_scalar(Fp::from(reject_count as u64))
+                .map_err(|e| format!("reject: {:?}", e))?;
+            x = *transcript.squeeze_challenge_scalar::<()>();
+        }
+
+        l_points.push(l);
+        r_points.push(r);
+        round_chals.push(fp_to_fq(x));
+    }
+
+    let a_final: Fp = transcript
+        .read_scalar()
+        .map_err(|e| format!("read a_final: {:?}", e))?;
+    let r_prime: Fp = transcript
+        .read_scalar()
+        .map_err(|e| format!("read r_prime: {:?}", e))?;
+
+    Ok(VestaProofData {
+        k,
+        theta,
+        round_chals,
+        l_points,
+        r_points,
+        a_final,
+        r_prime,
+    })
+}
+
+/// Convert an Fp scalar to an Fq value preserving the integer (byte) representation.
+/// Fp::MODULUS < Fq::MODULUS for the Pasta cycle, so any valid Fp repr is also
+/// a valid Fq repr.
+fn fp_to_fq(fp: Fp) -> Fq {
+    let mut fq_repr = <Fq as PrimeField>::Repr::default();
+    fq_repr.as_mut().copy_from_slice(fp.to_repr().as_ref());
+    Fq::from_repr(fq_repr).unwrap_or(Fq::ZERO)
 }
 
 #[cfg(test)]
