@@ -460,22 +460,29 @@ impl LedgerState {
         Ok(())
     }
 
-    /// C-3: Validate issuance rules — enforced by consensus before any state mutation.
+    /// D-2: Validate issuance with fee burning — enforced by consensus before any state mutation.
     ///
     /// Rules:
     /// - At most one coinbase per block, must be first transaction
-    /// - Coinbase must have no inputs, public_amount must equal block reward
-    /// - Non-coinbase transactions must have public_amount == 0
+    /// - Coinbase must have no inputs
+    /// - Coinbase amount = max(0, block_reward - total_fees)  (fee burning)
+    /// - Non-coinbase transactions may have public_amount > 0 (represents fee)
+    /// - If no coinbase, total fees must be 0 (unrewarded fees not allowed)
     /// - Genesis is exempt (structural validation already handled)
     fn validate_issuance_rules(&self, block: &Block, height: u64) -> Result<(), String> {
         if height == 0 {
             return Ok(());
         }
-        let expected_reward = calculate_block_reward_atoms(height);
+        let base_reward = calculate_block_reward_atoms(height);
+        let total_fees: u64 = block.transactions.iter()
+            .filter(|tx| !tx.is_coinbase())
+            .map(|tx| tx.public_amount)
+            .sum();
+
         let mut coinbase_count = 0u64;
 
         for (idx, tx) in block.transactions.iter().enumerate() {
-            if tx.public_amount > 0 {
+            if tx.is_coinbase() {
                 coinbase_count += 1;
                 if idx != 0 {
                     return Err("coinbase must be first transaction".into());
@@ -483,21 +490,23 @@ impl LedgerState {
                 if !tx.inputs.is_empty() {
                     return Err("coinbase must have no inputs".into());
                 }
-                if tx.public_amount != expected_reward {
+                let expected = base_reward.saturating_sub(total_fees);
+                if tx.public_amount != expected {
                     return Err(format!(
-                        "invalid block reward: expected {}, got {}",
-                        expected_reward, tx.public_amount
+                        "invalid coinbase: expected {} (reward {} - fees {}), got {}",
+                        expected, base_reward, total_fees, tx.public_amount
                     ));
                 }
-            } else if coinbase_count > 0 && idx > 0 {
-                // Non-coinbase tx: public_amount must be 0 (already true)
             }
         }
 
-        // Coinbase not required in Phase 0 — mining code adds it in Phase 2.
-        // If present, it is validated above (position 0, no inputs, correct reward).
         if coinbase_count > 1 {
             return Err("block must not contain multiple coinbase transactions".into());
+        }
+
+        // If no coinbase, fees would be burned without compensating the miner
+        if coinbase_count == 0 && total_fees > 0 {
+            return Err("block has fees but no coinbase to deduct from".into());
         }
 
         Ok(())

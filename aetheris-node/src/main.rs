@@ -1,4 +1,4 @@
-use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage};
+use aetheris_core::{Hash, Transaction, Block, BlockHeader, P2PMessage, ShieldedOutput, calculate_block_reward_atoms};
 use aetheris_crypto::VDF;
 use aetheris_node::consensus::{MathematicalArbitrator, BlockProposal};
 use aetheris_node::mixnet;
@@ -631,8 +631,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let (vdf_result, vdf_proof, _duration) = vdf.solve(&seed);
                     
                     // 2. Prepare Transactions & Recursive ZK Proof
-                    let txs = mempool.lock().unwrap().take_all();
+                    let mut txs = mempool.lock().unwrap().take_all();
                     let state_root = ledger.lock().unwrap().get_state_root();
+                    
+                    // D-2: Calculate fee burning — coinbase = max(0, reward - total_fees)
+                    let base_reward = calculate_block_reward_atoms(current_height);
+                    let total_fees: u64 = txs.iter()
+                        .filter(|tx| !tx.is_coinbase())
+                        .map(|tx| tx.public_amount)
+                        .sum();
+                    let coinbase_amount = base_reward.saturating_sub(total_fees);
+                    let coinbase_tx = Transaction {
+                        inputs: vec![],
+                        outputs: vec![ShieldedOutput {
+                            commitment: [0xFF; 32],
+                            ephemeral_key: [0u8; 32],
+                            ciphertext: vec![],
+                        }],
+                        public_amount: coinbase_amount,
+                        proof: vec![],
+                    };
                     
                     // Generate O(1) recursive SNARK proving the accumulator transition
                     let tx_count = txs.len();
@@ -646,8 +664,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let (_gen_pt, gen_off) = compute_generator_and_offset();
                     let mut witnesses: Vec<TxWitness> = Vec::new();
                     for tx in &txs {
-                        if tx.public_amount > 0 {
-                            continue; // skip coinbase — no ZK proof
+                        if tx.is_coinbase() {
+                            continue; // coinbase has no ZK proof (validated by issuance rules)
                         }
                         let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
                         let w = compute_tx_witness(
@@ -679,8 +697,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     
                     last_block_proof = recursive_proof[..INSTANCE_PREFIX_BYTES].to_vec();
 
-                    // 3. Propose Block — single timestamp, hash from serialized block
+                    // 3. Propose Block — prepend coinbase, single timestamp, hash from serialized block
                     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    let mut block_txs = vec![coinbase_tx];
+                    block_txs.append(&mut txs);
                     let block = Block {
                         header: BlockHeader {
                             parent_hash,
@@ -692,14 +712,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             difficulty: current_difficulty,
                             recursive_proof: recursive_proof.clone(),
                         },
-                        transactions: txs.clone(),
+                        transactions: block_txs.clone(),
                     };
                     let block_hash = aetheris_core::block_hash(&block);
 
                     let proposal = BlockProposal {
                         height: current_height,
                         block_hash,
-                        transactions: txs,
+                        transactions: block_txs,
                         vdf_result,
                         vdf_proof,
                         sender: swarm.local_peer_id().to_string(),
