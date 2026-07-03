@@ -17,20 +17,18 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 libp2p = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
 ff = "0.13"
 group = "0.13"
 rand = { workspace = true }
 log = "0.4"
-num-bigint = "0.4"
-num-traits = "0.2"
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
 rayon = "1.8"
 blake3 = { workspace = true }
-subtle = "2.6"
+subtle = { workspace = true }
 ed25519-dalek = { workspace = true }
 halo2_backend = { path = "../aetheris-zkp/vendor/halo2/halo2_backend" }
-# Using a more standard poseidon implementation if available, or just mock it for now
-# poseidon = "0.3" 
 
 [dev-dependencies]
 rand_chacha = { workspace = true }

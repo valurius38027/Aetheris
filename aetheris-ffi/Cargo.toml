@@ -12,28 +12,27 @@ aetheris-node = { path = "../aetheris-node" }
 aetheris-zkp = { path = "../aetheris-zkp" }
 aetheris-crypto = { path = "../aetheris-crypto" }
 aetheris-recursive = { path = "../aetheris-recursive" }
-# halo2curves = { workspace = true }
 halo2curves = { workspace = true }
 serde = { workspace = true }
-serde_json = "1.0"
+serde_json = { workspace = true }
 once_cell = "1.18"
 chrono = "0.4"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { workspace = true }
 libc = "0.2"
 anyhow = { workspace = true }
-sled = "0.34"
-bip39 = { version = "2.0", features = ["rand"] }
-tiny-keccak = { version = "2.0", features = ["keccak"] }
-blake3 = "1.5"
-hex = "0.4"
+sled = { workspace = true }
+bip39 = { workspace = true }
+tiny-keccak = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
 getrandom = { version = "0.2", features = ["js"] }
-aes-gcm = "0.10"
-bincode = "1.3"
-rand = "0.8"
+aes-gcm = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
 argon2 = "0.5"
-libp2p = "0.53"
+libp2p = { workspace = true }
 futures-util = "0.3"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
