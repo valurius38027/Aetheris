@@ -3,3 +3,6 @@ target/
 .DS_Store
 *.lock
 /Aetheris_Release
+
+# Cargo.lock is required for protocol dependency reproducibility.
+!Cargo.lock

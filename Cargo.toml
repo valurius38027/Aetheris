@@ -41,21 +41,15 @@ num-traits = "0.2"
 num-integer = "0.1"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aes-gcm = "0.10"
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+halo2_proofs = { path = "aetheris-zkp/vendor/halo2/halo2_proofs" }
 halo2curves = { version = "0.7.0" }
 sled = "0.34"
 aetheris-core = { path = "aetheris-core" }
 bincode = "1.3"
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
-poseidon = "0.3"
-poseidon-circuit = { git = "https://github.com/privacy-scaling-explorations/poseidon-circuit", branch = "main" }
 
-[patch.crates-io]
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
 
-[patch.'https://github.com/privacy-scaling-explorations/halo2.git']
-halo2_backend = { path = "aetheris-zkp/vendor/halo2/halo2_backend" }
-halo2_middleware = { path = "aetheris-zkp/vendor/halo2/halo2_middleware" }
+
 
 [profile.dev]
 opt-level = 1
@@ -80,3 +74,4 @@ debug = false
 [profile.release.package.halo2_proofs]
 opt-level = 3
 codegen-units = 1
+

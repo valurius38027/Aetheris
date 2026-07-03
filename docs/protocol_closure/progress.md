@@ -28,6 +28,8 @@ Status values:
 
 - [x] Remove or restore missing workspace member.
 - [ ] `cargo check --workspace` completes. Current blocker is external dependency fetch, not workspace membership.
+- [ ] Full PSE Halo2 sources are vendored locally and Cargo uses local paths.
+- [ ] `Cargo.lock` is generated and committed after vendoring.
 - [ ] Safe test matrix recorded.
 - [ ] Heavy recursive tests are gated or documented so they are not run by accident.
 - [ ] Build/test evidence recorded here.
@@ -111,4 +113,5 @@ Status values:
 | 2026-07-03 | Phase 0 | `cargo metadata --no-deps --format-version 1` | Passed; workspace manifest resolves and enumerates all intended workspace members. |
 | 2026-07-03 | Phase 0 | `cargo check --workspace` | Blocked by environment/dependency fetch: Cargo cannot fetch `https://github.com/privacy-scaling-explorations/halo2.git` due to CONNECT tunnel HTTP 403. |
 | 2026-07-03 | Phase 0 | `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check --workspace` | Same environment blocker: git fetch from GitHub returns CONNECT tunnel HTTP 403. |
+| 2026-07-03 | Phase 0 | Dependency vendoring preparation | Added a local-vendor runbook and import script so a machine with dependency sources can convert the workspace to path dependencies and commit a lockfile. |
 | 2026-07-03 | Baseline | Source audit | Identified build, transaction, wallet, node, recursive, and FFI closure gaps. |

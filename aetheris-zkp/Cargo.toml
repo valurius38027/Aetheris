@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 halo2_proofs = { workspace = true }
-halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
-halo2_middleware = { git = "https://github.com/privacy-scaling-explorations/halo2.git", branch = "main" }
+halo2_backend = { path = "vendor/halo2/halo2_backend" }
+halo2_middleware = { path = "vendor/halo2/halo2_middleware" }
 halo2curves = { workspace = true }
 rand_chacha = { workspace = true }
 rand = { workspace = true }

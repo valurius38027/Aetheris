@@ -30,6 +30,28 @@ crate is listed as a member.
 
 ## Open Issues
 
+### PC-017 — P0 — Workspace depends on live GitHub fetch for protocol dependency
+
+**Phase:** 0
+
+**Problem:** The workspace cannot be built or tested in a network-restricted
+environment because `halo2_proofs` is a live git dependency on GitHub. A
+floating branch dependency also makes protocol review non-reproducible.
+
+**Required Fix:** Vendor the full PSE Halo2 workspace into the repository,
+preserve the existing local Halo2 patch surface (`halo2_backend`,
+`halo2_middleware`), rewrite `Cargo.toml` to a local path dependency, and
+commit a generated `Cargo.lock`.
+
+> **Note:** `poseidon-circuit` was previously listed as a git dependency but
+> is unused (Poseidon is implemented in-tree). It has been removed from
+> `Cargo.toml` and does not need to be vendored.
+
+**Acceptance:** `cargo fetch --offline`, `cargo metadata --no-deps`, and
+`cargo check --workspace` work without contacting GitHub.
+
+---
+
 ### PC-002 — P1 — Output commitments are not proven from transaction witness
 
 **Phase:** 2
