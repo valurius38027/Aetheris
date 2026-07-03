@@ -162,7 +162,7 @@ struct GenesisConfig {
 }
 
 fn load_genesis_config() -> Option<GenesisConfig> {
-    let config_path = std::path::Path::new("genesis.json");
+    let config_path = std::path::Path::new("aetheris-core/resources/genesis.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(config_path) {
             return serde_json::from_str(&content).ok();

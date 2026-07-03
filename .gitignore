@@ -6,3 +6,20 @@ target/
 
 # Cargo.lock is required for protocol dependency reproducibility.
 !Cargo.lock
+
+# Build artifacts
+Aetheris.App/bin/
+Aetheris.App/obj/
+Aetheris.CLI/bin/
+Aetheris.CLI/obj/
+*.bak
+__pycache__/
+*.pyc
+ledger_outputs.json
+
+# Coq proof compilation artifacts
+formal_proof/*.vo
+formal_proof/*.vok
+formal_proof/*.vos
+formal_proof/*.glob
+formal_proof/.*.aux
