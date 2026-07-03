@@ -4,8 +4,9 @@ members = [
     "aetheris-crypto",
     "aetheris-zkp",
     "aetheris-node",
-    "aetheris-wallet", "aetheris-ffi",
-    "aetheris-recursive", "target/check_pkd_temp",
+    "aetheris-wallet",
+    "aetheris-ffi",
+    "aetheris-recursive",
 ]
 resolver = "2"
 

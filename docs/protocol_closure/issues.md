@@ -10,7 +10,7 @@ Priorities:
 - **P2** — prevents end-to-end closure or creates serious production ambiguity.
 - **P3** — hardening, maintainability, or post-closure quality.
 
-## Open Issues
+## Closed Issues
 
 ### PC-001 — P0 — Workspace references missing `target/check_pkd_temp`
 
@@ -22,10 +22,13 @@ crate is listed as a member.
 **Required Fix:** Remove the stale member or restore a real crate outside
 `target/` if it is intentionally part of the workspace.
 
-**Acceptance:** `cargo check --workspace` starts compiling the workspace instead
-of failing at manifest load.
+**Acceptance:** `cargo metadata --no-deps --format-version 1` succeeds and `cargo check --workspace` progresses past workspace manifest parsing. Full compilation remains tracked by Phase 0 because the environment currently cannot fetch the PSE Halo2 git dependency from GitHub.
+
+**Resolution:** Removed the stale `target/check_pkd_temp` workspace member.
 
 ---
+
+## Open Issues
 
 ### PC-002 — P1 — Output commitments are not proven from transaction witness
 

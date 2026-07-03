@@ -12,7 +12,7 @@ Status values:
 
 | Phase | Title | Status | Current Gate | Evidence |
 | --- | --- | --- | --- | --- |
-| 0 | Restore build and evidence baseline | Blocked | Workspace must resolve | `cargo check --workspace` currently fails because a missing `target/check_pkd_temp` member is listed in workspace members. |
+| 0 | Restore build and evidence baseline | In Progress | Dependency fetch / compile baseline | Workspace manifest now resolves after removing stale `target/check_pkd_temp`; full check is currently blocked by GitHub fetch 403 for the PSE Halo2 git dependency in this environment. |
 | 1 | Canonical transaction and note model | Not Started | Core model design approved | Waiting on Phase 0. |
 | 2 | ZK transaction circuit closure | Not Started | Commitment/membership/nullifier/value tests pass | Waiting on Phase 1. |
 | 3 | Node validation unification | Not Started | Mempool and block validation share one engine | Waiting on Phase 2. |
@@ -26,8 +26,8 @@ Status values:
 
 ### Phase 0 — Restore Build and Evidence Baseline
 
-- [ ] Remove or restore missing workspace member.
-- [ ] `cargo check --workspace` completes.
+- [x] Remove or restore missing workspace member.
+- [ ] `cargo check --workspace` completes. Current blocker is external dependency fetch, not workspace membership.
 - [ ] Safe test matrix recorded.
 - [ ] Heavy recursive tests are gated or documented so they are not run by accident.
 - [ ] Build/test evidence recorded here.
@@ -107,4 +107,8 @@ Status values:
 | Date | Phase | Evidence | Result |
 | --- | --- | --- | --- |
 | 2026-07-03 | Baseline | `cargo check --workspace` | Failed at manifest load because `target/check_pkd_temp` is listed but missing. |
+| 2026-07-03 | Phase 0 | Workspace member cleanup | Removed stale `target/check_pkd_temp` from workspace members. |
+| 2026-07-03 | Phase 0 | `cargo metadata --no-deps --format-version 1` | Passed; workspace manifest resolves and enumerates all intended workspace members. |
+| 2026-07-03 | Phase 0 | `cargo check --workspace` | Blocked by environment/dependency fetch: Cargo cannot fetch `https://github.com/privacy-scaling-explorations/halo2.git` due to CONNECT tunnel HTTP 403. |
+| 2026-07-03 | Phase 0 | `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check --workspace` | Same environment blocker: git fetch from GitHub returns CONNECT tunnel HTTP 403. |
 | 2026-07-03 | Baseline | Source audit | Identified build, transaction, wallet, node, recursive, and FFI closure gaps. |
