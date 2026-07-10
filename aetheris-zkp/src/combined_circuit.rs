@@ -1,3 +1,4 @@
+use halo2_middleware::ff::FromUniformBytes;
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::{
     arithmetic::Field,
@@ -19,7 +20,7 @@ use crate::ipa::prover::ProverIPA;
 use crate::ipa::strategy::SingleStrategyIPA;
 use crate::poseidon_fq::ensure_poseidon_spec;
 use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
-use crate::halo2_pasta::{ensure_params, CachedKeyPair};
+use crate::halo2_pasta::{ensure_params, CachedKeyPair, ZkProofError};
 
 /// Instance layout: [merkle_root, nullifier, public_amount, cm_0, cm_1, ...]
 #[derive(Clone, Debug)]
@@ -40,6 +41,7 @@ pub struct CombinedConfig {
     pub s_conservation: Selector,
     pub s_bool: Selector,
     pub s_select: Selector,
+    pub s_commitment_opening: Selector,
     /// Shared instance column: [root, nf, pub_amt, cm_0, cm_1, ...]
     pub instance: Column<Instance>,
 }
@@ -66,6 +68,18 @@ pub struct CombinedConservationCircuit {
 
 static COMBINED_KEY_CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), CachedKeyPair>>> =
     OnceLock::new();
+
+fn blinding_to_fq(blinding: &[u8; 32]) -> Fq {
+    let h = blake3::hash(blinding);
+    let mut uniform = [0u8; 64];
+    uniform[..32].copy_from_slice(h.as_bytes());
+    uniform[63] &= 0x3F;
+    Fq::from_uniform_bytes(&uniform)
+}
+
+fn opened_commitment_fq(amount: u64, blinding: &[u8; 32]) -> Fq {
+    Fq::from(amount) + blinding_to_fq(blinding)
+}
 
 fn ensure_combined_keys(
     amounts_in_len: usize,
@@ -177,6 +191,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
         let s_conservation = meta.selector();
         let s_bool = meta.selector();
         let s_select = meta.selector();
+        let s_commitment_opening = meta.selector();
 
         // ── Instance column ──
         let instance = meta.instance_column();
@@ -244,6 +259,19 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             ]
         });
 
+        // Gate 7: public output commitment opening. The host commitment
+        // scheme is cm = amount + H(blinding) in Fq. The circuit receives
+        // H(blinding) as a private scalar witness and constrains it against
+        // the public commitment instance, so a proof cannot be reused with a
+        // substituted output amount/commitment pair.
+        meta.create_gate("output_commitment_opening", |meta| {
+            let s = meta.query_selector(s_commitment_opening);
+            let amount = meta.query_advice(advice[0], Rotation::cur());
+            let commitment = meta.query_advice(advice[3], Rotation::cur());
+            let blinding_hash = meta.query_advice(advice[4], Rotation::cur());
+            vec![s * (commitment - amount - blinding_hash)]
+        });
+
         CombinedConfig {
             advice,
             leaf,
@@ -257,6 +285,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             s_conservation,
             s_bool,
             s_select,
+            s_commitment_opening,
             instance,
         }
     }
@@ -280,10 +309,9 @@ impl Circuit<Fq> for CombinedConservationCircuit {
             .map(|s| Fq::from_repr(*s).expect("sibling is canonical Fq"))
             .collect();
 
-        // Host-side check in prove_combined_tx verifies commitment binding.
-        // Circuit constraint for Fq-based Pedersen commitment is deferred
-        // (requires ECC gates). The copy constraint instance→advice[3] ensures
-        // the commitment value is a public input.
+        // The output commitment opening gate below constrains each public
+        // commitment to the private output amount and H(blinding) scalar used
+        // by the current host commitment scheme.
 
         // ── Witness region (bits, sk, index) ──
         let sk_cell: Cell;
@@ -442,10 +470,24 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                 )?;
                 config.s_conservation.enable(&mut region, offset)?;
 
-                // Commitment copy: instance[3+j] → advice[3]
+                // Commitment opening rows: instance[3+j] must equal
+                // amount_out[j] + H(out_blinding[j]) in Fq.
                 for (j, cm_set) in self.output_commitments.iter().enumerate() {
                     let idx = n_in + j;
                     if idx < all_amounts.len() && !cm_set.is_empty() {
+                        offset += 1;
+                        region.assign_advice(
+                            || "commitment_amount",
+                            config.advice[0],
+                            offset,
+                            || Value::known(Fq::from(self.amounts_out[j])),
+                        )?;
+                        region.assign_advice(
+                            || "commitment_blinding_hash",
+                            config.advice[4],
+                            offset,
+                            || Value::known(blinding_to_fq(&self.out_blindings[j])),
+                        )?;
                         region.assign_advice_from_instance(
                             || "commitment",
                             config.instance,
@@ -453,8 +495,8 @@ impl Circuit<Fq> for CombinedConservationCircuit {
                             config.advice[3],
                             offset,
                         )?;
-                    }
-                    if idx < all_amounts.len() {
+                        config.s_commitment_opening.enable(&mut region, offset)?;
+                    } else if idx < all_amounts.len() {
                         offset += 1;
                     }
                 }
@@ -745,7 +787,7 @@ impl Circuit<Fq> for CombinedConservationCircuit {
 
 // ── Public API ──────────────────────────────────────────────────────────
 
-pub fn prove_combined_tx(
+pub fn prove_combined_tx_result(
     amounts_in: &[u64],
     amounts_out: &[u64],
     in_blindings: &[[u8; 32]],
@@ -759,37 +801,97 @@ pub fn prove_combined_tx(
     index: u64,
     merkle_root: &[u8; 32],
     nullifier: &[u8; 32],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ZkProofError> {
+    const MAX_IOPS: usize = 30;
+    const MAX_DEPTH: usize = 32;
+
+    if amounts_in.len() + amounts_out.len() > MAX_IOPS {
+        return Err(ZkProofError::ProofShapeTooLarge {
+            inputs: amounts_in.len(),
+            outputs: amounts_out.len(),
+            max: MAX_IOPS,
+        });
+    }
+    if in_blindings.len() != amounts_in.len() {
+        return Err(ZkProofError::LengthMismatch("input blindings must match input amounts"));
+    }
+    if out_blindings.len() != amounts_out.len() {
+        return Err(ZkProofError::LengthMismatch("output blindings must match output amounts"));
+    }
+    if output_commitments.len() != amounts_out.len() {
+        return Err(ZkProofError::LengthMismatch("output commitments must match output amounts"));
+    }
+    crate::halo2_pasta::check_value_balance(amounts_in, amounts_out, public_amount)?;
+
     let depth = path_siblings.len();
+    if depth == 0 || depth > MAX_DEPTH {
+        return Err(ZkProofError::InvalidMembershipDepth { depth, max: MAX_DEPTH });
+    }
+    if position_bits.len() != depth {
+        return Err(ZkProofError::LengthMismatch("membership position bits must match path siblings"));
+    }
+    if Fq::from_repr(*leaf).into_option().is_none() {
+        return Err(ZkProofError::NonCanonicalMembershipLeaf);
+    }
+    for (index, sibling) in path_siblings.iter().enumerate() {
+        if Fq::from_repr(*sibling).into_option().is_none() {
+            return Err(ZkProofError::NonCanonicalMembershipSibling { index });
+        }
+    }
+    if Fq::from_repr(*sk).into_option().is_none() {
+        return Err(ZkProofError::NonCanonicalNullifierKey);
+    }
+    let root_fq = Fq::from_repr(*merkle_root)
+        .into_option()
+        .ok_or(ZkProofError::NonCanonicalMerkleRoot)?;
+    let nf_fq = Fq::from_repr(*nullifier)
+        .into_option()
+        .ok_or(ZkProofError::NonCanonicalNullifier)?;
+    let expected_root = crate::halo2_pasta::compute_membership_root_from_path(
+        leaf,
+        path_siblings,
+        position_bits,
+    )?;
+    if expected_root != *merkle_root {
+        return Err(ZkProofError::MembershipRootMismatch {
+            expected: expected_root,
+            actual: *merkle_root,
+        });
+    }
+    let expected_nullifier = crate::poseidon_fq::poseidon_nullifier(sk, index);
+    if expected_nullifier != *nullifier {
+        return Err(ZkProofError::MembershipNullifierMismatch {
+            expected: expected_nullifier,
+            actual: *nullifier,
+        });
+    }
+    for (idx, cm) in output_commitments.iter().enumerate() {
+        if Fq::from_repr(*cm).into_option().is_none() {
+            return Err(ZkProofError::NonCanonicalCommitment { index: idx });
+        }
+    }
+
     let (params, (_vk, pk)) = (
         ensure_params(),
         ensure_combined_keys(amounts_in.len(), amounts_out.len(), depth),
     );
 
-    let padded_in_blindings: Vec<[u8; 32]> = if in_blindings.is_empty() {
-        vec![[0u8; 32]; amounts_in.len()]
-    } else {
-        in_blindings.to_vec()
-    };
-    let padded_out_blindings: Vec<[u8; 32]> = if out_blindings.is_empty() {
-        vec![[0u8; 32]; amounts_out.len()]
-    } else {
-        out_blindings.to_vec()
-    };
-    let padded_commitments: Vec<Vec<[u8; 32]>> = if output_commitments.is_empty() {
-        amounts_out.iter().map(|_| vec![]).collect()
-    } else {
-        output_commitments.iter().map(|&cm| vec![cm]).collect()
-    };
+    let padded_in_blindings: Vec<[u8; 32]> = in_blindings.to_vec();
+    let padded_out_blindings: Vec<[u8; 32]> = out_blindings.to_vec();
+    let padded_commitments: Vec<Vec<[u8; 32]>> = output_commitments
+        .iter()
+        .map(|&cm| vec![cm])
+        .collect();
 
-    // Host-side check: output_commitments[j] must match create_commitment(amounts_out[j], out_blindings[j])
-    if !output_commitments.is_empty() {
-        for j in 0..amounts_out.len() {
-            let expected = crate::halo2_pasta::create_commitment(amounts_out[j], &padded_out_blindings[j]);
-            if output_commitments[j] != expected {
-                panic!("prove_combined_tx: output_commitments[{}] mismatch — expected {:02x?}, got {:02x?}",
-                    j, expected, output_commitments[j]);
-            }
+    for j in 0..amounts_out.len() {
+        let expected = opened_commitment_fq(amounts_out[j], &padded_out_blindings[j])
+            .to_repr();
+        if output_commitments[j] != expected {
+            return Err(ZkProofError::CommitmentMismatch {
+                index: j,
+                expected,
+                actual: output_commitments[j],
+            });
         }
     }
 
@@ -811,12 +913,6 @@ pub fn prove_combined_tx(
 
     let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
 
-    let root_fq = Fq::from_repr(*merkle_root)
-        .into_option()
-        .expect("prove_combined: merkle_root is canonical Fq");
-    let nf_fq = Fq::from_repr(*nullifier)
-        .into_option()
-        .expect("prove_combined: nullifier is canonical Fq");
     let pub_amt_fq = if public_amount >= 0 {
         Fq::from(public_amount as u64)
     } else {
@@ -824,11 +920,8 @@ pub fn prove_combined_tx(
     };
     let mut instance_col = vec![root_fq, nf_fq, pub_amt_fq];
     for cm in output_commitments {
-        instance_col.push(
-            Fq::from_repr(*cm)
-                .into_option()
-                .expect("prove_combined: commitment is canonical Fq repr"),
-        );
+        let cm_fq = Fq::from_repr(*cm).unwrap();
+        instance_col.push(cm_fq);
     }
     let instances = vec![instance_col];
 
@@ -840,7 +933,7 @@ pub fn prove_combined_tx(
         OsRng,
         &mut transcript,
     )
-    .expect("prove_combined_tx failed");
+    .map_err(|e| ZkProofError::ProvingError(format!("{e:?}")))?;
     let proof = transcript.finalize();
 
     let mut full = b"halo2_ipa_combined_v1_".to_vec();
@@ -848,16 +941,49 @@ pub fn prove_combined_tx(
     full.extend_from_slice(&(amounts_out.len() as u16).to_le_bytes());
     full.extend_from_slice(&(depth as u16).to_le_bytes());
     full.extend_from_slice(&proof);
-    full
+    Ok(full)
 }
 
-pub fn verify_combined_tx(
+pub fn prove_combined_tx(
+    amounts_in: &[u64],
+    amounts_out: &[u64],
+    in_blindings: &[[u8; 32]],
+    out_blindings: &[[u8; 32]],
+    output_commitments: &[[u8; 32]],
+    public_amount: i64,
+    leaf: &[u8; 32],
+    path_siblings: &[[u8; 32]],
+    position_bits: &[bool],
+    sk: &[u8; 32],
+    index: u64,
+    merkle_root: &[u8; 32],
+    nullifier: &[u8; 32],
+) -> Vec<u8> {
+    prove_combined_tx_result(
+        amounts_in,
+        amounts_out,
+        in_blindings,
+        out_blindings,
+        output_commitments,
+        public_amount,
+        leaf,
+        path_siblings,
+        position_bits,
+        sk,
+        index,
+        merkle_root,
+        nullifier,
+    )
+    .expect("prove_combined_tx failed")
+}
+
+pub fn verify_combined_tx_result(
     proof: &[u8],
     merkle_root: &[u8; 32],
     nullifier: &[u8; 32],
     output_commitments: &[[u8; 32]],
     public_amount: i64,
-) -> bool {
+) -> Result<bool, ZkProofError> {
     use halo2_backend::plonk::verifier::verify_proof_with_strategy;
 
     const PREFIX: &[u8] = b"halo2_ipa_combined_v1_";
@@ -867,40 +993,55 @@ pub fn verify_combined_tx(
     const MAX_DEPTH: usize = 32;
 
     if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
-        return false;
+        return Err(ZkProofError::InvalidProofPrefix);
     }
-    let in_len =
-        u16::from_le_bytes(proof[PREFIX_LEN..PREFIX_LEN + 2].try_into().unwrap()) as usize;
+    let in_len = u16::from_le_bytes(
+        proof[PREFIX_LEN..PREFIX_LEN + 2]
+            .try_into()
+            .map_err(|_| ZkProofError::InvalidProofPrefix)?,
+    ) as usize;
     let out_len = u16::from_le_bytes(
         proof[PREFIX_LEN + 2..PREFIX_LEN + 4]
             .try_into()
-            .unwrap(),
+            .map_err(|_| ZkProofError::InvalidProofPrefix)?,
     ) as usize;
-    let depth =
-        u16::from_le_bytes(proof[PREFIX_LEN + 4..PREFIX_LEN + SHAPE_LEN]
+    let depth = u16::from_le_bytes(
+        proof[PREFIX_LEN + 4..PREFIX_LEN + SHAPE_LEN]
             .try_into()
-            .unwrap()) as usize;
-    if in_len + out_len > MAX_IOPS || depth == 0 || depth > MAX_DEPTH {
-        return false;
+            .map_err(|_| ZkProofError::InvalidProofPrefix)?,
+    ) as usize;
+    if in_len + out_len > MAX_IOPS {
+        return Err(ZkProofError::ProofShapeTooLarge {
+            inputs: in_len,
+            outputs: out_len,
+            max: MAX_IOPS,
+        });
+    }
+    if depth == 0 || depth > MAX_DEPTH {
+        return Err(ZkProofError::InvalidMembershipDepth { depth, max: MAX_DEPTH });
     }
     if output_commitments.len() != out_len {
-        return false;
+        return Err(ZkProofError::LengthMismatch("output commitments length must match proof shape"));
     }
     let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
+
+    let root_fq = Fq::from_repr(*merkle_root)
+        .into_option()
+        .ok_or(ZkProofError::NonCanonicalMerkleRoot)?;
+    let nf_fq = Fq::from_repr(*nullifier)
+        .into_option()
+        .ok_or(ZkProofError::NonCanonicalNullifier)?;
+    for (idx, cm) in output_commitments.iter().enumerate() {
+        if Fq::from_repr(*cm).into_option().is_none() {
+            return Err(ZkProofError::NonCanonicalCommitment { index: idx });
+        }
+    }
 
     let (params, (vk, _)) = (
         ensure_params(),
         ensure_combined_keys(in_len, out_len, depth),
     );
 
-    let root_fq = match Fq::from_repr(*merkle_root).into_option() {
-        Some(fq) => fq,
-        None => return false,
-    };
-    let nf_fq = match Fq::from_repr(*nullifier).into_option() {
-        Some(fq) => fq,
-        None => return false,
-    };
     let pub_amt_fq = if public_amount >= 0 {
         Fq::from(public_amount as u64)
     } else {
@@ -908,10 +1049,8 @@ pub fn verify_combined_tx(
     };
     let mut instance_col = vec![root_fq, nf_fq, pub_amt_fq];
     for cm in output_commitments {
-        match Fq::from_repr(*cm).into_option() {
-            Some(fq) => instance_col.push(fq),
-            None => return false,
-        }
+        let cm_fq = Fq::from_repr(*cm).unwrap();
+        instance_col.push(cm_fq);
     }
     let instances = vec![instance_col];
 
@@ -929,9 +1068,20 @@ pub fn verify_combined_tx(
         &[instances],
         &mut transcript,
     ) {
-        Ok(strategy) => strategy.finalize(),
-        Err(_) => false,
+        Ok(strategy) => Ok(strategy.finalize()),
+        Err(_) => Err(ZkProofError::VerificationError),
     }
+}
+
+pub fn verify_combined_tx(
+    proof: &[u8],
+    merkle_root: &[u8; 32],
+    nullifier: &[u8; 32],
+    output_commitments: &[[u8; 32]],
+    public_amount: i64,
+) -> bool {
+    verify_combined_tx_result(proof, merkle_root, nullifier, output_commitments, public_amount)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -946,6 +1096,304 @@ mod tests {
         let mut b = [0u8; 32];
         b[..8].copy_from_slice(&val.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn test_combined_result_rejects_invalid_prefix() {
+        assert_eq!(
+            verify_combined_tx_result(b"bad", &[0u8; 32], &[0u8; 32], &[], 0),
+            Err(ZkProofError::InvalidProofPrefix)
+        );
+    }
+
+    #[test]
+    fn test_combined_result_rejects_invalid_membership_depth() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[crate::halo2_pasta::create_commitment(5, &[0u8; 32])],
+            0,
+            &[1u8; 32],
+            &[],
+            &[],
+            &[2u8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(
+            result,
+            Err(ZkProofError::InvalidMembershipDepth { depth: 0, max: 32 })
+        );
+    }
+
+    #[test]
+    fn test_combined_result_rejects_missing_input_blindings_before_synthesis() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[],
+            &[[0u8; 32]],
+            &[opened_commitment_fq(5, &[0u8; 32]).to_repr()],
+            0,
+            &[1u8; 32],
+            &[[2u8; 32]],
+            &[false],
+            &[3u8; 32],
+            0,
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        assert!(matches!(result, Err(ZkProofError::LengthMismatch(_))));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_missing_output_blindings_before_synthesis() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[],
+            &[opened_commitment_fq(5, &[0u8; 32]).to_repr()],
+            0,
+            &[1u8; 32],
+            &[[2u8; 32]],
+            &[false],
+            &[3u8; 32],
+            0,
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        assert!(matches!(result, Err(ZkProofError::LengthMismatch(_))));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_missing_output_commitments_before_synthesis() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[],
+            0,
+            &[1u8; 32],
+            &[[2u8; 32]],
+            &[false],
+            &[3u8; 32],
+            0,
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        assert!(matches!(result, Err(ZkProofError::LengthMismatch(_))));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_value_balance_mismatch_before_synthesis() {
+        let result = prove_combined_tx_result(
+            &[10],
+            &[7],
+            &[[0u8; 32]],
+            &[[1u8; 32]],
+            &[opened_commitment_fq(7, &[1u8; 32]).to_repr()],
+            0,
+            &[1u8; 32],
+            &[[2u8; 32]],
+            &[false],
+            &[3u8; 32],
+            0,
+            &[4u8; 32],
+            &[5u8; 32],
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::ValueBalanceMismatch {
+                expected_public_amount: 3,
+                actual_public_amount: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_noncanonical_leaf() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[crate::halo2_pasta::create_commitment(5, &[0u8; 32])],
+            0,
+            &[0xffu8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &[2u8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(result, Err(ZkProofError::NonCanonicalMembershipLeaf));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_noncanonical_sibling_key_and_root() {
+        let commitment = crate::halo2_pasta::create_commitment(5, &[0u8; 32]);
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[commitment],
+            0,
+            &[1u8; 32],
+            &[[0xffu8; 32]],
+            &[false],
+            &[2u8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(
+            result,
+            Err(ZkProofError::NonCanonicalMembershipSibling { index: 0 })
+        );
+
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[commitment],
+            0,
+            &[1u8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &[0xffu8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(result, Err(ZkProofError::NonCanonicalNullifierKey));
+
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[commitment],
+            0,
+            &[1u8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &[2u8; 32],
+            0,
+            &[0xffu8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(result, Err(ZkProofError::NonCanonicalMerkleRoot));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_wrong_merkle_root_before_synthesis() {
+        let commitment = crate::halo2_pasta::create_commitment(5, &[0u8; 32]);
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[commitment],
+            0,
+            &[1u8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &[2u8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::MembershipRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_combined_result_rejects_wrong_nullifier_before_synthesis() {
+        let commitment = crate::halo2_pasta::create_commitment(5, &[0u8; 32]);
+        let sk = [2u8; 32];
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[commitment],
+            0,
+            &[1u8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &sk,
+            0,
+            &crate::halo2_pasta::compute_membership_root_from_path(
+                &[1u8; 32],
+                &[[9u8; 32]],
+                &[false],
+            )
+            .unwrap(),
+            &crate::poseidon_fq::poseidon_nullifier(&sk, 1),
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::MembershipNullifierMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_combined_verify_rejects_noncanonical_public_fields_before_keys() {
+        let mut proof = b"halo2_ipa_combined_v1_".to_vec();
+        proof.extend_from_slice(&1u16.to_le_bytes());
+        proof.extend_from_slice(&1u16.to_le_bytes());
+        proof.extend_from_slice(&1u16.to_le_bytes());
+
+        assert_eq!(
+            verify_combined_tx_result(&proof, &[0xffu8; 32], &[0u8; 32], &[[1u8; 32]], 0),
+            Err(ZkProofError::NonCanonicalMerkleRoot)
+        );
+        assert_eq!(
+            verify_combined_tx_result(&proof, &[0u8; 32], &[0xffu8; 32], &[[1u8; 32]], 0),
+            Err(ZkProofError::NonCanonicalNullifier)
+        );
+        assert_eq!(
+            verify_combined_tx_result(&proof, &[0u8; 32], &[0u8; 32], &[[0xffu8; 32]], 0),
+            Err(ZkProofError::NonCanonicalCommitment { index: 0 })
+        );
+    }
+
+    #[test]
+    fn test_combined_result_rejects_output_commitment_length_mismatch() {
+        let result = prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[0u8; 32]],
+            &[[0u8; 32]],
+            &[
+                crate::halo2_pasta::create_commitment(5, &[0u8; 32]),
+                crate::halo2_pasta::create_commitment(6, &[0u8; 32]),
+            ],
+            0,
+            &[1u8; 32],
+            &[[9u8; 32]],
+            &[false],
+            &[2u8; 32],
+            0,
+            &[3u8; 32],
+            &[4u8; 32],
+        );
+        assert_eq!(
+            result,
+            Err(ZkProofError::LengthMismatch(
+                "output commitments must match output amounts"
+            ))
+        );
     }
 
     fn run_combined_mock(depth: usize, leaf_index: usize, expect_valid: bool) {
@@ -1060,9 +1508,45 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
-    // Commitment binding is checked by the verifier providing the correct instance,
-    // not by MockProver constraints. Full IPA roundtrip in test_combined_ipa_roundtrip
-    // validates that a proof with one set of commitments fails to verify with different ones.
+    #[test]
+    fn test_combined_mock_rejects_commitment_not_opened_by_amount_blinding() {
+        let depth = 3;
+        let n_leaves = 1 << depth;
+        let leaves: Vec<[u8; 32]> = (0..n_leaves).map(|i| make_leaf(i as u64)).collect();
+        let mut tree = IncrementalMerkleTree::new();
+        for leaf in &leaves {
+            tree.append(*leaf);
+        }
+        let path = tree.path(2).unwrap();
+        let root = *tree.root();
+        let sk = make_leaf(0xCAFE);
+        let nf = poseidon_fq::poseidon_nullifier(&sk, 2);
+        let correct_cm = crate::halo2_pasta::create_commitment(300, &[3u8; 32]);
+
+        let circuit = CombinedConservationCircuit {
+            amounts_in: vec![100, 200],
+            amounts_out: vec![300],
+            in_blindings: vec![[1u8; 32], [2u8; 32]],
+            out_blindings: vec![[4u8; 32]],
+            output_commitments: vec![vec![correct_cm]],
+            public_amount: 0,
+            leaf: leaves[2],
+            path_siblings: path.siblings.clone(),
+            position_bits: path.position_bits.clone(),
+            sk,
+            index: 2,
+            merkle_root: root,
+            nullifier: nf,
+        };
+        let instances = vec![vec![
+            Fq::from_repr(root).unwrap(),
+            Fq::from_repr(nf).unwrap(),
+            Fq::ZERO,
+            Fq::from_repr(correct_cm).unwrap(),
+        ]];
+        let prover = MockProver::run(MEMBERSHIP_K, &circuit, instances).unwrap();
+        assert!(prover.verify().is_err());
+    }
 
     #[test]
     fn test_combined_mock_rejects_wrong_nullifier() {

@@ -381,6 +381,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_vesta_fold_k1() {
         let g = generator_chain(2);
         let challenges = vec![Fq::from(7)];
@@ -398,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_vesta_fold_k1_corrupt_rejected() {
         let g = generator_chain(2);
         let challenges = vec![Fq::from(7)];

@@ -16,6 +16,17 @@ use aes_gcm::aead::Aead;
 use tiny_keccak::{Hasher, Keccak};
 
 const WALLET_FILE: &str = "wallet.json";
+const DEV_JSON_IPC_ENV: &str = "AETHERIS_DEV_JSON_IPC";
+
+fn dev_json_ipc_enabled() -> bool {
+    matches!(
+        std::env::var(DEV_JSON_IPC_ENV)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
 
 #[derive(Serialize, Deserialize)]
 struct WalletData {
@@ -122,6 +133,11 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Net => {
             println!("Aetheris Network Status:");
+            if !dev_json_ipc_enabled() {
+                return Err(anyhow!(
+                    "local JSON node status is disabled by default; set {DEV_JSON_IPC_ENV}=1 for dev-only file IPC"
+                ));
+            }
             if let Ok(data) = fs::read_to_string("node_status.json") {
                 let status: serde_json::Value = serde_json::from_str(&data)?;
                 println!("   Height:      {}", status["height"]);
@@ -251,9 +267,17 @@ fn main() -> Result<()> {
                 inputs: vec![nf_in],
                 outputs,
                 public_amount: 0,
+                fee: 0,
+                note_root: [0u8; 32],
+                proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
                 proof,
             };
 
+            if !dev_json_ipc_enabled() {
+                return Err(anyhow!(
+                    "local JSON transaction handoff is disabled by default; set {DEV_JSON_IPC_ENV}=1 for dev-only file IPC"
+                ));
+            }
             wallet.nullifier_counter += 1;
             wallet.utxos = remaining_utxos;
             save_wallet(&wallet)?;
@@ -284,6 +308,11 @@ fn main() -> Result<()> {
             hasher.finalize(&mut vk);
             phrase.zeroize();
 
+            if !dev_json_ipc_enabled() {
+                return Err(anyhow!(
+                    "local JSON ledger scan is disabled by default; set {DEV_JSON_IPC_ENV}=1 for dev-only file IPC"
+                ));
+            }
             if let Ok(data) = fs::read_to_string("ledger_outputs.json") {
                 let outputs: Vec<ShieldedOutput> = serde_json::from_str(&data)?;
                 let new_outputs = &outputs[wallet.last_scanned_index..];

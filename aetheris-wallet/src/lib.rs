@@ -81,6 +81,9 @@ mod tests {
             inputs: vec![nullifier],
             outputs: vec![output.clone()],
             public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof,
         };
 
@@ -160,6 +163,9 @@ mod tests {
             inputs: vec![create_nullifier(&[0u8; 32], 0)],
             outputs,
             public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof,
         };
 

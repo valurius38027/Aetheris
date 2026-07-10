@@ -19,8 +19,19 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aetheris_node::state::LedgerState;
-use aetheris_zkp::ZkProverSystem;
 use bincode;
+
+const DEV_JSON_IPC_ENV: &str = "AETHERIS_DEV_JSON_IPC";
+
+fn dev_json_ipc_enabled() -> bool {
+    matches!(
+        std::env::var(DEV_JSON_IPC_ENV)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
 
 struct Mempool {
     pending_txs: HashMap<[u8; 32], Transaction>,
@@ -31,11 +42,7 @@ impl Mempool {
         Self { pending_txs: HashMap::new() }
     }
     fn add_tx(&mut self, tx: Transaction) -> Result<(), String> {
-        // Fix: DoS Prevention - Verify ZK-Proof BEFORE adding to mempool
-        let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|o| o.commitment).collect();
-        if !aetheris_zkp::ZKProofSystem::verify_conservation(&tx.proof, &commitments, tx.circuit_public_amount()) {
-            return Err("Invalid ZK-Proof: Value conservation or range proof failed".into());
-        }
+        aetheris_node::validation::validate_transaction_for_mempool(&tx)?;
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&serde_json::to_vec(&tx).unwrap_or_default());
@@ -66,6 +73,9 @@ mod tests {
                 ciphertext: vec![] 
             }],
             public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![0u8; 64], // Junk proof
         };
 
@@ -121,6 +131,7 @@ mod tests {
             timestamps: Vec::new(),
             aggregator_pk: None,
             recursive_vk_bytes: None,
+            recursive_proof_policy: aetheris_node::state::RecursiveProofPolicy::LegacyAllowEmptyNonGenesis,
         };
         let test_state_root = state.get_state_root();
 
@@ -310,9 +321,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                       "peers": peer_count,
                       "peer_id": swarm.local_peer_id().to_string(),
                   });
-                  let _ = fs::write("node_status.json", serde_json::to_string_pretty(&status).unwrap_or_default());
+                  if dev_json_ipc_enabled() {
+                      let _ = fs::write("node_status.json", serde_json::to_string_pretty(&status).unwrap_or_default());
+                  }
               }
               _ = wallet_watch_interval.tick() => {
+                  if !dev_json_ipc_enabled() {
+                      continue;
+                  }
                   if let Ok(tx_data) = fs::read_to_string("pending_tx.json") {
                       if let Ok(tx) = serde_json::from_str::<Transaction>(&tx_data) {
                           println!("📩 Received new transaction from wallet. Adding to mempool...");
@@ -649,6 +665,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ciphertext: vec![],
                         }],
                         public_amount: coinbase_amount,
+                        fee: 0,
+                        note_root: [0u8; 32],
+                        proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
                         proof: vec![],
                     };
                     

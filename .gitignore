@@ -6,6 +6,9 @@ target/
 
 # Cargo.lock is required for protocol dependency reproducibility.
 !Cargo.lock
+!vendor/**/*.lock
+!vendor/**/src/target/
+!vendor/**/src/target/**
 
 # Build artifacts
 Aetheris.App/bin/

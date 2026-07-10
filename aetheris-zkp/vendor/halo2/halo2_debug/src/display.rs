@@ -71,7 +71,7 @@ fn var_fmt_names(
 }
 
 /// ExprDisp constructor that formats viariables using their `Display` implementation.
-pub fn expr_disp<F: PrimeField, V: Variable>(e: &Expression<F, V>) -> ExprDisp<F, V, ()> {
+pub fn expr_disp<F: PrimeField, V: Variable>(e: &Expression<F, V>) -> ExprDisp<'_, F, V, ()> {
     ExprDisp(e, var_fmt_default, &())
 }
 
@@ -143,7 +143,7 @@ pub struct LookupArgDisp<'a, F: PrimeField, V: Variable, A>(
 /// LookupArgDisp constructor that formats viariables using their `Display` implementation.
 pub fn lookup_arg_disp<F: PrimeField, V: Variable>(
     a: &lookup::Argument<F, V>,
-) -> LookupArgDisp<F, V, ()> {
+) -> LookupArgDisp<'_, F, V, ()> {
     LookupArgDisp(a, var_fmt_default, &())
 }
 
@@ -196,7 +196,7 @@ pub struct ShuffleArgDisp<'a, F: PrimeField, V: Variable, A>(
 /// ShuffleArgDisp constructor that formats viariables using their `Display` implementation.
 pub fn shuffle_arg_disp<F: PrimeField, V: Variable>(
     a: &shuffle::Argument<F, V>,
-) -> ShuffleArgDisp<F, V, ()> {
+) -> ShuffleArgDisp<'_, F, V, ()> {
     ShuffleArgDisp(a, var_fmt_default, &())
 }
 

@@ -28,8 +28,6 @@ crate is listed as a member.
 
 ---
 
-## Open Issues
-
 ### PC-017 — P0 — Workspace depends on live GitHub fetch for protocol dependency
 
 **Phase:** 0
@@ -50,7 +48,11 @@ commit a generated `Cargo.lock`.
 **Acceptance:** `cargo fetch --offline`, `cargo metadata --no-deps`, and
 `cargo check --workspace` work without contacting GitHub.
 
+**Resolution:** Cargo uses local path/vendor sources and offline locked metadata/checks pass without contacting GitHub.
+
 ---
+
+## Open Issues
 
 ### PC-002 — P1 — Output commitments are not proven from transaction witness
 
@@ -65,6 +67,74 @@ using the canonical note commitment scheme.
 
 **Acceptance:** Replacing an output commitment while keeping the same proof and
 public amount fails verification.
+
+**2026-07-07 Evidence:** The transaction-level conservation verifier now has a
+focused regression test proving that replacing an output commitment under the
+same proof returns `ZkProofError::VerificationError`. Full canonical note
+commitment binding for asset/owner fields remains open.
+
+**2026-07-08 Evidence:** `aetheris-core` now defines a domain-separated
+canonical note commitment transcript over amount, asset id, owner, rho, rseed,
+memo length/content, and commitment blinding. This closes the host-side field
+order/spec gap for output commitments, but the circuit still must reproduce and
+constrain the same transcript before PC-002 can close.
+
+**2026-07-08 Evidence:** `TransactionWitness` and `OutputNoteWitness` now
+separate output private witness data from public transaction outputs, and the
+witness validation helper rejects public commitments that do not match canonical
+output note plaintext plus blinding. This gives the prover/wallet path a stable
+witness/public consistency check while circuit enforcement remains the next
+required step.
+
+**2026-07-08 Evidence:** Combined membership+conservation proof entrypoints now
+provide `Result` variants for proof creation and verification. Malformed prefixes,
+invalid membership depth, and output commitment shape mismatches return structured
+`ZkProofError`s instead of panicking or collapsing to ambiguous `false`.
+
+**2026-07-08 Evidence:** Membership and combined proof creation now reject
+non-canonical private membership witness field encodings (leaf, path siblings,
+and nullifier key) before synthesis. Membership and combined proof creation now
+also recompute the Merkle path root before synthesis and reject witnesses whose
+path does not match the public root. They additionally recompute the public
+nullifier from the private nullifier key and note position before synthesis and
+reject mismatched nullifiers with `ZkProofError::MembershipNullifierMismatch`.
+Membership and combined verification reject non-canonical public
+roots/nullifiers/commitments before key/proof synthesis or verification. This
+closes panic-safety, avoidable-work, path/root mismatch, and host-side
+nullifier-mismatch gaps before structured proof work begins.
+
+**2026-07-08 Evidence:** `CombinedConservationCircuit` now constrains each
+public output commitment to the private output amount and private `H(blinding)`
+scalar used by the current host commitment scheme (`cm = amount + H(blinding)`
+in Fq). This moves output commitment binding from API-only checks into circuit
+constraints for the amount/blinding-hash opening. Full canonical note transcript
+binding over asset id, owner, rho, rseed, and memo remains open.
+
+**2026-07-08 Evidence:** Conservation and combined proof creation now
+precompute the value-balance equation `sum(inputs) - sum(outputs) ==
+public_amount` with `i128` host arithmetic and reject mismatches with
+`ZkProofError::ValueBalanceMismatch` before proving-key lookup or synthesis. The
+constraint remains enforced in-circuit for cryptographic validity, while the
+precheck makes malformed witness/public amount pairs fail deterministically and
+cheaply.
+
+**2026-07-08 Evidence:** Combined proof creation now requires complete private
+value/commitment-opening witness data: input blindings must match input amounts,
+output blindings must match output amounts, and public output commitments must
+match output amounts. The combined canonical path no longer silently pads absent
+blindings or skips output commitment opening constraints for non-empty outputs.
+
+**2026-07-08 Evidence:** Transaction-level proof verification now dispatches by
+`proof_system_version`: legacy transactions use the conservation verifier, while
+`PROOF_SYSTEM_CANONICAL_SHIELDED_V1` transactions use the combined
+membership+conservation verifier over `note_root`, the public nullifier, output
+commitments, and fee-adjusted public amount. Canonical v1 transactions can no
+longer be accepted with a legacy conservation-only proof prefix. Mixed-version
+batch transaction verification uses the same dispatch path, while the
+legacy-conservation batch helper is explicitly legacy-only. Node validation now
+routes both mempool proof checks and block non-coinbase batch proof checks
+through `validate_transaction_proofs`, after public-shape and
+replay/duplicate checks for blocks.
 
 ---
 
@@ -81,6 +151,22 @@ validation.
 
 **Acceptance:** A transaction with a random nullifier and no valid note witness is
 rejected by mempool and block validation.
+
+**2026-07-07 Evidence:** Membership proof Result-path coverage now rejects a
+valid proof when checked against the wrong public nullifier. Node-level unified
+membership enforcement remains open for Phase 3.
+
+**2026-07-08 Evidence:** `NoteWitness::nullifier` now derives the canonical
+input nullifier from the note commitment, nullifier key, and note tree position.
+This closes the host-side nullifier transcript gap, but the transaction circuit
+still must constrain the same derivation before random public nullifiers are
+cryptographically impossible.
+
+**2026-07-08 Evidence:** `TransactionWitness::validate_public_inputs` now
+checks that every consensus-visible input nullifier matches the canonical
+nullifier derived from the private input witness. This gives wallet/prover code
+a single host-side witness/public binding check for inputs while the ZK circuit
+constraint remains open.
 
 ---
 
@@ -133,14 +219,26 @@ use-after-free under sanitizer-compatible test strategy.
 
 **Phase:** 3
 
-**Problem:** The codebase has a locked genesis identity concept, but node
-validation appears structural rather than identity-enforcing.
+**Status:** Fixed for the mainnet validation path. Node genesis validation now
+enforces the locked fair-launch genesis identity and rejects legacy pre-mine
+transactions, wrong state roots, wrong VDF placeholders, wrong difficulty, and
+identity-wrong timestamps before state mutation. A future dev-mode override, if
+needed, must be explicit rather than falling through the mainnet validator.
 
-**Required Fix:** Decide strict network genesis versus configurable dev genesis
-and implement that policy in node validation.
+**Problem:** The codebase has a locked genesis identity concept, but node
+validation appeared structural rather than identity-enforcing.
+
+**Resolution:** Implemented strict `validate_genesis_block` policy in node
+validation and wired `LedgerState::apply_block_with_validation` to call it for
+height 0. The policy matches the fair-launch `create_genesis_block` shape: zero
+parent, empty transaction list, empty state root, current `VDF_DIFFICULTY`, zero
+VDF placeholders, empty recursive proof, and `EXPECTED_GENESIS_HASH`. The FFI
+wallet import path no longer indexes removed prototype pre-mine transactions and
+fails explicitly if genesis construction ever contains unexpected allocations.
 
 **Acceptance:** Mainnet-mode nodes reject a structurally valid but identity-wrong
-genesis; dev-mode nodes make configurability explicit.
+genesis. Configurable dev genesis remains a separate explicit follow-up rather
+than an implicit bypass of the locked mainnet identity.
 
 ---
 
@@ -148,14 +246,23 @@ genesis; dev-mode nodes make configurability explicit.
 
 **Phase:** 3, 6
 
+**Status:** Partially fixed for the fair-launch genesis path. Genesis block
+construction now returns `Result` and validates the constructed block against the
+locked node-side genesis policy before callers can apply or hash it. Because the
+current fair-launch genesis has no recursive aggregate proof, the remaining
+Phase 6 work is to add an injectable recursive/accumulator construction failure
+once genesis carries a non-empty aggregate.
+
 **Problem:** Genesis aggregate construction should fail fast if proof
 accumulation fails.
 
-**Required Fix:** Return `Result` from genesis construction and propagate
-accumulator errors.
+**Resolution:** `create_genesis_block` now propagates structured construction
+errors to FFI callers (`GENESIS_CONSTRUCTION_FAILED`) instead of returning an
+unchecked block.
 
-**Acceptance:** Injected accumulator failure prevents genesis block creation and
-is reported as a structured error.
+**Acceptance:** Constructed genesis validation failures prevent genesis use and
+are reported as structured FFI errors; recursive accumulator fault injection
+remains tracked for the first genesis format that actually carries an aggregate.
 
 ---
 
@@ -163,11 +270,19 @@ is reported as a structured error.
 
 **Phase:** 4
 
+**Status:** Fixed for default execution. The wallet and node only use local JSON
+file IPC when `AETHERIS_DEV_JSON_IPC=1` (also accepts `true`/`yes`) is set.
+Default wallet `net`, `send`, and `scan` commands fail closed instead of reading
+or writing unauthenticated `node_status.json`, `pending_tx.json`, or
+`ledger_outputs.json`; default node loops skip status export and wallet file
+watching.
+
 **Problem:** `pending_tx.json` and `ledger_outputs.json` are unauthenticated,
 racy local-file channels.
 
-**Required Fix:** Move these paths behind a dev feature or replace them with
-authenticated IPC/RPC.
+**Resolution:** Moved these paths behind an explicit dev-only environment gate.
+Production/default flows must use authenticated RPC/IPC work tracked in later
+Phase 4/7 tasks.
 
 **Acceptance:** Default wallet/node flow does not rely on unauthenticated local
 JSON files.
@@ -178,13 +293,20 @@ JSON files.
 
 **Phase:** 3
 
+**Status:** Fixed for shared transaction public-shape/proof validation.
+
 **Problem:** Mempool and block validation must use the same transaction validity
 logic to avoid accepting transactions that later fail in blocks or vice versa.
 
-**Required Fix:** Centralize transaction validation and call it from both paths.
+**Resolution:** `aetheris-node::validation` now routes mempool and block
+transaction admission through one shared public-shape/context validation core,
+then applies context-specific policy only where consensus semantics require it:
+coinbase transactions are rejected from the mempool but remain valid block
+issuance candidates for the later block-level uniqueness/state checks.
 
-**Acceptance:** A shared test matrix proves valid and invalid transactions have
-identical outcomes in mempool and block validation.
+**Acceptance:** Added mempool-vs-block matrix tests for malformed non-coinbase
+transactions so duplicate-nullifier public-shape failures and malformed proof
+failures reject consistently from both paths.
 
 ---
 
@@ -211,6 +333,11 @@ recursive proof verification have different trust assumptions.
 
 **Required Fix:** Document and enforce explicit aggregation modes.
 
+**2026-07-09 Evidence:** Recursive proof verification now rejects empty proof
+bodies and transaction-count prefixes above the bounded verifier cap before
+constructing the matching keygen circuit, preventing malformed gossip/block
+proof bytes from requesting unbounded recursive verifier work.
+
 **Acceptance:** Node configuration determines aggregation mode; tests prove no
 silent downgrade from full verification to trusted mode.
 
@@ -219,6 +346,11 @@ silent downgrade from full verification to trusted mode.
 ### PC-013 — P2 — Stub recursive manager surfaces can be mistaken for production support
 
 **Phase:** 6
+
+**Status:** Partially fixed. The P2P recursive manager now exposes
+`RecursiveManagerMode::StubUnavailable`, `supports_production_proofs() == false`,
+and generated proof JSON includes `mode: "stub_unavailable"` alongside
+`status: "unavailable"`.
 
 **Problem:** Manager APIs that return unavailable/stub behavior coexist with real
 lower-level accumulator APIs.

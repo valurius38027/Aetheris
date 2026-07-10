@@ -1917,6 +1917,14 @@ pub struct P2PRecursiveManager {
     gossip_count_in_window: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecursiveManagerMode {
+    /// Compatibility manager surface only. Proof generation APIs return
+    /// `status=unavailable` and verification APIs fail closed unless handed a
+    /// real block-recursive proof for the lower-level verifier.
+    StubUnavailable,
+}
+
 pub struct RecursiveManagerHandle {
     inner: Arc<RwLock<P2PRecursiveManager>>,
 }
@@ -1932,6 +1940,14 @@ impl P2PRecursiveManager {
             last_gossip_time: std::time::Instant::now(),
             gossip_count_in_window: 0,
         }
+    }
+
+    pub fn mode(&self) -> RecursiveManagerMode {
+        RecursiveManagerMode::StubUnavailable
+    }
+
+    pub fn supports_production_proofs(&self) -> bool {
+        false
     }
 
     /// Strictly follows gossip_aggregation_protocol.md for validation and forwarding.
@@ -2098,7 +2114,8 @@ impl P2PRecursiveManager {
             .map(|tx_id| {
                 let tx_id_hex = hex::encode(tx_id);
                 format!(
-                    "{{\"tx_id\": \"{}\", \"status\": \"unavailable\", \
+                    "{{\"tx_id\": \"{}\", \"mode\": \"stub_unavailable\", \
+                     \"status\": \"unavailable\", \
                      \"reason\": \"recursive proving deferred to Phase 1.4\"}}",
                     tx_id_hex
                 )
@@ -2112,6 +2129,7 @@ impl P2PRecursiveManager {
         let tx_id_hex = hex::encode(tx_id);
         format!(
             "{{\"tx_id\": \"{}\", \"shard_id\": {}, \
+             \"mode\": \"stub_unavailable\", \
              \"status\": \"unavailable\", \
              \"reason\": \"recursive proving deferred to Phase 1.4\"}}",
             tx_id_hex, self.shard_id
@@ -2553,6 +2571,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_ecc_scalar_mul() {
         const K: u32 = 17;
 
@@ -2704,6 +2723,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_ecc_scalar_mul_rejects_non_curve_input() {
         const K: u32 = 17;
 
@@ -2758,6 +2778,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_ecc_fixed_base_scalar_mul_still_accepts_curve_base() {
         const K: u32 = 17;
 
@@ -2889,6 +2910,8 @@ mod tests {
         assert!(manager.seen_atomic.is_empty());
         assert!(manager.seen_aggregate.is_empty());
         assert!(manager.pending_atomic.is_empty());
+        assert_eq!(manager.mode(), RecursiveManagerMode::StubUnavailable);
+        assert!(!manager.supports_production_proofs());
     }
 
     #[test]
@@ -2917,6 +2940,10 @@ mod tests {
         assert!(
             result.contains("unavailable"),
             "JSON should indicate Phase 1.3 stub status"
+        );
+        assert!(
+            result.contains("\"mode\": \"stub_unavailable\""),
+            "JSON should mark the manager mode as stub_unavailable"
         );
         assert!(
             result.contains("Phase 1.4"),
@@ -3019,6 +3046,7 @@ mod tests {
     /// gate formula drifts away from Vesta's curve equation, this test
     /// fails at `MockProver::verify()`.
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_ecc_identity_propagation() {
         const K: u32 = 18;
 

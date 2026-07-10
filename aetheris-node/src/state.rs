@@ -11,6 +11,16 @@ use serde::{Serialize, Deserialize};
 /// Serialized recursive accumulator state (same as INSTANCE_PREFIX_BYTES).
 pub const RECURSIVE_STATE_BYTES: usize = INSTANCE_PREFIX_BYTES;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecursiveProofPolicy {
+    /// Transitional compatibility mode: non-genesis blocks may omit recursive
+    /// proofs and rely on direct transaction/state/VDF validation.
+    LegacyAllowEmptyNonGenesis,
+    /// Production-target mode: every non-genesis block must carry a recursive
+    /// proof that verifies before state mutation.
+    RequireNonGenesisProof,
+}
+
 /// Extract the recursive accumulator state from a proof that uses the
 /// instance-prefix format: [Q.x(32) || Q.y(32) || transcript(32) || depth(4) || halo2_proof].
 fn recursive_state_from_proof(proof: &[u8]) -> Option<Vec<u8>> {
@@ -48,6 +58,7 @@ pub struct LedgerState {
     pub aggregator_pk: Option<VerifyingKey>,
     /// Halo2 recursive proof verification key (serialized bytes).
     pub recursive_vk_bytes: Option<Vec<u8>>,
+    pub recursive_proof_policy: RecursiveProofPolicy,
 }
 
 impl LedgerState {
@@ -69,10 +80,15 @@ impl LedgerState {
             timestamps: Vec::new(),
             aggregator_pk: None,
             recursive_vk_bytes: None,
+            recursive_proof_policy: RecursiveProofPolicy::LegacyAllowEmptyNonGenesis,
         };
         state.restore_aggregator_pk();
         state.restore_from_db();
         state
+    }
+
+    pub fn set_recursive_proof_policy(&mut self, policy: RecursiveProofPolicy) {
+        self.recursive_proof_policy = policy;
     }
 
     pub fn restore_from_db(&mut self) {
@@ -284,27 +300,9 @@ impl LedgerState {
     }
 
     pub fn apply_block_with_validation(&mut self, block: Block, validate_parent: bool) -> Result<(), String> {
-        // 0. Genesis Validation (Structural — proofs use blinding, hash varies per run)
+        // 0. Genesis validation: mainnet uses a locked fair-launch identity.
         if block.header.height == 0 {
-            if block.header.parent_hash != [0u8; 32] {
-                return Err("Genesis block must have zero parent_hash".into());
-            }
-            if block.transactions.len() != 2 {
-                return Err("Genesis block must have exactly 2 transactions".into());
-            }
-            // Mint tx: 1 output, non-negative public_amount
-            if block.transactions[0].outputs.len() != 1 || block.transactions[0].public_amount <= 0 {
-                return Err("Genesis mint transaction malformed".into());
-            }
-            // Transfer tx: 2 outputs, zero public_amount
-            if block.transactions[1].outputs.len() != 2 || block.transactions[1].public_amount != 0 {
-                return Err("Genesis transfer transaction malformed".into());
-            }
-
-            // Log genesis hash for debugging (non-deterministic due to ZKP randomness)
-            let block_data = bincode::serialize(&block).unwrap_or_default();
-            let block_hash = hex::encode(blake3::hash(&block_data).as_bytes());
-            println!("[GENESIS] Genesis block hash: {}", block_hash);
+            crate::validation::validate_genesis_block(&block)?;
         } else {
             // V-2: Validate difficulty matches expected chain value
             if block.header.difficulty != self.current_difficulty {
@@ -369,24 +367,30 @@ impl LedgerState {
         // §D.2+§D.3: O(1) recursive SNARK verification (replaces O(n) accumulator chain).
         // Mining is wired (§D.2 complete): produced blocks carry non-empty proofs.
         // Empty `recursive_proof` allowed for genesis block only (trusted fallback).
-        if !block.header.recursive_proof.is_empty() {
+        if block.header.recursive_proof.is_empty() {
+            if block.header.height > 0
+                && self.recursive_proof_policy == RecursiveProofPolicy::RequireNonGenesisProof
+            {
+                return Err(format!(
+                    "missing recursive proof for non-genesis block #{}",
+                    block.header.height
+                ));
+            }
+        } else {
             if !verify_block_recursive_proof(&block.header.recursive_proof, &block.header.state_root) {
                 return Err(format!("Recursive proof verification failed for block #{}", block.header.height));
             }
         }
 
+        // C-5: Validate transaction public shape, nullifiers, commitments, and non-coinbase proofs before mutation.
+        crate::validation::validate_block_transactions_against_state(
+            &block.transactions,
+            &self.nullifiers,
+            &self.commitments,
+        )?;
+
         // C-3: Validate issuance rules before any state mutation
         self.validate_issuance_rules(&block, block.header.height)?;
-
-        // C-5: Validate nullifiers — intra-block double-spend detection too
-        let mut seen_in_block = std::collections::HashSet::new();
-        for tx in &block.transactions {
-            for nf in &tx.inputs {
-                if self.nullifiers.contains(nf) || !seen_in_block.insert(*nf) {
-                    return Err("double-spend: nullifier already spent".to_string());
-                }
-            }
-        }
 
         // H-1: Validate state_root BEFORE apply (miner includes pre-state root)
         let pre_state_root = self.get_state_root();
@@ -542,6 +546,97 @@ mod tests {
     use aetheris_core::{BlockHeader, ShieldedOutput, Transaction, calculate_block_reward_atoms};
     use aetheris_zkp::ZkProverSystem;
 
+    fn locked_fair_launch_genesis_block() -> Block {
+        Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: build_merkle_root(&[]),
+                timestamp: 1_771_027_200,
+                vdf_result: vec![0u8; 32],
+                vdf_proof: vec![0u8; 32],
+                height: 0,
+                difficulty: VDF_DIFFICULTY,
+                recursive_proof: vec![],
+            },
+            transactions: vec![],
+        }
+    }
+
+    fn height_one_state() -> (tempfile::TempDir, sled::Db, LedgerState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                height: 0,
+                difficulty: 100,
+                recursive_proof: vec![],
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+
+        state.height = 1;
+        state.current_difficulty = 100;
+        state.last_block_hash = [42u8; 32];
+        state.last_recursive_state = genesis_recursive_state_bytes();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        (dir, db, state)
+    }
+
+    fn block_coinbase_tx(commitment: [u8; 32]) -> Transaction {
+        Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment,
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: calculate_block_reward_atoms(1),
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
+            proof: vec![],
+        }
+    }
+
+    #[test]
+    fn test_apply_block_accepts_locked_fair_launch_genesis() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        state.apply_block(locked_fair_launch_genesis_block()).unwrap();
+
+        assert_eq!(state.height, 1);
+        assert!(state.commitments.is_empty());
+        assert!(state.nullifiers.is_empty());
+        assert!(db.get(b"block_0").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_apply_block_rejects_identity_wrong_genesis_before_mutation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+        let mut genesis = locked_fair_launch_genesis_block();
+        genesis.header.timestamp += 1;
+
+        let err = state.apply_block(genesis).unwrap_err();
+
+        assert!(err.contains("genesis identity mismatch"));
+        assert_eq!(state.height, 0);
+        assert!(db.get(b"block_0").unwrap().is_none());
+    }
+
     #[test]
     fn test_state_root_mismatch_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -585,6 +680,9 @@ mod tests {
                 ciphertext: vec![],
             }],
             public_amount: reward,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![],
         };
         let block = Block {
@@ -604,6 +702,95 @@ mod tests {
         let result = state.apply_block(block);
         assert!(result.is_err(), "wrong state_root must be rejected");
         assert!(result.unwrap_err().contains("State root mismatch"));
+    }
+
+    #[test]
+    fn test_apply_block_rejects_bad_vdf_before_mutation() {
+        let (_dir, db, mut state) = height_one_state();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: state.get_state_root(),
+                timestamp: 2000,
+                vdf_result: vec![1u8; 32],
+                vdf_proof: vec![2u8; 32],
+                height: 1,
+                difficulty: 100,
+                recursive_proof: vec![],
+            },
+            transactions: vec![block_coinbase_tx([0x51; 32])],
+        };
+
+        let err = state.apply_block(block).unwrap_err();
+
+        assert!(err.contains("VDF verification failed"));
+        assert_eq!(state.height, 1, "failed VDF block must not advance height");
+        assert!(state.commitments.is_empty(), "failed VDF block must not mutate commitments");
+        assert!(db.get(b"block_1").unwrap().is_none(), "failed VDF block must not be persisted");
+    }
+
+    #[test]
+    fn test_apply_block_rejects_bad_recursive_proof_before_mutation() {
+        let (_dir, db, mut state) = height_one_state();
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: state.get_state_root(),
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                height: 1,
+                difficulty: 100,
+                recursive_proof: vec![0xA5],
+            },
+            transactions: vec![block_coinbase_tx([0x52; 32])],
+        };
+
+        let err = state.apply_block(block).unwrap_err();
+
+        assert!(err.contains("Recursive proof verification failed"));
+        assert_eq!(state.height, 1, "failed recursive proof block must not advance height");
+        assert!(state.commitments.is_empty(), "failed recursive proof block must not mutate commitments");
+        assert!(
+            db.get(b"block_1").unwrap().is_none(),
+            "failed recursive proof block must not be persisted"
+        );
+    }
+
+    #[test]
+    fn test_apply_block_strict_recursive_policy_rejects_empty_non_genesis_proof() {
+        let (_dir, db, mut state) = height_one_state();
+        state.set_recursive_proof_policy(RecursiveProofPolicy::RequireNonGenesisProof);
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root: state.get_state_root(),
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                height: 1,
+                difficulty: 100,
+                recursive_proof: vec![],
+            },
+            transactions: vec![block_coinbase_tx([0x53; 32])],
+        };
+
+        let err = state.apply_block(block).unwrap_err();
+
+        assert!(err.contains("missing recursive proof"));
+        assert_eq!(state.height, 1, "strict recursive policy failure must not advance height");
+        assert!(
+            state.commitments.is_empty(),
+            "strict recursive policy failure must not mutate commitments"
+        );
+        assert!(
+            db.get(b"block_1").unwrap().is_none(),
+            "strict recursive policy failure must not be persisted"
+        );
     }
 
     #[test]
@@ -653,6 +840,9 @@ mod tests {
             inputs: vec![spent_nf],
             outputs: vec![],
             public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof,
         };
 
@@ -701,6 +891,9 @@ mod tests {
                 ciphertext: vec![],
             }],
             public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![0u8; 32],
         };
         let _block = Block {
@@ -847,6 +1040,9 @@ mod tests {
                 ciphertext: vec![],
             }],
             public_amount: reward,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![],
         };
         let block = Block {
@@ -869,6 +1065,74 @@ mod tests {
         assert_eq!(state.height, 2);
         assert_ne!(state.last_block_hash, [0u8; 32]);
         assert_eq!(state.last_recursive_state, genesis_recursive_state_bytes());
+    }
+
+    #[test]
+    fn test_apply_block_rejects_duplicate_output_commitment_before_mutation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let mut state = LedgerState::new_with_db(db.clone());
+
+        let prev_block = Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1000,
+                vdf_result: vec![],
+                vdf_proof: vec![],
+                height: 0,
+                difficulty: 100,
+                recursive_proof: vec![],
+            },
+            transactions: vec![],
+        };
+        db.insert(b"block_0", bincode::serialize(&prev_block).unwrap()).unwrap();
+        db.insert(b"height", &1u64.to_le_bytes()).unwrap();
+
+        state.height = 1;
+        state.current_difficulty = 100;
+        state.last_block_hash = [42u8; 32];
+        state.last_recursive_state = genesis_recursive_state_bytes();
+        db.insert(b"last_block_hash", &state.last_block_hash).unwrap();
+
+        let duplicate_commitment = [0xCC; 32];
+        state.commitments.insert(duplicate_commitment);
+        let state_root = state.get_state_root();
+        let vdf = aetheris_crypto::VDF::new(100);
+        let (vdf_result, vdf_proof, _) = vdf.solve(&state.last_block_hash);
+
+        let tx = Transaction {
+            inputs: vec![],
+            outputs: vec![ShieldedOutput {
+                commitment: duplicate_commitment,
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: calculate_block_reward_atoms(1),
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
+            proof: vec![],
+        };
+        let block = Block {
+            header: BlockHeader {
+                parent_hash: state.last_block_hash,
+                state_root,
+                timestamp: 2000,
+                vdf_result,
+                vdf_proof,
+                height: 1,
+                difficulty: 100,
+                recursive_proof: vec![],
+            },
+            transactions: vec![tx],
+        };
+
+        let result = state.apply_block(block);
+        assert!(result.is_err(), "duplicate commitment must be rejected");
+        assert!(result.unwrap_err().contains("duplicate output commitment"));
+        assert_eq!(state.height, 1, "failed block must not advance height");
+        assert_eq!(state.commitments.len(), 1, "failed block must not mutate commitments");
     }
 
     #[test]
@@ -911,6 +1175,9 @@ mod tests {
                 ciphertext: vec![],
             }],
             public_amount: reward,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![],
         };
         let state_root = state.get_state_root();
@@ -1024,6 +1291,9 @@ mod tests {
                 ciphertext: vec![],
             }],
             public_amount: reward,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![],
         };
         let reorg_state_root = state.get_state_root();
