@@ -232,7 +232,6 @@ impl<A, V: FromIterator<A>> FromIterator<Value<A>> for Value<V> {
     /// elements are taken, and the [`Value::unknown()`] is returned. Should no
     /// [`Value::unknown()`] occur, a container of type `V` containing the values of each
     /// [`Value`] is returned.
-    #[must_use]
     fn from_iter<I: IntoIterator<Item = Value<A>>>(iter: I) -> Self {
         Self {
             inner: iter.into_iter().map(|v| v.inner).collect(),
@@ -247,7 +246,6 @@ impl<A, V: FromIterator<A>> FromIterator<Value<A>> for Value<V> {
 impl<V: Neg> Neg for Value<V> {
     type Output = Value<V::Output>;
 
-    #[must_use]
     fn neg(self) -> Self::Output {
         Value {
             inner: self.inner.map(|v| -v),
@@ -265,7 +263,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: Self) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a + b),
@@ -279,7 +276,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: Self) -> Self::Output {
         Value {
             inner: self
@@ -297,7 +293,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: Value<&V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a + b),
@@ -311,7 +306,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: Value<V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a + b),
@@ -325,7 +319,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: &Self) -> Self::Output {
         self + rhs.as_ref()
     }
@@ -337,7 +330,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn add(self, rhs: Value<V>) -> Self::Output {
         self.as_ref() + rhs
     }
@@ -353,7 +345,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: Self) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a - b),
@@ -367,7 +358,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: Self) -> Self::Output {
         Value {
             inner: self
@@ -385,7 +375,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: Value<&V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a - b),
@@ -399,7 +388,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: Value<V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a - b),
@@ -413,7 +401,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: &Self) -> Self::Output {
         self - rhs.as_ref()
     }
@@ -425,7 +412,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn sub(self, rhs: Value<V>) -> Self::Output {
         self.as_ref() - rhs
     }
@@ -441,7 +427,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: Self) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a * b),
@@ -455,7 +440,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: Self) -> Self::Output {
         Value {
             inner: self
@@ -473,7 +457,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: Value<&V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a * b),
@@ -487,7 +470,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: Value<V>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a * b),
@@ -501,7 +483,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: &Self) -> Self::Output {
         self * rhs.as_ref()
     }
@@ -513,7 +494,6 @@ where
 {
     type Output = Value<O>;
 
-    #[must_use]
     fn mul(self, rhs: Value<V>) -> Self::Output {
         self.as_ref() * rhs
     }
@@ -524,7 +504,6 @@ where
 //
 
 impl<F: Field> From<Value<F>> for Value<Assigned<F>> {
-    #[must_use]
     fn from(value: Value<F>) -> Self {
         Self {
             inner: value.inner.map(Assigned::from),
@@ -535,7 +514,6 @@ impl<F: Field> From<Value<F>> for Value<Assigned<F>> {
 impl<F: Field> Add<Value<F>> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn add(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a + b),
@@ -546,7 +524,6 @@ impl<F: Field> Add<Value<F>> for Value<Assigned<F>> {
 impl<F: Field> Add<F> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn add(self, rhs: F) -> Self::Output {
         self + Value::known(rhs)
     }
@@ -555,7 +532,6 @@ impl<F: Field> Add<F> for Value<Assigned<F>> {
 impl<F: Field> Add<Value<F>> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn add(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a + b),
@@ -566,7 +542,6 @@ impl<F: Field> Add<Value<F>> for Value<&Assigned<F>> {
 impl<F: Field> Add<F> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn add(self, rhs: F) -> Self::Output {
         self + Value::known(rhs)
     }
@@ -575,7 +550,6 @@ impl<F: Field> Add<F> for Value<&Assigned<F>> {
 impl<F: Field> Sub<Value<F>> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn sub(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a - b),
@@ -586,7 +560,6 @@ impl<F: Field> Sub<Value<F>> for Value<Assigned<F>> {
 impl<F: Field> Sub<F> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn sub(self, rhs: F) -> Self::Output {
         self - Value::known(rhs)
     }
@@ -595,7 +568,6 @@ impl<F: Field> Sub<F> for Value<Assigned<F>> {
 impl<F: Field> Sub<Value<F>> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn sub(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a - b),
@@ -606,7 +578,6 @@ impl<F: Field> Sub<Value<F>> for Value<&Assigned<F>> {
 impl<F: Field> Sub<F> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn sub(self, rhs: F) -> Self::Output {
         self - Value::known(rhs)
     }
@@ -615,7 +586,6 @@ impl<F: Field> Sub<F> for Value<&Assigned<F>> {
 impl<F: Field> Mul<Value<F>> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn mul(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a * b),
@@ -626,7 +596,6 @@ impl<F: Field> Mul<Value<F>> for Value<Assigned<F>> {
 impl<F: Field> Mul<F> for Value<Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn mul(self, rhs: F) -> Self::Output {
         self * Value::known(rhs)
     }
@@ -635,7 +604,6 @@ impl<F: Field> Mul<F> for Value<Assigned<F>> {
 impl<F: Field> Mul<Value<F>> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn mul(self, rhs: Value<F>) -> Self::Output {
         Value {
             inner: self.inner.zip(rhs.inner).map(|(a, b)| a * b),
@@ -646,7 +614,6 @@ impl<F: Field> Mul<Value<F>> for Value<&Assigned<F>> {
 impl<F: Field> Mul<F> for Value<&Assigned<F>> {
     type Output = Value<Assigned<F>>;
 
-    #[must_use]
     fn mul(self, rhs: F) -> Self::Output {
         self * Value::known(rhs)
     }

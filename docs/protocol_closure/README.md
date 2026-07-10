@@ -34,6 +34,8 @@ security story across these boundaries:
   from current state to initial protocol closure.
 - [`progress.md`](progress.md) — status board and acceptance-gate checklist.
 - [`issues.md`](issues.md) — normalized issue backlog derived from the audit.
+- [`checks.md`](checks.md) — safe offline check/test matrix and heavy recursive test guidance.
+- [`recursive_aggregation_modes.md`](recursive_aggregation_modes.md) — current recursive proof trust modes, compatibility gaps, and Phase 6 closure requirements.
 
 ## Working Model
 

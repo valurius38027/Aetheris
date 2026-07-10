@@ -109,6 +109,11 @@ pub fn build_recursive_instance(
 pub const INSTANCE_PREFIX_BYTES: usize = 100;
 /// Full proof prefix including `num_txs` field: Q.x(32) || Q.y(32) || transcript(32) || depth(4) || num_txs(4)
 pub const PROOF_PREFIX_BYTES: usize = 104;
+/// Defensive host-side cap for the transaction-count field embedded in a
+/// recursive block proof prefix. The verifier uses this count to rebuild a
+/// matching keygen circuit, so malformed prefixes must be rejected before they
+/// can request unbounded allocation or key generation.
+pub const MAX_RECURSIVE_PROOF_TXS: usize = 1024;
 
 /// Return the canonical genesis recursive accumulator state as serialized bytes.
 /// Format matches the proof prefix: [Q.x(32) || Q.y(32) || transcript(32) || depth(4)].
@@ -134,6 +139,10 @@ pub fn verify_block_recursive_proof(
         return false;
     }
     let (prefix, proof_body) = proof.split_at(PROOF_PREFIX_BYTES);
+    if proof_body.is_empty() {
+        eprintln!("verify_block_recursive_proof: proof body is empty");
+        return false;
+    }
     let qx_repr: [u8; 32] = prefix[..32].try_into().unwrap();
     let qy_repr: [u8; 32] = prefix[32..64].try_into().unwrap();
     let transcript_slice: [u8; 32] = prefix[64..96].try_into().unwrap();
@@ -142,6 +151,13 @@ pub fn verify_block_recursive_proof(
     let mut num_txs_bytes = [0u8; 4];
     num_txs_bytes.copy_from_slice(&prefix[100..104]);
     let num_txs = u32::from_le_bytes(num_txs_bytes) as usize;
+    if num_txs > MAX_RECURSIVE_PROOF_TXS {
+        eprintln!(
+            "verify_block_recursive_proof: num_txs {} exceeds max {}",
+            num_txs, MAX_RECURSIVE_PROOF_TXS
+        );
+        return false;
+    }
 
     use ff::FromUniformBytes;
     use halo2_proofs::halo2curves::pasta::Fq;
@@ -835,6 +851,26 @@ mod tests {
     use super::*;
     use crate::pallas_accumulate::ep_to_pallas_point;
     use rand::rngs::OsRng;
+
+    fn malformed_recursive_proof_with_num_txs(num_txs: u32, body_len: usize) -> Vec<u8> {
+        let mut proof = vec![0u8; PROOF_PREFIX_BYTES + body_len];
+        proof[100..104].copy_from_slice(&num_txs.to_le_bytes());
+        proof
+    }
+
+    #[test]
+    fn test_verify_block_recursive_proof_rejects_empty_body_before_keygen() {
+        let proof = malformed_recursive_proof_with_num_txs(0, 0);
+
+        assert!(!verify_block_recursive_proof(&proof, &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_verify_block_recursive_proof_rejects_huge_num_txs_before_keygen() {
+        let proof = malformed_recursive_proof_with_num_txs(u32::MAX, 1);
+
+        assert!(!verify_block_recursive_proof(&proof, &[0u8; 32]));
+    }
 
     #[test]
     fn test_prove_and_verify_recursive() {

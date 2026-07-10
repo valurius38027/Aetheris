@@ -372,32 +372,143 @@ pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     *tree.root()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZkProofError {
+    LengthMismatch(&'static str),
+    CommitmentMismatch { index: usize, expected: [u8; 32], actual: [u8; 32] },
+    NonCanonicalCommitment { index: usize },
+    InvalidProofPrefix,
+    ProofShapeTooLarge { inputs: usize, outputs: usize, max: usize },
+    VerificationError,
+    ProvingError(String),
+    UnsupportedProofSystemVersion(u16),
+    InvalidTransactionShape(String),
+    InvalidMembershipDepth { depth: usize, max: usize },
+    NonCanonicalMembershipLeaf,
+    NonCanonicalMembershipSibling { index: usize },
+    NonCanonicalNullifierKey,
+    NonCanonicalMerkleRoot,
+    NonCanonicalNullifier,
+    MembershipRootMismatch { expected: [u8; 32], actual: [u8; 32] },
+    MembershipNullifierMismatch { expected: [u8; 32], actual: [u8; 32] },
+    ValueBalanceMismatch { expected_public_amount: i128, actual_public_amount: i64 },
+}
+
+impl std::fmt::Display for ZkProofError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch(msg) => write!(f, "length mismatch: {msg}"),
+            Self::CommitmentMismatch { index, .. } => write!(f, "output commitment mismatch at index {index}"),
+            Self::NonCanonicalCommitment { index } => write!(f, "non-canonical commitment at index {index}"),
+            Self::InvalidProofPrefix => write!(f, "invalid conservation proof prefix"),
+            Self::ProofShapeTooLarge { inputs, outputs, max } => {
+                write!(f, "proof shape too large: inputs {inputs} + outputs {outputs} > {max}")
+            }
+            Self::VerificationError => write!(f, "conservation proof verification failed"),
+            Self::ProvingError(msg) => write!(f, "conservation proof creation failed: {msg}"),
+            Self::UnsupportedProofSystemVersion(version) => {
+                write!(f, "unsupported transaction proof system version: {version}")
+            }
+            Self::InvalidTransactionShape(msg) => write!(f, "invalid transaction public shape: {msg}"),
+            Self::InvalidMembershipDepth { depth, max } => {
+                write!(f, "invalid membership depth: {depth}, max {max}")
+            }
+            Self::NonCanonicalMembershipLeaf => write!(f, "non-canonical membership leaf"),
+            Self::NonCanonicalMembershipSibling { index } => {
+                write!(f, "non-canonical membership sibling at index {index}")
+            }
+            Self::NonCanonicalNullifierKey => write!(f, "non-canonical membership nullifier key"),
+            Self::NonCanonicalMerkleRoot => write!(f, "non-canonical membership Merkle root"),
+            Self::NonCanonicalNullifier => write!(f, "non-canonical membership nullifier"),
+            Self::MembershipRootMismatch { .. } => write!(f, "membership path does not match public Merkle root"),
+            Self::MembershipNullifierMismatch { .. } => {
+                write!(f, "membership nullifier does not match private key and index")
+            }
+            Self::ValueBalanceMismatch { expected_public_amount, actual_public_amount } => {
+                write!(
+                    f,
+                    "value balance mismatch: expected public amount {expected_public_amount}, got {actual_public_amount}",
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ZkProofError {}
+
+pub(crate) fn check_value_balance(
+    amounts_in: &[u64],
+    amounts_out: &[u64],
+    public_amount: i64,
+) -> Result<(), ZkProofError> {
+    let total_in = amounts_in
+        .iter()
+        .fold(0i128, |acc, amount| acc + i128::from(*amount));
+    let total_out = amounts_out
+        .iter()
+        .fold(0i128, |acc, amount| acc + i128::from(*amount));
+    let expected_public_amount = total_in - total_out;
+    if expected_public_amount != i128::from(public_amount) {
+        return Err(ZkProofError::ValueBalanceMismatch {
+            expected_public_amount,
+            actual_public_amount: public_amount,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn compute_membership_root_from_path(
+    leaf: &[u8; 32],
+    path_siblings: &[[u8; 32]],
+    position_bits: &[bool],
+) -> Result<[u8; 32], ZkProofError> {
+    if Fq::from_repr(*leaf).into_option().is_none() {
+        return Err(ZkProofError::NonCanonicalMembershipLeaf);
+    }
+    if position_bits.len() != path_siblings.len() {
+        return Err(ZkProofError::LengthMismatch("membership position bits must match path siblings"));
+    }
+
+    let spec = poseidon_fq::ensure_poseidon_spec();
+    let mut current = Fq::from_repr(*leaf).unwrap();
+    for (index, sibling_bytes) in path_siblings.iter().enumerate() {
+        let sibling = Fq::from_repr(*sibling_bytes)
+            .into_option()
+            .ok_or(ZkProofError::NonCanonicalMembershipSibling { index })?;
+        let (left, right) = if position_bits[index] {
+            (sibling, current)
+        } else {
+            (current, sibling)
+        };
+        let mut state = [left, right, Fq::ZERO];
+        poseidon_fq::poseidon_permute(spec, &mut state);
+        current = state[0];
+    }
+    Ok(current.to_repr())
+}
+
 pub struct Halo2PastaBackend;
 
-impl ZkProverSystem for Halo2PastaBackend {
-    type Params = ParamsIPA<EqAffine>;
-    type ProvingKey = halo2_proofs::plonk::ProvingKey<EqAffine>;
-    type VerifyingKey = halo2_proofs::plonk::VerifyingKey<EqAffine>;
-
-    fn ensure_params() -> &'static Self::Params {
-        ensure_conservation_params()
-    }
-
-    fn ensure_keys(
-        amounts_in_len: usize,
-        amounts_out_len: usize,
-    ) -> (Self::VerifyingKey, Self::ProvingKey) {
-        ensure_conservation_keys(amounts_in_len, amounts_out_len)
-    }
-
-    fn prove_conservation(
+impl Halo2PastaBackend {
+    pub fn prove_conservation_result(
         amounts_in: &[u64],
         amounts_out: &[u64],
         in_blindings: &[[u8; 32]],
         out_blindings: &[[u8; 32]],
         output_commitments: &[[u8; 32]],
         public_amount: i64,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, ZkProofError> {
+        if !in_blindings.is_empty() && in_blindings.len() != amounts_in.len() {
+            return Err(ZkProofError::LengthMismatch("input blindings must be empty or match input amounts"));
+        }
+        if !out_blindings.is_empty() && out_blindings.len() != amounts_out.len() {
+            return Err(ZkProofError::LengthMismatch("output blindings must be empty or match output amounts"));
+        }
+        if !output_commitments.is_empty() && output_commitments.len() != amounts_out.len() {
+            return Err(ZkProofError::LengthMismatch("output commitments must be empty or match output amounts"));
+        }
+        check_value_balance(amounts_in, amounts_out, public_amount)?;
+
         let (params, (_vk, pk)) = (
             ensure_conservation_params(),
             ensure_conservation_keys(amounts_in.len(), amounts_out.len()),
@@ -408,8 +519,6 @@ impl ZkProverSystem for Halo2PastaBackend {
         } else {
             in_blindings.to_vec()
         };
-        // Host-side check: output_commitments[j] must match create_commitment(amounts_out[j], out_blindings[j])
-        // This is a defense-in-depth check — the circuit enforces the copy constraint via instance→advice[3].
         let padded_out_blindings: Vec<[u8; 32]> = if out_blindings.is_empty() {
             vec![[0u8; 32]; amounts_out.len()]
         } else {
@@ -419,8 +528,11 @@ impl ZkProverSystem for Halo2PastaBackend {
             for j in 0..amounts_out.len() {
                 let expected = create_commitment(amounts_out[j], &padded_out_blindings[j]);
                 if output_commitments[j] != expected {
-                    panic!("prove_conservation: output_commitments[{}] mismatch — expected {:02x?}, got {:02x?}",
-                        j, expected, output_commitments[j]);
+                    return Err(ZkProofError::CommitmentMismatch {
+                        index: j,
+                        expected,
+                        actual: output_commitments[j],
+                    });
                 }
             }
         }
@@ -446,42 +558,110 @@ impl ZkProverSystem for Halo2PastaBackend {
             Fp::ZERO - Fp::from(public_amount.unsigned_abs())
         };
         let mut instance_col = vec![instance_fp];
-        for cm in output_commitments {
-            instance_col.push(
-                Fp::from_repr(*cm).into_option()
-                    .expect("prove_conservation: invalid commitment bytes — must be canonical Fp repr")
-            );
+        for (index, cm) in output_commitments.iter().enumerate() {
+            match Fp::from_repr(*cm).into_option() {
+                Some(fp) => instance_col.push(fp),
+                None => return Err(ZkProofError::NonCanonicalCommitment { index }),
+            }
         }
         let instances = vec![instance_col];
         create_proof::<CommitmentSchemeIPA<EqAffine>, ProverIPA<'_, EqAffine>, _, _, _, _>(
             params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
-        ).expect("prove_conservation failed");
+        ).map_err(|e| ZkProofError::ProvingError(format!("{e:?}")))?;
         let proof = transcript.finalize();
         let mut full = b"halo2_ipa_vesta_v1_".to_vec();
         full.extend_from_slice(&(amounts_in.len() as u16).to_le_bytes());
         full.extend_from_slice(&(amounts_out.len() as u16).to_le_bytes());
         full.extend_from_slice(&proof);
-        full
+        Ok(full)
     }
 
-    fn verify_conservation(
+    pub fn verify_transaction_result(
+        tx: &aetheris_core::Transaction,
+    ) -> Result<bool, ZkProofError> {
+        match tx.proof_system_version {
+            aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION => {
+                Self::verify_transaction_conservation_result(tx)
+            }
+            aetheris_core::PROOF_SYSTEM_CANONICAL_SHIELDED_V1 => {
+                Self::verify_transaction_combined_result(tx)
+            }
+            other => Err(ZkProofError::UnsupportedProofSystemVersion(other)),
+        }
+    }
+
+    pub fn verify_transaction(tx: &aetheris_core::Transaction) -> bool {
+        Self::verify_transaction_result(tx).unwrap_or(false)
+    }
+
+    pub fn verify_transaction_conservation_result(
+        tx: &aetheris_core::Transaction,
+    ) -> Result<bool, ZkProofError> {
+        match tx.proof_system_version {
+            aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION => {}
+            other => return Err(ZkProofError::UnsupportedProofSystemVersion(other)),
+        }
+        tx.validate_public_shape()
+            .map_err(|e| ZkProofError::InvalidTransactionShape(e.to_string()))?;
+
+        let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|out| out.commitment).collect();
+        Self::verify_conservation_result(&tx.proof, &commitments, tx.circuit_public_amount())
+    }
+
+    pub fn verify_transaction_conservation(tx: &aetheris_core::Transaction) -> bool {
+        Self::verify_transaction_conservation_result(tx).unwrap_or(false)
+    }
+
+    pub fn verify_transaction_combined_result(
+        tx: &aetheris_core::Transaction,
+    ) -> Result<bool, ZkProofError> {
+        match tx.proof_system_version {
+            aetheris_core::PROOF_SYSTEM_CANONICAL_SHIELDED_V1 => {}
+            other => return Err(ZkProofError::UnsupportedProofSystemVersion(other)),
+        }
+        tx.validate_public_shape()
+            .map_err(|e| ZkProofError::InvalidTransactionShape(e.to_string()))?;
+        if tx.inputs.len() != 1 {
+            return Err(ZkProofError::InvalidTransactionShape(
+                "canonical shielded v1 currently requires exactly one input nullifier".to_string(),
+            ));
+        }
+
+        let commitments: Vec<[u8; 32]> = tx.outputs.iter().map(|out| out.commitment).collect();
+        crate::combined_circuit::verify_combined_tx_result(
+            &tx.proof,
+            &tx.note_root,
+            &tx.inputs[0],
+            &commitments,
+            tx.circuit_public_amount(),
+        )
+    }
+
+    pub fn verify_transaction_combined(tx: &aetheris_core::Transaction) -> bool {
+        Self::verify_transaction_combined_result(tx).unwrap_or(false)
+    }
+
+    pub fn verify_conservation_result(
         proof: &[u8],
         output_commitments: &[[u8; 32]],
         public_amount: i64,
-    ) -> bool {
+    ) -> Result<bool, ZkProofError> {
         const PREFIX: &[u8] = b"halo2_ipa_vesta_v1_";
         const PREFIX_LEN: usize = 19;
         const SHAPE_LEN: usize = 4;
         const MAX_PROOF_IOPS: usize = 30;
         if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
-            return false;
+            return Err(ZkProofError::InvalidProofPrefix);
         }
-        let in_len = u16::from_le_bytes(proof[PREFIX_LEN..PREFIX_LEN + 2].try_into().unwrap()) as usize;
+        let in_len = u16::from_le_bytes(proof[PREFIX_LEN..PREFIX_LEN + 2].try_into().map_err(|_| ZkProofError::InvalidProofPrefix)?) as usize;
         let out_len = u16::from_le_bytes(
-            proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN].try_into().unwrap(),
+            proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN].try_into().map_err(|_| ZkProofError::InvalidProofPrefix)?,
         ) as usize;
         if in_len + out_len > MAX_PROOF_IOPS {
-            return false;
+            return Err(ZkProofError::ProofShapeTooLarge { inputs: in_len, outputs: out_len, max: MAX_PROOF_IOPS });
+        }
+        if output_commitments.len() != out_len {
+            return Err(ZkProofError::LengthMismatch("output commitments length must match proof shape"));
         }
         let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
 
@@ -493,10 +673,10 @@ impl ZkProverSystem for Halo2PastaBackend {
             Fp::ZERO - Fp::from(public_amount.unsigned_abs())
         };
         let mut instance_col = vec![instance_fp];
-        for cm in output_commitments {
+        for (index, cm) in output_commitments.iter().enumerate() {
             match Fp::from_repr(*cm).into_option() {
                 Some(fp) => instance_col.push(fp),
-                None => return false,
+                None => return Err(ZkProofError::NonCanonicalCommitment { index }),
             }
         }
         let instances = vec![instance_col];
@@ -505,9 +685,54 @@ impl ZkProverSystem for Halo2PastaBackend {
         match verify_proof_with_strategy::<CommitmentSchemeIPA<EqAffine>, _, Challenge255<EqAffine>, Blake2bRead<&[u8], EqAffine, Challenge255<EqAffine>>, SingleStrategyIPA<'_, EqAffine>>(
             params, &vk, SingleStrategyIPA::new(params), &[instances], &mut transcript,
         ) {
-            Ok(strategy) => strategy.finalize(),
-            Err(_) => false,
+            Ok(strategy) => Ok(strategy.finalize()),
+            Err(_) => Err(ZkProofError::VerificationError),
         }
+    }
+}
+
+impl ZkProverSystem for Halo2PastaBackend {
+    type Params = ParamsIPA<EqAffine>;
+    type ProvingKey = halo2_proofs::plonk::ProvingKey<EqAffine>;
+    type VerifyingKey = halo2_proofs::plonk::VerifyingKey<EqAffine>;
+
+    fn ensure_params() -> &'static Self::Params {
+        ensure_conservation_params()
+    }
+
+    fn ensure_keys(
+        amounts_in_len: usize,
+        amounts_out_len: usize,
+    ) -> (Self::VerifyingKey, Self::ProvingKey) {
+        ensure_conservation_keys(amounts_in_len, amounts_out_len)
+    }
+
+    fn prove_conservation(
+        amounts_in: &[u64],
+        amounts_out: &[u64],
+        in_blindings: &[[u8; 32]],
+        out_blindings: &[[u8; 32]],
+        output_commitments: &[[u8; 32]],
+        public_amount: i64,
+    ) -> Vec<u8> {
+        Self::prove_conservation_result(
+            amounts_in,
+            amounts_out,
+            in_blindings,
+            out_blindings,
+            output_commitments,
+            public_amount,
+        )
+        .expect("prove_conservation failed")
+    }
+
+    fn verify_conservation(
+        proof: &[u8],
+        output_commitments: &[[u8; 32]],
+        public_amount: i64,
+    ) -> bool {
+        Self::verify_conservation_result(proof, output_commitments, public_amount)
+            .unwrap_or(false)
     }
 
 }
@@ -517,7 +742,7 @@ impl Halo2PastaBackend {
     /// and that the nullifier H(sk, index) matches the claimed value.
     /// Public instances: [merkle_root, nullifier].
     /// Wire format: 19-byte prefix + 4-byte depth (u32 LE) + inner Halo2 proof.
-    pub fn prove_membership(
+    pub fn prove_membership_result(
         leaf: &[u8; 32],
         path_siblings: &[[u8; 32]],
         position_bits: &[bool],
@@ -525,8 +750,46 @@ impl Halo2PastaBackend {
         index: u64,
         merkle_root: &[u8; 32],
         nullifier: &[u8; 32],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, ZkProofError> {
         let depth = path_siblings.len();
+        const MAX_DEPTH: usize = 32;
+        if depth == 0 || depth > MAX_DEPTH {
+            return Err(ZkProofError::InvalidMembershipDepth { depth, max: MAX_DEPTH });
+        }
+        if position_bits.len() != depth {
+            return Err(ZkProofError::LengthMismatch("membership position bits must match path siblings"));
+        }
+        if Fq::from_repr(*leaf).into_option().is_none() {
+            return Err(ZkProofError::NonCanonicalMembershipLeaf);
+        }
+        for (index, sibling) in path_siblings.iter().enumerate() {
+            if Fq::from_repr(*sibling).into_option().is_none() {
+                return Err(ZkProofError::NonCanonicalMembershipSibling { index });
+            }
+        }
+        if Fq::from_repr(*sk).into_option().is_none() {
+            return Err(ZkProofError::NonCanonicalNullifierKey);
+        }
+        let root_fq = Fq::from_repr(*merkle_root)
+            .into_option()
+            .ok_or(ZkProofError::NonCanonicalMerkleRoot)?;
+        let nf_fq = Fq::from_repr(*nullifier)
+            .into_option()
+            .ok_or(ZkProofError::NonCanonicalNullifier)?;
+        let expected_root = compute_membership_root_from_path(leaf, path_siblings, position_bits)?;
+        if expected_root != *merkle_root {
+            return Err(ZkProofError::MembershipRootMismatch {
+                expected: expected_root,
+                actual: *merkle_root,
+            });
+        }
+        let expected_nullifier = poseidon_fq::poseidon_nullifier(sk, index);
+        if expected_nullifier != *nullifier {
+            return Err(ZkProofError::MembershipNullifierMismatch {
+                expected: expected_nullifier,
+                actual: *nullifier,
+            });
+        }
         let (params, (_vk, pk)) = (ensure_params(), ensure_membership_keys_for_depth(depth));
 
         let circuit = MembershipCircuit {
@@ -540,51 +803,70 @@ impl Halo2PastaBackend {
         };
 
         let mut transcript = Blake2bWrite::<_, EpAffine, Challenge255<_>>::init(vec![]);
-        let root_fq = Fq::from_repr(*merkle_root).into_option().expect("merkle_root is canonical Fq");
-        let nf_fq = Fq::from_repr(*nullifier).into_option().expect("nullifier is canonical Fq");
         let instances = vec![vec![root_fq, nf_fq]];
 
         create_proof::<CommitmentSchemeIPA<EpAffine>, ProverIPA<'_, EpAffine>, _, _, _, _>(
             params, &pk, &[circuit], &[instances], OsRng, &mut transcript,
         )
-        .expect("prove_membership failed");
+        .map_err(|e| ZkProofError::ProvingError(format!("{e:?}")))?;
         let proof = transcript.finalize();
         let mut full = b"halo2_ipa_member_v1_".to_vec();
         full.extend_from_slice(&(depth as u32).to_le_bytes());
         full.extend_from_slice(&proof);
-        full
+        Ok(full)
     }
 
-    /// Verify a membership proof produced by `prove_membership`.
-    /// Returns true iff the proof is valid for the given `merkle_root` and `nullifier`.
-    pub fn verify_membership(proof: &[u8], merkle_root: &[u8; 32], nullifier: &[u8; 32]) -> bool {
+    pub fn prove_membership(
+        leaf: &[u8; 32],
+        path_siblings: &[[u8; 32]],
+        position_bits: &[bool],
+        sk: &[u8; 32],
+        index: u64,
+        merkle_root: &[u8; 32],
+        nullifier: &[u8; 32],
+    ) -> Vec<u8> {
+        Self::prove_membership_result(
+            leaf,
+            path_siblings,
+            position_bits,
+            sk,
+            index,
+            merkle_root,
+            nullifier,
+        )
+        .expect("prove_membership failed")
+    }
+
+    pub fn verify_membership_result(
+        proof: &[u8],
+        merkle_root: &[u8; 32],
+        nullifier: &[u8; 32],
+    ) -> Result<bool, ZkProofError> {
         const PREFIX: &[u8] = b"halo2_ipa_member_v1_";
         const PREFIX_LEN: usize = 20;
         const DEPTH_LEN: usize = 4;
         const MAX_DEPTH: usize = 32;
         if proof.len() < PREFIX_LEN + DEPTH_LEN || !proof.starts_with(PREFIX) {
-            return false;
+            return Err(ZkProofError::InvalidProofPrefix);
         }
         let depth = u32::from_le_bytes(
             proof[PREFIX_LEN..PREFIX_LEN + DEPTH_LEN]
                 .try_into()
-                .unwrap(),
+                .map_err(|_| ZkProofError::InvalidProofPrefix)?,
         ) as usize;
         if depth == 0 || depth > MAX_DEPTH {
-            return false;
+            return Err(ZkProofError::InvalidMembershipDepth { depth, max: MAX_DEPTH });
         }
         let inner_proof = &proof[PREFIX_LEN + DEPTH_LEN..];
 
-        let (params, (vk, _)) = (ensure_params(), ensure_membership_keys_for_depth(depth));
+        let root_fq = Fq::from_repr(*merkle_root)
+            .into_option()
+            .ok_or(ZkProofError::NonCanonicalMerkleRoot)?;
+        let nf_fq = Fq::from_repr(*nullifier)
+            .into_option()
+            .ok_or(ZkProofError::NonCanonicalNullifier)?;
 
-        let root_fq = match Fq::from_repr(*merkle_root).into_option() {
-            Some(fq) => fq,
-            None => return false,
-        };
-        let nf_fq = match Fq::from_repr(*nullifier).into_option() {
-            Some(fq) => fq,
-            None => return false,
-        };
+        let (params, (vk, _)) = (ensure_params(), ensure_membership_keys_for_depth(depth));
         let instances = vec![vec![root_fq, nf_fq]];
 
         let mut transcript = Blake2bRead::<_, EpAffine, Challenge255<_>>::init(inner_proof);
@@ -596,12 +878,15 @@ impl Halo2PastaBackend {
             SingleStrategyIPA<'_, EpAffine>,
         >(params, &vk, SingleStrategyIPA::new(params), &[instances], &mut transcript);
         match result {
-            Ok(strategy) => strategy.finalize(),
-            Err(e) => {
-                eprintln!("[ZK] verify_membership error: {:?}", e);
-                false
-            }
+            Ok(strategy) => Ok(strategy.finalize()),
+            Err(_) => Err(ZkProofError::VerificationError),
         }
+    }
+
+    /// Verify a membership proof produced by `prove_membership`.
+    /// Returns true iff the proof is valid for the given `merkle_root` and `nullifier`.
+    pub fn verify_membership(proof: &[u8], merkle_root: &[u8; 32], nullifier: &[u8; 32]) -> bool {
+        Self::verify_membership_result(proof, merkle_root, nullifier).unwrap_or(false)
     }
 
     pub fn setup_params() -> ParamsIPA<EqAffine> {
@@ -704,16 +989,18 @@ impl Halo2PastaBackend {
     /// Batch-verify multiple conservation proofs using AccumulatorStrategyIPA.
     /// All proofs are folded into a single MSM accumulator; finalize() checks
     /// once. Equivalent to calling verify_conservation per proof, but O(1) MSM check.
-    pub fn batch_verify_conservation(
+    pub fn batch_verify_conservation_result(
         proofs: &[Vec<u8>],
         outputs_list: &[&[[u8; 32]]],
         public_amounts: &[i64],
-    ) -> bool {
+    ) -> Result<bool, ZkProofError> {
         if proofs.len() != outputs_list.len() || proofs.len() != public_amounts.len() {
-            return false;
+            return Err(ZkProofError::LengthMismatch(
+                "proof, output commitment, and public amount batches must have equal length",
+            ));
         }
         if proofs.is_empty() {
-            return true;
+            return Ok(true);
         }
 
         let params = ensure_conservation_params();
@@ -726,31 +1013,40 @@ impl Halo2PastaBackend {
 
         for (i, proof) in proofs.iter().enumerate() {
             if proof.len() < PREFIX_LEN + SHAPE_LEN || !proof.starts_with(PREFIX) {
-                return false;
+                return Err(ZkProofError::InvalidProofPrefix);
             }
-            let in_len = u16::from_le_bytes(proof[PREFIX_LEN..PREFIX_LEN + 2].try_into().unwrap()) as usize;
+            let in_len = u16::from_le_bytes(
+                proof[PREFIX_LEN..PREFIX_LEN + 2]
+                    .try_into()
+                    .map_err(|_| ZkProofError::InvalidProofPrefix)?,
+            ) as usize;
             let out_len = u16::from_le_bytes(
-                proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN].try_into().unwrap(),
+                proof[PREFIX_LEN + 2..PREFIX_LEN + SHAPE_LEN]
+                    .try_into()
+                    .map_err(|_| ZkProofError::InvalidProofPrefix)?,
             ) as usize;
             if in_len + out_len > MAX_PROOF_IOPS {
-                return false;
+                return Err(ZkProofError::ProofShapeTooLarge { inputs: in_len, outputs: out_len, max: MAX_PROOF_IOPS });
+            }
+            let output_commitments = outputs_list[i];
+            if output_commitments.len() != out_len {
+                return Err(ZkProofError::LengthMismatch("output commitments length must match proof shape"));
             }
             let inner_proof = &proof[PREFIX_LEN + SHAPE_LEN..];
 
             let (vk, _) = ensure_conservation_keys(in_len, out_len);
 
             let public_amount = public_amounts[i];
-            let output_commitments = outputs_list[i];
             let instance_fp = if public_amount >= 0 {
                 Fp::from(public_amount as u64)
             } else {
                 Fp::ZERO - Fp::from(public_amount.unsigned_abs())
             };
             let mut instance_col = vec![instance_fp];
-            for cm in output_commitments {
+            for (index, cm) in output_commitments.iter().enumerate() {
                 match Fp::from_repr(*cm).into_option() {
                     Some(fp) => instance_col.push(fp),
-                    None => return false,
+                    None => return Err(ZkProofError::NonCanonicalCommitment { index }),
                 }
             }
             let instances = vec![instance_col];
@@ -767,11 +1063,77 @@ impl Halo2PastaBackend {
             );
             match result {
                 Ok(s) => strategy = s,
-                Err(_) => return false,
+                Err(_) => return Err(ZkProofError::VerificationError),
             }
         }
 
-        strategy.finalize()
+        Ok(strategy.finalize())
+    }
+
+    /// Batch-verify transactions using each transaction's declared proof-system
+    /// version. This intentionally dispatches per transaction so legacy
+    /// conservation proofs and canonical combined proofs cannot be confused.
+    pub fn batch_verify_transaction_result(
+        transactions: &[aetheris_core::Transaction],
+    ) -> Result<bool, ZkProofError> {
+        for tx in transactions {
+            if !Self::verify_transaction_result(tx)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn batch_verify_transaction(transactions: &[aetheris_core::Transaction]) -> bool {
+        Self::batch_verify_transaction_result(transactions).unwrap_or(false)
+    }
+
+    /// Batch-verify legacy transaction conservation proofs using each
+    /// transaction's consensus-visible output commitments and public amount.
+    pub fn batch_verify_transaction_conservation_result(
+        transactions: &[aetheris_core::Transaction],
+    ) -> Result<bool, ZkProofError> {
+        let mut proofs = Vec::with_capacity(transactions.len());
+        let mut outputs = Vec::with_capacity(transactions.len());
+        let mut public_amounts = Vec::with_capacity(transactions.len());
+
+        for tx in transactions {
+            match tx.proof_system_version {
+                aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION => {}
+                other => return Err(ZkProofError::UnsupportedProofSystemVersion(other)),
+            }
+            tx.validate_public_shape()
+                .map_err(|e| ZkProofError::InvalidTransactionShape(e.to_string()))?;
+            proofs.push(tx.proof.clone());
+            outputs.push(
+                tx.outputs
+                    .iter()
+                    .map(|output| output.commitment)
+                    .collect::<Vec<[u8; 32]>>(),
+            );
+            public_amounts.push(tx.circuit_public_amount());
+        }
+
+        let output_refs = outputs
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<&[[u8; 32]]>>();
+        Self::batch_verify_conservation_result(&proofs, &output_refs, &public_amounts)
+    }
+
+    pub fn batch_verify_transaction_conservation(
+        transactions: &[aetheris_core::Transaction],
+    ) -> bool {
+        Self::batch_verify_transaction_conservation_result(transactions).unwrap_or(false)
+    }
+
+    pub fn batch_verify_conservation(
+        proofs: &[Vec<u8>],
+        outputs_list: &[&[[u8; 32]]],
+        public_amounts: &[i64],
+    ) -> bool {
+        Self::batch_verify_conservation_result(proofs, outputs_list, public_amounts)
+            .unwrap_or(false)
     }
 }
 
@@ -779,11 +1141,6 @@ impl Halo2PastaBackend {
 mod tests {
     use super::*;
 
-    fn test_merkle_leaf(i: u64) -> [u8; 32] {
-        let mut b = [0u8; 32];
-        b[..8].copy_from_slice(&i.to_le_bytes());
-        b
-    }
 
     fn make_proof(amounts_in: &[u64], amounts_out: &[u64], pub_amt: i64) -> (Vec<u8>, Vec<[u8; 32]>) {
         let out_blindings: Vec<[u8; 32]> = vec![[0u8; 32]; amounts_out.len()];
@@ -794,6 +1151,189 @@ mod tests {
             amounts_in, amounts_out, &[], &out_blindings, &correct_cms, pub_amt,
         );
         (proof, correct_cms)
+    }
+
+
+    #[test]
+    fn test_prove_conservation_result_rejects_mismatched_commitment_without_panic() {
+        let result = Halo2PastaBackend::prove_conservation_result(
+            &[10],
+            &[10],
+            &[],
+            &[[0u8; 32]],
+            &[[0xAA; 32]],
+            0,
+        );
+        assert!(matches!(result, Err(ZkProofError::CommitmentMismatch { index: 0, .. })));
+    }
+
+    #[test]
+    fn test_verify_conservation_result_rejects_bad_prefix_without_panic() {
+        let result = Halo2PastaBackend::verify_conservation_result(b"not-a-proof", &[], 0);
+        assert_eq!(result, Err(ZkProofError::InvalidProofPrefix));
+    }
+
+    #[test]
+    fn test_verify_conservation_result_rejects_shape_commitment_mismatch() {
+        let (proof, _commitments) = make_proof(&[5], &[5], 0);
+        let result = Halo2PastaBackend::verify_conservation_result(&proof, &[], 0);
+        assert!(matches!(result, Err(ZkProofError::LengthMismatch(_))));
+    }
+
+    #[test]
+    fn test_verify_transaction_conservation_result_rejects_unknown_version() {
+        let (proof, commitments) = make_proof(&[7], &[7], 0);
+        let mut tx = aetheris_core::Transaction {
+            inputs: vec![[1u8; 32]],
+            outputs: commitments
+                .iter()
+                .map(|commitment| aetheris_core::ShieldedOutput {
+                    commitment: *commitment,
+                    ephemeral_key: [0u8; 32],
+                    ciphertext: vec![],
+                })
+                .collect(),
+            public_amount: 0,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
+            proof,
+        };
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Ok(true)
+        );
+        tx.proof_system_version = 99;
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Err(ZkProofError::UnsupportedProofSystemVersion(99))
+        );
+    }
+
+    #[test]
+    fn test_verify_transaction_conservation_result_rejects_invalid_public_shape() {
+        let (proof, commitments) = make_proof(&[7], &[7], 0);
+        let mut tx = make_transaction_from_proof(proof, commitments, 0);
+        tx.inputs = vec![[2u8; 32], [2u8; 32]];
+
+        assert!(matches!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Err(ZkProofError::InvalidTransactionShape(_))
+        ));
+    }
+
+    #[test]
+    fn test_verify_transaction_conservation_result_rejects_tampered_output_commitment() {
+        let (proof, commitments) = make_proof(&[10], &[10], 0);
+        let mut tx = make_transaction_from_proof(proof, commitments, 0);
+        tx.outputs[0].commitment = create_commitment(10, &[1u8; 32]);
+
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Err(ZkProofError::VerificationError)
+        );
+    }
+
+    #[test]
+    fn test_verify_transaction_conservation_result_binds_fee_to_public_amount() {
+        let (proof, commitments) = make_proof(&[20], &[15], 5);
+        let mut tx = make_transaction_from_proof(proof, commitments, 3);
+        tx.fee = 2;
+
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Ok(true)
+        );
+
+        tx.fee = 1;
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_conservation_result(&tx),
+            Err(ZkProofError::VerificationError)
+        );
+    }
+
+    fn make_canonical_combined_transaction() -> aetheris_core::Transaction {
+        let mut tree = IncrementalMerkleTree::new();
+        let leaf = Fq::from(7u64).to_repr();
+        tree.append(leaf);
+        tree.append(Fq::from(8u64).to_repr());
+        let path = tree.path(0).unwrap();
+        let root = *tree.root();
+        let sk = Fq::from(42u64).to_repr();
+        let nullifier = poseidon_fq::poseidon_nullifier(&sk, 0);
+        let commitment = create_commitment(5, &[9u8; 32]);
+        let proof = crate::combined_circuit::prove_combined_tx_result(
+            &[5],
+            &[5],
+            &[[1u8; 32]],
+            &[[9u8; 32]],
+            &[commitment],
+            0,
+            &leaf,
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            0,
+            &root,
+            &nullifier,
+        )
+        .unwrap();
+        aetheris_core::Transaction {
+            inputs: vec![nullifier],
+            outputs: vec![aetheris_core::ShieldedOutput {
+                commitment,
+                ephemeral_key: [0u8; 32],
+                ciphertext: vec![],
+            }],
+            public_amount: 0,
+            fee: 0,
+            note_root: root,
+            proof_system_version: aetheris_core::PROOF_SYSTEM_CANONICAL_SHIELDED_V1,
+            proof,
+        }
+    }
+
+    #[test]
+    fn test_verify_transaction_result_rejects_canonical_v1_legacy_conservation_proof() {
+        let (proof, commitments) = make_proof(&[7], &[7], 0);
+        let mut tx = make_transaction_from_proof(proof, commitments, 0);
+        tx.proof_system_version = aetheris_core::PROOF_SYSTEM_CANONICAL_SHIELDED_V1;
+
+        assert_eq!(
+            Halo2PastaBackend::verify_transaction_result(&tx),
+            Err(ZkProofError::InvalidProofPrefix)
+        );
+    }
+
+    #[test]
+    fn test_verify_transaction_result_accepts_canonical_v1_combined_proof() {
+        let tx = make_canonical_combined_transaction();
+        assert_eq!(Halo2PastaBackend::verify_transaction_result(&tx), Ok(true));
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_result_accepts_mixed_versions() {
+        let (proof, commitments) = make_proof(&[7], &[7], 0);
+        let legacy = make_transaction_from_proof(proof, commitments, 0);
+        let canonical = make_canonical_combined_transaction();
+
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_transaction_result(&[legacy, canonical]),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_result_rejects_canonical_legacy_prefix() {
+        let (proof, commitments) = make_proof(&[7], &[7], 0);
+        let mut canonical_with_legacy_proof = make_transaction_from_proof(proof, commitments, 0);
+        canonical_with_legacy_proof.proof_system_version =
+            aetheris_core::PROOF_SYSTEM_CANONICAL_SHIELDED_V1;
+
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_transaction_result(&[canonical_with_legacy_proof]),
+            Err(ZkProofError::InvalidProofPrefix)
+        );
     }
 
     #[test]
@@ -975,11 +1515,11 @@ mod tests {
                 let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
 
                 // H2 = H(h1_out, sib1) — BOTH cells copy-constrained
-                let h2_native = chip.native_hash(h1_native, self.sib1);
+                let _h2_native = chip.native_hash(h1_native, self.sib1);
                 let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(h1_native), Value::known(self.sib1), Some(h1.cell()), Some(sib1_cell))?;
 
                 // Nullifier = H(sk, index)
-                let nf_native = chip.native_hash(self.sk, self.index);
+                let _nf_native = chip.native_hash(self.sk, self.index);
                 let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
 
                 // instance[0] = h2, instance[1] = nf
@@ -1101,9 +1641,9 @@ mod tests {
                 let (leaf_cell, sib0_cell, sib1_cell, sk_cell, idx_cell) = witnesses;
                 let h1_native = chip.native_hash(self.leaf, self.sib0);
                 let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
-                let h2_native = chip.native_hash(h1_native, self.sib1);
+                let _h2_native = chip.native_hash(h1_native, self.sib1);
                 let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(h1_native), Value::known(self.sib1), Some(h1.cell()), Some(sib1_cell))?;
-                let nf_native = chip.native_hash(self.sk, self.index);
+                let _nf_native = chip.native_hash(self.sk, self.index);
                 let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
                 layouter.assign_region(|| "c0", |mut region| {
                     let ic = region.assign_advice_from_instance(|| "r", config.instance, 0, config.poseidon.state[0], 0)?;
@@ -1226,12 +1766,12 @@ mod tests {
 
                 // H2 = H(h1_out, sib1) — SWAPPED: sib1 goes FIRST, prev hash output goes SECOND
                 // This mimics position_bits=true in the membership circuit
-                let h2_native = chip.native_hash(self.sib1, h1_native); // swapped native
+                let _h2_native = chip.native_hash(self.sib1, h1_native); // swapped native
                 // first_cell = Some(sib1_cell), second_cell = Some(h1.cell())
                 let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(self.sib1), Value::known(h1_native), Some(sib1_cell), Some(h1.cell()))?;
 
                 // Nullifier
-                let nf_native = chip.native_hash(self.sk, self.index);
+                let _nf_native = chip.native_hash(self.sk, self.index);
                 let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
 
                 layouter.assign_region(|| "c0", |mut region| {
@@ -1352,10 +1892,10 @@ mod tests {
                 let h1 = chip.assign_hash(layouter.namespace(|| "h1"), Value::known(self.leaf), Value::known(self.sib0), Some(leaf_cell), Some(sib0_cell))?;
 
                 // H2: swapped — sib1→state[0], h1_out→state[1] (mimics position_bits true)
-                let h2_native = chip.native_hash(self.sib1, h1_native);
+                let _h2_native = chip.native_hash(self.sib1, h1_native);
                 let h2 = chip.assign_hash(layouter.namespace(|| "h2"), Value::known(self.sib1), Value::known(h1_native), Some(sib1_cell), Some(h1.cell()))?;
 
-                let nf_native = chip.native_hash(self.sk, self.index);
+                let _nf_native = chip.native_hash(self.sk, self.index);
                 let nf = chip.assign_hash(layouter.namespace(|| "nf"), Value::known(self.sk), Value::known(self.index), Some(sk_cell), Some(idx_cell))?;
 
                 layouter.assign_region(|| "c0", |mut region| {
@@ -1406,7 +1946,7 @@ mod tests {
     fn test_membership_direct_ipa() {
         unsafe { std::env::set_var("AETHERIS_DBG", "1"); }
 
-        use crate::membership_circuit::{MembershipCircuit, MEMBERSHIP_K};
+        use crate::membership_circuit::MembershipCircuit;
         use crate::merkle_tree::IncrementalMerkleTree;
         use crate::poseidon_fq;
 
@@ -1466,7 +2006,7 @@ mod tests {
         use crate::poseidon_fq::{ensure_poseidon_spec, poseidon_permute};
         use crate::poseidon_fq_chip::{PoseidonFqChip, PoseidonFqConfig};
         use halo2_proofs::{
-            circuit::{Cell, Layouter, SimpleFloorPlanner, Value},
+            circuit::{Layouter, SimpleFloorPlanner, Value},
             plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression, Instance, Selector},
             poly::Rotation,
         };
@@ -1807,6 +2347,305 @@ mod tests {
         let fake_root = [0xFFu8; 32];
         assert!(!Halo2PastaBackend::verify_membership(&proof, &fake_root, &nf),
             "wrong root should be rejected");
+    }
+
+
+
+    #[test]
+    fn test_batch_verify_conservation_result_accepts_valid_batch() {
+        let (p1, commitments1) = make_proof(&[10], &[10], 0);
+        let (p2, commitments2) = make_proof(&[20], &[20], 0);
+        let proofs = vec![p1, p2];
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_conservation_result(
+                &proofs,
+                &[&commitments1, &commitments2],
+                &[0, 0],
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_conservation_result_rejects_bad_prefix() {
+        let proofs = vec![b"not-a-proof".to_vec()];
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_conservation_result(&proofs, &[&[]], &[0]),
+            Err(ZkProofError::InvalidProofPrefix)
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_conservation_result_rejects_commitment_shape_mismatch() {
+        let (proof, _commitments) = make_proof(&[10], &[10], 0);
+        assert!(matches!(
+            Halo2PastaBackend::batch_verify_conservation_result(&[proof], &[&[]], &[0]),
+            Err(ZkProofError::LengthMismatch(_))
+        ));
+    }
+
+    fn make_transaction_from_proof(
+        proof: Vec<u8>,
+        commitments: Vec<[u8; 32]>,
+        public_amount: u64,
+    ) -> aetheris_core::Transaction {
+        aetheris_core::Transaction {
+            inputs: vec![[1u8; 32]],
+            outputs: commitments
+                .iter()
+                .map(|commitment| aetheris_core::ShieldedOutput {
+                    commitment: *commitment,
+                    ephemeral_key: [0u8; 32],
+                    ciphertext: vec![],
+                })
+                .collect(),
+            public_amount,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: aetheris_core::PROOF_SYSTEM_LEGACY_CONSERVATION,
+            proof,
+        }
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_conservation_result_accepts_valid_transactions() {
+        let (p1, commitments1) = make_proof(&[10], &[10], 0);
+        let (p2, commitments2) = make_proof(&[20], &[15], 5);
+        let mut tx_with_fee = make_transaction_from_proof(p2, commitments2, 3);
+        tx_with_fee.fee = 2;
+        let txs = vec![make_transaction_from_proof(p1, commitments1, 0), tx_with_fee];
+
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_transaction_conservation_result(&txs),
+            Ok(true)
+        );
+        assert!(Halo2PastaBackend::batch_verify_transaction_conservation(&txs));
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_conservation_result_rejects_unknown_version() {
+        let (proof, commitments) = make_proof(&[10], &[10], 0);
+        let mut tx = make_transaction_from_proof(proof, commitments, 0);
+        tx.proof_system_version = 9;
+
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_transaction_conservation_result(&[tx]),
+            Err(ZkProofError::UnsupportedProofSystemVersion(9))
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_conservation_result_rejects_invalid_public_shape() {
+        let (proof, commitments) = make_proof(&[10], &[10], 0);
+        let mut tx = make_transaction_from_proof(proof, commitments, 0);
+        tx.inputs = vec![[3u8; 32], [3u8; 32]];
+
+        assert!(matches!(
+            Halo2PastaBackend::batch_verify_transaction_conservation_result(&[tx]),
+            Err(ZkProofError::InvalidTransactionShape(_))
+        ));
+    }
+
+    #[test]
+    fn test_batch_verify_transaction_conservation_result_rejects_tampered_public_amount() {
+        let (proof, commitments) = make_proof(&[10], &[10], 0);
+        let tx = make_transaction_from_proof(proof, commitments, 1);
+
+        assert_eq!(
+            Halo2PastaBackend::batch_verify_transaction_conservation_result(&[tx]),
+            Err(ZkProofError::VerificationError)
+        );
+    }
+
+    #[test]
+    fn test_membership_result_rejects_bad_prefix_without_panic() {
+        let root = [0u8; 32];
+        let nf = [0u8; 32];
+        let result = Halo2PastaBackend::verify_membership_result(b"not-a-member-proof", &root, &nf);
+        assert_eq!(result, Err(ZkProofError::InvalidProofPrefix));
+    }
+
+    #[test]
+    fn test_membership_result_rejects_bad_depth_without_panic() {
+        let mut proof = b"halo2_ipa_member_v1_".to_vec();
+        proof.extend_from_slice(&0u32.to_le_bytes());
+        let root = [0u8; 32];
+        let nf = [0u8; 32];
+        assert_eq!(
+            Halo2PastaBackend::verify_membership_result(&proof, &root, &nf),
+            Err(ZkProofError::InvalidMembershipDepth { depth: 0, max: 32 })
+        );
+    }
+
+    #[test]
+    fn test_membership_result_rejects_wrong_nullifier() {
+        let mut tree = IncrementalMerkleTree::new();
+        let leaf = [7u8; 32];
+        let filler = [8u8; 32];
+        tree.append(leaf);
+        tree.append(filler);
+        let index = 0u64;
+        let sk = Fq::from(42u64).to_repr();
+        let nf = poseidon_fq::poseidon_nullifier(&sk, index);
+        let path = tree.path(index as usize).unwrap();
+        let root = *tree.root();
+        let proof = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            index,
+            &root,
+            &nf,
+        )
+        .unwrap();
+        let wrong_nf = poseidon_fq::poseidon_nullifier(&sk, index + 1);
+
+        assert_eq!(
+            Halo2PastaBackend::verify_membership_result(&proof, &root, &wrong_nf),
+            Err(ZkProofError::VerificationError)
+        );
+    }
+
+    #[test]
+    fn test_prove_membership_result_rejects_mismatched_path_shape() {
+        let leaf = [0u8; 32];
+        let sibling = [[1u8; 32]];
+        let sk = Fq::from(42u64).to_repr();
+        let root = [0u8; 32];
+        let nf = [0u8; 32];
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &sibling,
+            &[],
+            &sk,
+            0,
+            &root,
+            &nf,
+        );
+        assert!(matches!(result, Err(ZkProofError::LengthMismatch(_))));
+    }
+
+    #[test]
+    fn test_prove_conservation_result_rejects_value_balance_mismatch_before_synthesis() {
+        let result = Halo2PastaBackend::prove_conservation_result(
+            &[10],
+            &[7],
+            &[[0u8; 32]],
+            &[[1u8; 32]],
+            &[],
+            0,
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::ValueBalanceMismatch {
+                expected_public_amount: 3,
+                actual_public_amount: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_prove_membership_result_rejects_noncanonical_leaf() {
+        let leaf = [0xffu8; 32];
+        let sibling = [[1u8; 32]];
+        let sk = Fq::from(42u64).to_repr();
+        let root = [0u8; 32];
+        let nf = [0u8; 32];
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &sibling,
+            &[false],
+            &sk,
+            0,
+            &root,
+            &nf,
+        );
+        assert_eq!(result, Err(ZkProofError::NonCanonicalMembershipLeaf));
+    }
+
+    #[test]
+    fn test_prove_membership_result_rejects_noncanonical_sibling_and_key() {
+        let leaf = Fq::from(7u64).to_repr();
+        let root = [0u8; 32];
+        let nf = [0u8; 32];
+        let bad_sibling = [[0xffu8; 32]];
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &bad_sibling,
+            &[false],
+            &Fq::from(42u64).to_repr(),
+            0,
+            &root,
+            &nf,
+        );
+        assert_eq!(
+            result,
+            Err(ZkProofError::NonCanonicalMembershipSibling { index: 0 })
+        );
+
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &[[1u8; 32]],
+            &[false],
+            &[0xffu8; 32],
+            0,
+            &root,
+            &nf,
+        );
+        assert_eq!(result, Err(ZkProofError::NonCanonicalNullifierKey));
+    }
+
+    #[test]
+    fn test_prove_membership_result_rejects_wrong_merkle_root_before_synthesis() {
+        let mut tree = IncrementalMerkleTree::new();
+        let leaf = Fq::from(7u64).to_repr();
+        tree.append(leaf);
+        tree.append(Fq::from(8u64).to_repr());
+        let path = tree.path(0).unwrap();
+        let sk = Fq::from(42u64).to_repr();
+        let nf = poseidon_fq::poseidon_nullifier(&sk, 0);
+        let wrong_root = Fq::from(999u64).to_repr();
+
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            0,
+            &wrong_root,
+            &nf,
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::MembershipRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_prove_membership_result_rejects_wrong_nullifier_before_synthesis() {
+        let mut tree = IncrementalMerkleTree::new();
+        let leaf = Fq::from(7u64).to_repr();
+        tree.append(leaf);
+        tree.append(Fq::from(8u64).to_repr());
+        let path = tree.path(0).unwrap();
+        let root = *tree.root();
+        let sk = Fq::from(42u64).to_repr();
+        let wrong_nf = poseidon_fq::poseidon_nullifier(&sk, 1);
+
+        let result = Halo2PastaBackend::prove_membership_result(
+            &leaf,
+            &path.siblings,
+            &path.position_bits,
+            &sk,
+            0,
+            &root,
+            &wrong_nf,
+        );
+        assert!(matches!(
+            result,
+            Err(ZkProofError::MembershipNullifierMismatch { .. })
+        ));
     }
 
     #[test]

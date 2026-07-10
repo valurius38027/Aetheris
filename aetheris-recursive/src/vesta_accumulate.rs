@@ -616,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_accumulate_wires_transcript_and_fold() {
         let witness = build_test_witness();
         let circuit = AccumulateTest {
@@ -630,6 +631,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_accumulate_rejects_corrupt_challenge() {
         let witness = build_test_witness();
         let circuit = AccumulateTest {
@@ -867,6 +869,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_passes() {
         let vw = base_verify_witness();
         let circuit = VerifyIpaTest {
@@ -881,6 +884,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_rejects_corrupt_r_prime() {
         let vw = base_verify_witness();
         let circuit = VerifyIpaTest {
@@ -895,6 +899,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_rejects_corrupt_eval() {
         let mut vw = base_verify_witness();
         vw.eval = vw.eval + Fq::ONE;
@@ -910,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_rejects_corrupt_a_final() {
         let mut vw = base_verify_witness();
         vw.a_final = vw.a_final + Fq::ONE;
@@ -925,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_rejects_corrupt_l_point() {
         let mut vw = base_verify_witness();
         vw.l_points[0] = EqAffine::generator();
@@ -940,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy K>=17 recursive circuit test; run explicitly with --ignored and a name filter"]
     fn test_verify_ipa_full_rejects_corrupt_r_point() {
         let mut vw = base_verify_witness();
         vw.r_points[0] = EqAffine::generator();

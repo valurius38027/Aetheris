@@ -4,6 +4,12 @@ pub type Amount = u64;
 pub type Hash = [u8; 32];
 pub type Nullifier = Hash;
 pub type Commitment = Hash;
+pub type AssetId = Hash;
+pub type NoteRoot = Hash;
+
+pub const AET_ASSET_ID: AssetId = [0u8; 32];
+pub const PROOF_SYSTEM_LEGACY_CONSERVATION: u16 = 0;
+pub const PROOF_SYSTEM_CANONICAL_SHIELDED_V1: u16 = 1;
 
 pub const VDF_DIFFICULTY: u64 = 1_600_000;
 pub const TARGET_BLOCK_TIME: u64 = 10; // Target 10 seconds per block
@@ -14,9 +20,212 @@ pub const MAX_OUTPUTS: usize = 5;
 // EXPECTED_GENESIS_HASH — recompute after changing create_genesis_block.
 // Fair launch genesis: empty block (no mint/transfer transactions).
 // Recompute with: cargo test -p aetheris-ffi --lib test_genesis_hash_locked -- --test-threads=1
-pub const EXPECTED_GENESIS_HASH: &str = "93c42fa7c611220c565b6792a30d113bbe8176d34fbfa1698cc0bb8b705fa536";
+pub const EXPECTED_GENESIS_HASH: &str = "cd930c8e33305255c09bbf389ccf14aec4b825ccbd416bec46db49ebaa1429e1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const NOTE_COMMITMENT_DOMAIN: &[u8] = b"AETHERIS_NOTE_COMMITMENT_V1";
+const NULLIFIER_DOMAIN: &[u8] = b"AETHERIS_NULLIFIER_V1";
+
+/// Computes the canonical note commitment used by transaction outputs.
+///
+/// The field order is consensus-critical and intentionally includes all
+/// immutable note plaintext fields plus the separate commitment blinding.
+/// Future circuit work must reproduce this transcript inside the proof system
+/// before Phase 2 can mark output commitment binding as closed.
+pub fn canonical_note_commitment(note: &NotePlaintext, blinding: &[u8; 32]) -> Commitment {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NOTE_COMMITMENT_DOMAIN);
+    hasher.update(&note.amount.to_le_bytes());
+    hasher.update(&note.asset_id);
+    hasher.update(&note.owner);
+    hasher.update(&note.rho);
+    hasher.update(&note.rseed);
+    hasher.update(&(note.memo.len() as u64).to_le_bytes());
+    hasher.update(&note.memo);
+    hasher.update(blinding);
+    hasher.finalize().into()
+}
+
+/// Computes the canonical nullifier for an input note witness.
+///
+/// The nullifier binds the already-committed note, the wallet's nullifier key,
+/// and the note tree position. Nodes still enforce uniqueness against chain
+/// state, while the ZK transaction proof must eventually constrain this same
+/// transcript so arbitrary public nullifiers cannot be supplied.
+pub fn canonical_nullifier(
+    note_commitment: &Commitment,
+    nullifier_key: &[u8; 32],
+    merkle_position: u64,
+) -> Nullifier {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NULLIFIER_DOMAIN);
+    hasher.update(note_commitment);
+    hasher.update(nullifier_key);
+    hasher.update(&merkle_position.to_le_bytes());
+    hasher.finalize().into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotePlaintext {
+    pub amount: Amount,
+    pub asset_id: AssetId,
+    pub owner: [u8; 32],
+    pub rho: [u8; 32],
+    pub rseed: [u8; 32],
+    pub memo: Vec<u8>,
+}
+
+impl NotePlaintext {
+    /// Domain-separated canonical note commitment for the current host-side
+    /// protocol model. The ZK circuit closure work must constrain the same
+    /// field order so every public output commitment commits to the private
+    /// note fields rather than only to amount/blinding.
+    pub fn commitment(&self, blinding: &[u8; 32]) -> Commitment {
+        canonical_note_commitment(self, blinding)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteWitness {
+    pub note: NotePlaintext,
+    pub blinding: [u8; 32],
+    pub nullifier_key: [u8; 32],
+    pub merkle_path: Vec<Hash>,
+    pub merkle_position: u64,
+}
+
+impl NoteWitness {
+    pub fn commitment(&self) -> Commitment {
+        self.note.commitment(&self.blinding)
+    }
+
+    pub fn nullifier(&self) -> Nullifier {
+        canonical_nullifier(&self.commitment(), &self.nullifier_key, self.merkle_position)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputNoteWitness {
+    pub note: NotePlaintext,
+    pub blinding: [u8; 32],
+}
+
+impl OutputNoteWitness {
+    pub fn commitment(&self) -> Commitment {
+        self.note.commitment(&self.blinding)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionWitness {
+    pub inputs: Vec<NoteWitness>,
+    pub outputs: Vec<OutputNoteWitness>,
+}
+
+impl TransactionWitness {
+    pub fn input_nullifiers(&self) -> Vec<Nullifier> {
+        self.inputs.iter().map(NoteWitness::nullifier).collect()
+    }
+
+    pub fn output_commitments(&self) -> Vec<Commitment> {
+        self.outputs.iter().map(OutputNoteWitness::commitment).collect()
+    }
+
+    pub fn validate_public_inputs(&self, tx: &Transaction) -> Result<(), WitnessValidationError> {
+        if self.inputs.len() != tx.inputs.len() {
+            return Err(WitnessValidationError::InputCountMismatch {
+                witness: self.inputs.len(),
+                transaction: tx.inputs.len(),
+            });
+        }
+
+        for (index, (witness, nullifier)) in self.inputs.iter().zip(&tx.inputs).enumerate() {
+            let expected = witness.nullifier();
+            if expected != *nullifier {
+                return Err(WitnessValidationError::InputNullifierMismatch {
+                    index,
+                    expected,
+                    actual: *nullifier,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_public_outputs(&self, tx: &Transaction) -> Result<(), WitnessValidationError> {
+        if self.outputs.len() != tx.outputs.len() {
+            return Err(WitnessValidationError::OutputCountMismatch {
+                witness: self.outputs.len(),
+                transaction: tx.outputs.len(),
+            });
+        }
+
+        for (index, (witness, output)) in self.outputs.iter().zip(&tx.outputs).enumerate() {
+            let expected = witness.commitment();
+            if expected != output.commitment {
+                return Err(WitnessValidationError::OutputCommitmentMismatch {
+                    index,
+                    expected,
+                    actual: output.commitment,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_public_fields(&self, tx: &Transaction) -> Result<(), WitnessValidationError> {
+        self.validate_public_inputs(tx)?;
+        self.validate_public_outputs(tx)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessValidationError {
+    InputCountMismatch {
+        witness: usize,
+        transaction: usize,
+    },
+    OutputCountMismatch {
+        witness: usize,
+        transaction: usize,
+    },
+    InputNullifierMismatch {
+        index: usize,
+        expected: Nullifier,
+        actual: Nullifier,
+    },
+    OutputCommitmentMismatch {
+        index: usize,
+        expected: Commitment,
+        actual: Commitment,
+    },
+}
+
+impl std::fmt::Display for WitnessValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputCountMismatch { witness, transaction } => write!(
+                f,
+                "witness input count {witness} does not match transaction input count {transaction}"
+            ),
+            Self::OutputCountMismatch { witness, transaction } => write!(
+                f,
+                "witness output count {witness} does not match transaction output count {transaction}"
+            ),
+            Self::InputNullifierMismatch { index, .. } => {
+                write!(f, "input witness nullifier mismatch at index {index}")
+            }
+            Self::OutputCommitmentMismatch { index, .. } => {
+                write!(f, "output witness commitment mismatch at index {index}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WitnessValidationError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShieldedOutput {
     pub commitment: Commitment,
     pub ephemeral_key: [u8; 32], // Diffie-Hellman ephemeral key for scanning
@@ -28,10 +237,76 @@ pub struct Transaction {
     pub inputs: Vec<Nullifier>,
     pub outputs: Vec<ShieldedOutput>,
     pub public_amount: Amount,
+    #[serde(default)]
+    pub fee: Amount,
+    #[serde(default)]
+    pub note_root: NoteRoot,
+    #[serde(default)]
+    pub proof_system_version: u16,
     pub proof: Vec<u8>,
 }
 
 impl Transaction {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+
+    pub fn validate_public_shape(&self) -> Result<(), TransactionValidationError> {
+        if self.inputs.len() > MAX_INPUTS {
+            return Err(TransactionValidationError::TooManyInputs {
+                actual: self.inputs.len(),
+                max: MAX_INPUTS,
+            });
+        }
+        if self.outputs.len() > MAX_OUTPUTS {
+            return Err(TransactionValidationError::TooManyOutputs {
+                actual: self.outputs.len(),
+                max: MAX_OUTPUTS,
+            });
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for nf in &self.inputs {
+            if !seen.insert(*nf) {
+                return Err(TransactionValidationError::DuplicateNullifier(*nf));
+            }
+        }
+
+        match self.proof_system_version {
+            PROOF_SYSTEM_LEGACY_CONSERVATION | PROOF_SYSTEM_CANONICAL_SHIELDED_V1 => {}
+            other => return Err(TransactionValidationError::UnsupportedProofSystemVersion(other)),
+        }
+
+        let circuit_amount = if self.is_coinbase() {
+            self.public_amount
+        } else {
+            self.public_amount
+                .checked_add(self.fee)
+                .ok_or(TransactionValidationError::PublicAmountOutOfRange)?
+        };
+        if circuit_amount > i64::MAX as u64 {
+            return Err(TransactionValidationError::PublicAmountOutOfRange);
+        }
+
+        Ok(())
+    }
+
+    pub fn canonical_public_fields(&self) -> TransactionPublicFields {
+        TransactionPublicFields {
+            input_nullifiers: self.inputs.clone(),
+            output_commitments: self.outputs.iter().map(|out| out.commitment).collect(),
+            encrypted_outputs: self.outputs.clone(),
+            public_amount: self.public_amount,
+            fee: self.fee,
+            note_root: self.note_root,
+            proof_system_version: self.proof_system_version,
+        }
+    }
+
     /// Returns true if this is a coinbase-style transaction (mint or block reward):
     /// no input nullifiers and a positive public_amount.
     pub fn is_coinbase(&self) -> bool {
@@ -45,15 +320,62 @@ impl Transaction {
     ///
     /// For a coinbase tx, `total_in = 0` and `total_out = public_amount`, so
     /// to satisfy the constraint we must pass `public_amount = -self.public_amount`.
-    /// For a regular transfer, `public_amount` is unchanged.
+    /// For a regular transfer, `public_amount + fee` is exposed to the circuit
+    /// so fees cannot be hidden outside the conservation equation.
     pub fn circuit_public_amount(&self) -> i64 {
-        if self.is_coinbase() {
-            -(self.public_amount as i64)
+        let public_amount = if self.is_coinbase() {
+            self.public_amount
         } else {
-            self.public_amount as i64
+            self.public_amount.saturating_add(self.fee)
+        };
+        let public_amount = i64::try_from(public_amount).unwrap_or(i64::MAX);
+        if self.is_coinbase() {
+            -public_amount
+        } else {
+            public_amount
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionPublicFields {
+    pub input_nullifiers: Vec<Nullifier>,
+    pub output_commitments: Vec<Commitment>,
+    pub encrypted_outputs: Vec<ShieldedOutput>,
+    pub public_amount: Amount,
+    pub fee: Amount,
+    pub note_root: NoteRoot,
+    pub proof_system_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionValidationError {
+    TooManyInputs { actual: usize, max: usize },
+    TooManyOutputs { actual: usize, max: usize },
+    DuplicateNullifier(Nullifier),
+    UnsupportedProofSystemVersion(u16),
+    PublicAmountOutOfRange,
+}
+
+impl std::fmt::Display for TransactionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyInputs { actual, max } => {
+                write!(f, "too many transaction inputs: {actual} > {max}")
+            }
+            Self::TooManyOutputs { actual, max } => {
+                write!(f, "too many transaction outputs: {actual} > {max}")
+            }
+            Self::DuplicateNullifier(_) => write!(f, "duplicate input nullifier"),
+            Self::UnsupportedProofSystemVersion(version) => {
+                write!(f, "unsupported proof system version: {version}")
+            }
+            Self::PublicAmountOutOfRange => write!(f, "transaction public amount plus fee is out of range"),
+        }
+    }
+}
+
+impl std::error::Error for TransactionValidationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -160,6 +482,9 @@ mod tests {
             inputs: vec![[seed; 32]],
             outputs: vec![dummy_output(seed), dummy_output(seed + 1)],
             public_amount: (seed as Amount) * 100,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![seed; 128],
         }
     }
@@ -289,6 +614,256 @@ mod tests {
         assert_eq!(decoded.amount, 1000);
     }
 
+
+    #[test]
+    fn test_note_plaintext_serialization_roundtrip() {
+        let note = NotePlaintext {
+            amount: 42,
+            asset_id: AET_ASSET_ID,
+            owner: [0x11; 32],
+            rho: [0x22; 32],
+            rseed: [0x33; 32],
+            memo: b"canonical memo".to_vec(),
+        };
+        let encoded = serde_json::to_vec(&note).unwrap();
+        let decoded: NotePlaintext = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, note);
+    }
+
+    #[test]
+    fn test_canonical_note_commitment_binds_plaintext_fields() {
+        let note = NotePlaintext {
+            amount: 42,
+            asset_id: AET_ASSET_ID,
+            owner: [0x11; 32],
+            rho: [0x22; 32],
+            rseed: [0x33; 32],
+            memo: b"canonical memo".to_vec(),
+        };
+        let blinding = [0x44; 32];
+        let commitment = note.commitment(&blinding);
+
+        assert_eq!(commitment, canonical_note_commitment(&note, &blinding));
+
+        let mut changed_amount = note.clone();
+        changed_amount.amount += 1;
+        assert_ne!(commitment, changed_amount.commitment(&blinding));
+
+        let mut changed_asset = note.clone();
+        changed_asset.asset_id = [0x55; 32];
+        assert_ne!(commitment, changed_asset.commitment(&blinding));
+
+        let mut changed_owner = note.clone();
+        changed_owner.owner = [0x66; 32];
+        assert_ne!(commitment, changed_owner.commitment(&blinding));
+
+        let mut changed_rho = note.clone();
+        changed_rho.rho = [0x77; 32];
+        assert_ne!(commitment, changed_rho.commitment(&blinding));
+
+        let mut changed_rseed = note.clone();
+        changed_rseed.rseed = [0x88; 32];
+        assert_ne!(commitment, changed_rseed.commitment(&blinding));
+
+        let mut changed_memo = note.clone();
+        changed_memo.memo.push(b'!');
+        assert_ne!(commitment, changed_memo.commitment(&blinding));
+
+        assert_ne!(commitment, note.commitment(&[0x99; 32]));
+    }
+
+    #[test]
+    fn test_note_witness_nullifier_binds_note_key_and_position() {
+        let witness = NoteWitness {
+            note: NotePlaintext {
+                amount: 42,
+                asset_id: AET_ASSET_ID,
+                owner: [0x11; 32],
+                rho: [0x22; 32],
+                rseed: [0x33; 32],
+                memo: b"canonical memo".to_vec(),
+            },
+            blinding: [0x44; 32],
+            nullifier_key: [0x55; 32],
+            merkle_path: vec![[0x66; 32]],
+            merkle_position: 7,
+        };
+        let nullifier = witness.nullifier();
+        assert_eq!(
+            nullifier,
+            canonical_nullifier(&witness.commitment(), &witness.nullifier_key, 7)
+        );
+
+        let mut changed_key = witness.clone();
+        changed_key.nullifier_key = [0x77; 32];
+        assert_ne!(nullifier, changed_key.nullifier());
+
+        let mut changed_position = witness.clone();
+        changed_position.merkle_position = 8;
+        assert_ne!(nullifier, changed_position.nullifier());
+
+        let mut changed_note = witness.clone();
+        changed_note.note.rho = [0x88; 32];
+        assert_ne!(nullifier, changed_note.nullifier());
+    }
+
+    #[test]
+    fn test_transaction_witness_validates_input_nullifiers() {
+        let input_witness = NoteWitness {
+            note: NotePlaintext {
+                amount: 42,
+                asset_id: AET_ASSET_ID,
+                owner: [0x11; 32],
+                rho: [0x22; 32],
+                rseed: [0x33; 32],
+                memo: b"canonical memo".to_vec(),
+            },
+            blinding: [0x44; 32],
+            nullifier_key: [0x55; 32],
+            merkle_path: vec![[0x66; 32]],
+            merkle_position: 7,
+        };
+        let mut tx = dummy_tx(1);
+        tx.inputs = vec![input_witness.nullifier()];
+        tx.outputs.clear();
+        let witness = TransactionWitness {
+            inputs: vec![input_witness.clone()],
+            outputs: vec![],
+        };
+
+        assert_eq!(witness.input_nullifiers(), tx.inputs);
+        assert!(witness.validate_public_inputs(&tx).is_ok());
+        assert!(witness.validate_public_fields(&tx).is_ok());
+
+        let mut changed_witness = witness.clone();
+        changed_witness.inputs[0].nullifier_key = [0x77; 32];
+        assert!(matches!(
+            changed_witness.validate_public_inputs(&tx),
+            Err(WitnessValidationError::InputNullifierMismatch { index: 0, .. })
+        ));
+
+        let mut missing_input_tx = tx.clone();
+        missing_input_tx.inputs.clear();
+        assert!(matches!(
+            witness.validate_public_inputs(&missing_input_tx),
+            Err(WitnessValidationError::InputCountMismatch { witness: 1, transaction: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_transaction_witness_validates_output_commitments() {
+        let output_witness = OutputNoteWitness {
+            note: NotePlaintext {
+                amount: 42,
+                asset_id: AET_ASSET_ID,
+                owner: [0x11; 32],
+                rho: [0x22; 32],
+                rseed: [0x33; 32],
+                memo: b"canonical memo".to_vec(),
+            },
+            blinding: [0x44; 32],
+        };
+        let mut tx = dummy_tx(1);
+        tx.outputs = vec![ShieldedOutput {
+            commitment: output_witness.commitment(),
+            ephemeral_key: [0x55; 32],
+            ciphertext: b"encrypted".to_vec(),
+        }];
+        let witness = TransactionWitness {
+            inputs: vec![],
+            outputs: vec![output_witness.clone()],
+        };
+
+        assert_eq!(witness.output_commitments(), vec![tx.outputs[0].commitment]);
+        assert!(witness.validate_public_outputs(&tx).is_ok());
+
+        let mut changed_witness = witness.clone();
+        changed_witness.outputs[0].note.owner = [0x66; 32];
+        assert!(matches!(
+            changed_witness.validate_public_outputs(&tx),
+            Err(WitnessValidationError::OutputCommitmentMismatch { index: 0, .. })
+        ));
+
+        let mut missing_output_tx = tx.clone();
+        missing_output_tx.outputs.clear();
+        assert!(matches!(
+            witness.validate_public_outputs(&missing_output_tx),
+            Err(WitnessValidationError::OutputCountMismatch { witness: 1, transaction: 0 })
+        ));
+    }
+
+    #[test]
+    fn test_transaction_public_fields_project_consensus_data() {
+        let mut tx = dummy_tx(7);
+        tx.fee = 3;
+        tx.note_root = [0x44; 32];
+        tx.proof_system_version = PROOF_SYSTEM_CANONICAL_SHIELDED_V1;
+
+        let public = tx.canonical_public_fields();
+        assert_eq!(public.input_nullifiers, tx.inputs);
+        assert_eq!(public.output_commitments, vec![[7u8; 32], [8u8; 32]]);
+        assert_eq!(public.encrypted_outputs, tx.outputs);
+        assert_eq!(public.public_amount, 700);
+        assert_eq!(public.fee, 3);
+        assert_eq!(public.note_root, [0x44; 32]);
+        assert_eq!(public.proof_system_version, PROOF_SYSTEM_CANONICAL_SHIELDED_V1);
+    }
+
+    #[test]
+    fn test_transaction_json_defaults_legacy_fields() {
+        let legacy_json = r#"{
+            "inputs": [],
+            "outputs": [],
+            "public_amount": 0,
+            "proof": []
+        }"#;
+        let tx: Transaction = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(tx.fee, 0);
+        assert_eq!(tx.note_root, [0u8; 32]);
+        assert_eq!(tx.proof_system_version, PROOF_SYSTEM_LEGACY_CONSERVATION);
+    }
+
+    #[test]
+    fn test_transaction_bytes_roundtrip() {
+        let tx = dummy_tx(3);
+        let encoded = tx.to_bytes().unwrap();
+        let decoded = Transaction::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.inputs, tx.inputs);
+        assert_eq!(decoded.canonical_public_fields(), tx.canonical_public_fields());
+        assert_eq!(decoded.proof, tx.proof);
+    }
+
+    #[test]
+    fn test_transaction_public_shape_rejects_too_many_inputs() {
+        let mut tx = dummy_tx(1);
+        tx.inputs = vec![[1u8; 32]; MAX_INPUTS + 1];
+        assert!(matches!(
+            tx.validate_public_shape(),
+            Err(TransactionValidationError::TooManyInputs { actual, max })
+                if actual == MAX_INPUTS + 1 && max == MAX_INPUTS
+        ));
+    }
+
+    #[test]
+    fn test_transaction_public_shape_rejects_duplicate_nullifier() {
+        let mut tx = dummy_tx(1);
+        tx.inputs = vec![[9u8; 32], [9u8; 32]];
+        assert_eq!(
+            tx.validate_public_shape(),
+            Err(TransactionValidationError::DuplicateNullifier([9u8; 32]))
+        );
+    }
+
+    #[test]
+    fn test_transaction_public_shape_rejects_unknown_proof_version() {
+        let mut tx = dummy_tx(1);
+        tx.proof_system_version = 99;
+        assert_eq!(
+            tx.validate_public_shape(),
+            Err(TransactionValidationError::UnsupportedProofSystemVersion(99))
+        );
+    }
+
     #[test]
     fn test_p2p_message_sync_request() {
         let msg = P2PMessage::SyncRequest { start_height: 0, end_height: 100 };
@@ -308,6 +883,9 @@ mod tests {
             inputs,
             outputs: vec![],
             public_amount,
+            fee: 0,
+            note_root: [0u8; 32],
+            proof_system_version: PROOF_SYSTEM_LEGACY_CONSERVATION,
             proof: vec![],
         }
     }
@@ -345,6 +923,24 @@ mod tests {
     #[test]
     fn test_circuit_public_amount_preserves_topup() {
         assert_eq!(mk_tx(vec![[0u8; 32]], 1000).circuit_public_amount(), 1000);
+    }
+
+
+    #[test]
+    fn test_circuit_public_amount_includes_transfer_fee() {
+        let mut tx = mk_tx(vec![[0u8; 32]], 7);
+        tx.fee = 3;
+        assert_eq!(tx.circuit_public_amount(), 10);
+    }
+
+    #[test]
+    fn test_validate_public_shape_rejects_public_amount_fee_overflow() {
+        let mut tx = mk_tx(vec![[0u8; 32]], u64::MAX);
+        tx.fee = 1;
+        assert_eq!(
+            tx.validate_public_shape(),
+            Err(TransactionValidationError::PublicAmountOutOfRange)
+        );
     }
 
     /// Edge case: empty inputs + public_amount = 0 is a true no-op.
